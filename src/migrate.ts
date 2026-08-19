@@ -1143,9 +1143,11 @@ export interface MigratedOptions {
 export interface MigratedAccessor<T> {
   get(name: string): KindStub<T>;
   /**
-   * Reports which side currently serves `name`, using (and priming) the
-   * same cached decision the stubs use. For observability, cutover checks,
-   * and progress dashboards.
+   * Reports which side currently serves `name`. Read-only under EVERY
+   * strategy: it never migrates (unlike a `lazy` `get()`), and it neither
+   * reads nor primes the route cache. Safe for progress dashboards and
+   * cutover sweeps. (Like any contact, it constructs both instances if
+   * they do not exist yet.)
    */
   resolve(name: string): Promise<"new" | "old">;
 }
@@ -1204,6 +1206,21 @@ export function migrated<T, NS extends DurableObjectNamespace<any>>(
 
   function rawFor(name: string): MigrationHostStub {
     return accessor.get(name).stub as unknown as MigrationHostStub;
+  }
+
+  /**
+   * A read-only route probe: never migrates, never touches the route
+   * cache. This is what `resolve()` exposes, so observability sweeps over
+   * a fleet cannot trigger migrations the way `get()` under `lazy` does.
+   */
+  async function peek(name: string): Promise<"new" | "old"> {
+    const status = await rawFor(name).__claydoImportStatus(secret);
+    if (status.kind !== undefined) return "new";
+    const oldStub = oldStubFor(name);
+    const seal = await oldStub.__claydoSealed(secret);
+    if (seal.sealed) return "new";
+    if (!(await oldStub.__claydoHasData(secret))) return "new";
+    return "old";
   }
 
   /** Waits for a migration another worker is running on this instance. */
@@ -1360,5 +1377,5 @@ export function migrated<T, NS extends DurableObjectNamespace<any>>(
     }) as KindStub<T>;
   }
 
-  return { get: facade, resolve: resolveCached };
+  return { get: facade, resolve: peek };
 }

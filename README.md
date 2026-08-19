@@ -393,6 +393,32 @@ const summary = await migrateInstance({
 // summary: { skipped, reason?, resumed, chunks, kv, rows, alarm }
 ```
 
+A skipped run's `reason` is one of: `"already migrated"`, `"old instance
+has no data (pass allowEmpty to migrate schema-only instances)"`, `"old
+instance is empty and the target is live"`, or `"completed by a concurrent
+driver"`.
+
+A minimal admin driver, wired end to end:
+
+```ts
+if (url.pathname.startsWith("/admin/preview/")) {
+  const name = url.pathname.split("/")[3]!;
+  return Response.json(
+    await previewInstance({ from: env.OLD_TALLY.getByName(name) }),
+  );
+}
+if (url.pathname.startsWith("/admin/migrate/")) {
+  const name = url.pathname.split("/")[3]!;
+  const summary = await migrateInstance({
+    from: env.OLD_TALLY.getByName(name),
+    to: kinds(env.APP_DO).tally,
+    name,
+    onProgress: (p) => console.log(`[migrate ${name}] chunk ${p.chunk}`, p.applied),
+  });
+  return Response.json(summary);
+}
+```
+
 The importer replays data as-is; it does not validate that the destination
 kind's class understands the imported schema. Registering the old class as
 the kind (as above) guarantees compatibility. Mapping data into a different
@@ -445,7 +471,12 @@ What the facade does and does not give you:
 - The stubs' `id` and `kind` metadata always describe the NEW side, even
   while the old instance still serves the traffic. For observability
   during the window, ask `await facade.resolve(name)` — it returns
-  `"new"` or `"old"`.
+  `"new"` or `"old"`, is read-only under EVERY strategy (a `resolve()`
+  sweep over your fleet registry never migrates anything, unlike `get()`
+  under `lazy`), and does not touch the route cache.
+- Migrating several old bindings at once? Create one facade per kind pair
+  (`migrated()` maps exactly one old namespace to one kind) and keep each
+  in its own module-scope singleton.
 - Route ALL traffic for migrating names through the facade. One forgotten
   route, debug script, or cross-kind call that touches the plain accessor
   mid-migration initializes the target and the driver refuses with:
@@ -469,7 +500,11 @@ content table arrives), KV entries (all user keys, including keys that
 start with `__claydo` — only the library's three exact reserved keys stay
 behind), and the pending alarm. Generated columns (`STORED` and `VIRTUAL`)
 are excluded from the copy and recompute on the target. FTS5 shadow tables
-are never copied; the index rebuilds from the real data.
+are never copied; the index rebuilds from the real data (a rebuilt index
+can be more compact than the original — compare the real tables, not the
+shadows, when verifying byte-level fidelity). PartyServer-based classes
+overwrite their own stored instance name (`__ps_name`) with the prefixed
+name on first contact after the move; everything else copies verbatim.
 
 The order is strict and race-proof:
 
@@ -491,7 +526,11 @@ On failure, the partial import is discarded and the old instance is
 unsealed — unless another driver owns the migration, in which case nothing
 is touched. Instances with no rows and no KV entries are skipped without
 sealing anything (pass `allowEmpty: true` to migrate schema-only
-instances), so stale registry entries cannot fabricate sealed husks.
+instances), so stale registry entries cannot fabricate sealed husks. One
+exception: classes whose constructor writes rows on first contact —
+Agents SDK classes write a `cf_agents_state` row — are never "empty" once
+probed, so this skip cannot protect them; keep the name registry
+authoritative for such classes (see the framework section).
 
 Recovery: if traffic reached the target before the migration ever ran, the
 target is "polluted" and the driver refuses with a both-live error. Wipe
@@ -512,21 +551,35 @@ watch for that close and re-issue the same request through the router,
 which serves the new side. Old `newUniqueId()` instances cannot keep their
 IDs; give them names (for example `migrated:<oldId>`).
 
-Two operational notes. First, if a driver crashes between the final chunk
-and the move marker, the old instance stays sealed with its alarm
-deferring every 60 seconds (with a `console.warn`) until any re-run of
-`migrateInstance` records the marker — re-runs are always safe, so retry
-after crashes. Second, methods that touch no storage still answer on a
-sealed instance (the seal freezes the data, not the event loop); the
-router's retry logic keys off storage access and `fetch()`, which covers
-real workloads.
+Operational notes:
+
+- If a driver crashes between the final chunk and the move marker, the old
+  instance stays sealed with its alarm deferring every 60 seconds (with a
+  `console.warn`) until any re-run of `migrateInstance` records the
+  marker — re-runs are always safe, so retry after crashes.
+- Methods that touch no storage still answer on a sealed instance (the
+  seal freezes the data, not the event loop); the router's retry logic
+  keys off storage access and `fetch()`. Beware storage-free heartbeats:
+  a `ping()` that never reads storage keeps answering from a sealed old
+  instance until the route TTL expires. Make keepalives read something,
+  or accept up to `oldRouteTtlMs` of routing lag for them.
+- Expect some benign exception noise in logs during the sealed window: a
+  request that raced the seal fails once before the router retries it on
+  the new side, and framework background bookkeeping (the Agents SDK's
+  alarm scheduler) logs sealed-storage errors until cutover. These do not
+  indicate data loss; the migration outcome is what the
+  `MigrationSummary` says.
 
 ### Secrets across Workers
 
 When the old class lives in another Worker, the same secret must be set in
-three places — on the wrapper, on the host, and in every driver call:
+three places — on the wrapper, on the host, and in every driver call. The
+wrapper and the host take the secret at module load, before any request
+`env` exists — import the module-scope `env` from `cloudflare:workers`:
 
 ```ts
+import { env } from "cloudflare:workers";
+
 // Old Worker
 export class Tally extends exportable(TallyImpl, {
   secret: env.MIGRATION_SECRET,
@@ -538,7 +591,7 @@ export class AppDO extends union(
   { importable: ["tally"], secret: env.MIGRATION_SECRET },
 ) {}
 
-// Driver (and migrated() options)
+// Driver (and migrated() options): the fetch-handler env works here too.
 await migrateInstance({ from, to, name, secret: env.MIGRATION_SECRET });
 ```
 
@@ -553,13 +606,22 @@ own methods work. Framework-specific notes:
 
 - The host initializes framework kinds on first contact (see the
   third-party section), so migrated agents answer RPC immediately — no
-  warm-up `fetch()` needed.
+  warm-up `fetch()` needed. The OLD binding has no such helper: RPC-first
+  access to a cold Agents SDK instance fails inside the framework
+  (`Cannot read properties of undefined (reading 'appendMessage')`)
+  because `onStart` only runs from `fetch()`. Seed and spot-check old
+  instances through `fetch()`, or add a warm-up fetch before old-side RPC.
+  The migration driver itself is unaffected.
 - Think creates a self-contained FTS5 conversation-search table; it
   migrates with searchability intact.
-- Framework constructors often write schema-version rows on first contact,
-  so a never-used old instance stops looking empty once the driver probes
-  it. Keep your name registry authoritative about which instances really
-  exist instead of relying on the empty-skip.
+- Framework constructors write bookkeeping rows on first contact (the
+  Agents SDK writes `cf_agents_state`), which has two consequences. The
+  empty-instance skip never applies — every probed instance has data — so
+  a stale registry name migrates a husk instead of being skipped. And
+  `previewInstance`, though it writes nothing itself, constructs the
+  instance it probes, so a preview sweep materializes previously
+  nonexistent names. Keep the name registry authoritative about which
+  instances really exist.
 - The Agents SDK's `getAgentByName()` and `routeAgentRequest()` need the
   same workarounds after migration as for any kind (see the third-party
   section).
@@ -569,9 +631,9 @@ own methods work. Framework-specific notes:
 | Export | Purpose |
 | --- | --- |
 | `exportable(Base, { secret? })` | Wraps the old class with seal + export support. |
-| `previewInstance({ from, secret? })` | Dry run: sizes, alarm, seal state, blockers. Changes nothing. |
+| `previewInstance({ from, secret? })` | Dry run: sizes, alarm, seal state, blockers. Writes nothing — but contacting an instance constructs it, and framework constructors write their own rows. |
 | `migrateInstance({ from, to, name, secret?, allowEmpty?, maxRowsPerChunk?, maxBytesPerChunk?, onProgress? })` | Moves one instance; returns a `MigrationSummary`. |
-| `migrated(oldNamespace, accessor, { strategy, secret?, oldRouteTtlMs? })` | Transitional router facade: `get(name)` + `resolve(name)`. |
+| `migrated(oldNamespace, accessor, { strategy, secret?, oldRouteTtlMs? })` | Transitional router facade: `get(name)` routes (and under `lazy`, migrates); `resolve(name)` is a read-only probe under every strategy. |
 | `wipeTarget(accessor, name, secret?)` | Destructive recovery for polluted targets. |
 
 `union(kinds, options)` accepts `{ importable: true | string[] }` to allow

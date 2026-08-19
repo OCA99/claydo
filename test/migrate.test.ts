@@ -392,6 +392,20 @@ describe("migrated() router", () => {
     await migrateInstance({ from: legacy("r9"), to: tally(), name: "r9" });
     expect(await accessor.resolve("r9")).toBe("new");
   });
+
+  it("resolve() is read-only even under the lazy strategy", async () => {
+    await seed("r10");
+    const accessor = migrated(env.LEGACY, tally(), { strategy: "lazy" });
+    // A progress sweep over untouched names must not migrate them.
+    expect(await accessor.resolve("r10")).toBe("old");
+    expect(await accessor.resolve("r10")).toBe("old");
+    expect((await legacy("r10").__claydoSealed()).sealed).toBe(false);
+    const status = await rawTarget("r10").__claydoImportStatus();
+    expect(status.kind).toBeUndefined();
+    // A real touch still migrates, and resolve() notices.
+    expect(await accessor.get("r10").total()).toBe(5);
+    expect(await accessor.resolve("r10")).toBe("new");
+  });
 });
 
 describe("data fidelity extensions", () => {
