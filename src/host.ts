@@ -175,9 +175,18 @@ export function union<R extends KindRegistry>(
         await this.#loading;
       }
       if (hint !== undefined && hint !== this.#kind) {
-        throw new Error(
-          `claydo: instance '${this.#identity()}' is kind ` +
-            `'${this.#kind}', but the caller expected kind '${hint}'.`,
+        // The structured fields survive the RPC hop (see toWireError), so
+        // callers can branch on `code` instead of parsing the message.
+        throw Object.assign(
+          new Error(
+            `claydo: instance '${this.#identity()}' is kind ` +
+              `'${this.#kind}', but the caller expected kind '${hint}'.`,
+          ),
+          {
+            code: "CLAYDO_KIND_MISMATCH",
+            actualKind: this.#kind,
+            expectedKind: hint,
+          },
         );
       }
       return this.#impl!;
