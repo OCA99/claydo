@@ -1,7 +1,15 @@
-import type { GdoCallResult, GenericDurableObjectInstance } from "./host";
-import { KIND_HEADER, type KindRegistry } from "./types";
+import type {
+  GdoCallResult,
+  GenericDurableObjectInstance,
+  WireError,
+} from "./host";
+import { KIND_HEADER, NO_INIT_HEADER, type KindRegistry } from "./types";
 
-/** Keys that are not exposed as RPC methods on the typed stub. */
+/**
+ * Keys that are not exposed as RPC methods on the typed stub: lifecycle
+ * handlers, internals, and the stub metadata keys (`union()` rejects kind
+ * classes that define the metadata keys as methods).
+ */
 type ReservedKey =
   | "ctx"
   | "env"
@@ -10,6 +18,10 @@ type ReservedKey =
   | "webSocketMessage"
   | "webSocketClose"
   | "webSocketError"
+  | "id"
+  | "name"
+  | "kind"
+  | "stub"
   | `__${string}`;
 
 /**
@@ -50,9 +62,13 @@ export type RegistryOf<NS> =
       : never
     : never;
 
-type KindNames<NS> = keyof RegistryOf<NS> & string;
+/**
+ * The union of kind names registered on a namespace. Use this to type kind
+ * names built at runtime before passing them to `kind()`.
+ */
+export type KindNameOf<NS> = keyof RegistryOf<NS> & string;
 
-type KindInstance<NS, K extends KindNames<NS>> = InstanceType<
+type KindInstance<NS, K extends KindNameOf<NS>> = InstanceType<
   RegistryOf<NS>[K]
 >;
 
@@ -69,7 +85,12 @@ export interface KindAccessor<T> {
   ): KindStub<T>;
   /** Creates a new unique instance. Store `stub.id.toString()` to find it again. */
   unique(options?: DurableObjectNamespaceNewUniqueIdOptions): KindStub<T>;
-  /** Returns a stub from a stored ID string or a `DurableObjectId`. */
+  /**
+   * Returns a stub from a stored ID string or a `DurableObjectId`.
+   * `fromId()` never initializes an instance: the instance must already have
+   * a kind (from a previous `get()` or `unique()` contact), or every call
+   * fails.
+   */
   fromId(id: string | DurableObjectId): KindStub<T>;
   /** Returns the Durable Object ID that `get(name)` resolves to. */
   idFromName(name: string): DurableObjectId;
@@ -81,36 +102,65 @@ type AnyHost = GenericDurableObjectInstance<KindRegistry>;
  * Returns a typed accessor for one kind inside a generic Durable Object
  * namespace.
  *
+ * Prefer {@link kinds} for literal kind names: its property access produces
+ * better TypeScript diagnostics. Use `kind()` when the kind name is a
+ * runtime value typed as {@link KindNameOf}.
+ *
  * @example
  * const counter = kind(env.APP_DO, "counter").get("user-42");
  * await counter.increment(2);
  */
 export function kind<
   NS extends DurableObjectNamespace<any>,
-  K extends KindNames<NS>,
+  K extends KindNameOf<NS>,
 >(namespace: NS, kindName: K): KindAccessor<KindInstance<NS, K>> {
   const ns = namespace as unknown as DurableObjectNamespace<AnyHost>;
   return {
     get: (name, options) =>
-      makeStub(
-        ns.get(ns.idFromName(`${kindName}:${name}`), options),
-        kindName,
+      makeStub(ns.get(ns.idFromName(`${kindName}:${name}`), options), kindName, {
         name,
-      ),
-    unique: (options) => makeStub(ns.get(ns.newUniqueId(options)), kindName),
+        allowInit: true,
+      }),
+    unique: (options) =>
+      makeStub(ns.get(ns.newUniqueId(options)), kindName, { allowInit: true }),
     fromId: (id) =>
       makeStub(
         ns.get(typeof id === "string" ? ns.idFromString(id) : id),
         kindName,
+        { allowInit: false },
       ),
     idFromName: (name) => ns.idFromName(`${kindName}:${name}`),
   };
 }
 
+/**
+ * Returns an object with one typed accessor per registered kind.
+ *
+ * @example
+ * const app = kinds(env.APP_DO);
+ * await app.counter.get("user-42").increment(2);
+ * const room = app.chat.get("lobby");
+ */
+export function kinds<NS extends DurableObjectNamespace<any>>(
+  namespace: NS,
+): {
+  [K in KindNameOf<NS>]: KindAccessor<KindInstance<NS, K>>;
+} {
+  return new Proxy({} as Record<string, unknown>, {
+    get: (_, prop) =>
+      typeof prop === "string" ? kind(namespace, prop as never) : undefined,
+  }) as { [K in KindNameOf<NS>]: KindAccessor<KindInstance<NS, K>> };
+}
+
+interface StubOptions {
+  name?: string;
+  allowInit: boolean;
+}
+
 function makeStub<T>(
   stub: DurableObjectStub<AnyHost>,
   kindName: string,
-  name?: string,
+  { name, allowInit }: StubOptions,
 ): KindStub<T> {
   const meta: Record<string, unknown> = {
     id: stub.id,
@@ -120,6 +170,7 @@ function makeStub<T>(
     fetch: (input: RequestInfo | URL, init?: RequestInit) => {
       const request = new Request(input, init);
       request.headers.set(KIND_HEADER, kindName);
+      if (!allowInit) request.headers.set(NO_INIT_HEADER, "1");
       return stub.fetch(request);
     },
   };
@@ -132,17 +183,46 @@ function makeStub<T>(
       // Do not present the stub as a thenable to `await`.
       if (prop === "then") return undefined;
       return async (...args: unknown[]) => {
-        // The RPC type mapping widens the `ok` literal, so restate the type.
-        const result = (await stub.__gdoCall(
-          kindName,
-          prop,
-          args,
-        )) as GdoCallResult;
+        let result: GdoCallResult;
+        try {
+          // The RPC type mapping widens the `ok` literal, so restate the type.
+          result = (await stub.__gdoCall(
+            kindName,
+            prop,
+            args,
+            allowInit,
+          )) as GdoCallResult;
+        } catch (transport) {
+          // The call failed outside the envelope: transport errors, or the
+          // return value did not serialize. Add call context.
+          const message =
+            transport instanceof Error ? transport.message : String(transport);
+          throw new Error(
+            `generic-durable-objects: call to ${kindName}.${prop}() failed: ${message}`,
+            { cause: transport },
+          );
+        }
         if (result.ok) return result.value;
-        const error = new Error(result.error.message);
-        error.name = result.error.name;
-        throw error;
+        throw reviveError(result.error, kindName, prop);
       };
     },
   }) as KindStub<T>;
+}
+
+/**
+ * Rebuilds an error thrown inside a kind. The revived error keeps the
+ * original name, message, serializable fields, and stack; the local frames
+ * follow after a marker line. `instanceof` custom classes does not survive
+ * the hop; match on `error.name` instead.
+ */
+function reviveError(wire: WireError, kindName: string, method: string): Error {
+  const error = new Error(wire.message);
+  error.name = wire.name;
+  if (wire.props) Object.assign(error, wire.props);
+  const localFrames = error.stack?.split("\n").slice(1).join("\n");
+  const remote = wire.stack ?? `${wire.name}: ${wire.message}`;
+  error.stack =
+    `${remote}\n    at [remote call ${kindName}.${method}() via generic-durable-objects]` +
+    (localFrames ? `\n${localFrames}` : "");
+  return error;
 }

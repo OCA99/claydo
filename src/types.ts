@@ -14,6 +14,12 @@ export type KindRegistry = Record<string, KindClass>;
 /** The header that carries the kind hint on `fetch()` calls to the stub. */
 export const KIND_HEADER = "x-gdo-kind";
 
+/**
+ * The header that marks a `fetch()` from a `fromId()` stub. It tells the
+ * host that the kind hint must validate only, never initialize.
+ */
+export const NO_INIT_HEADER = "x-gdo-no-init";
+
 /** The storage key that persists the kind of an instance. */
 export const KIND_STORAGE_KEY = "__gdo:kind";
 

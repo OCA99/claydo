@@ -5,7 +5,7 @@ import {
   waitOnExecutionContext,
 } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { kind } from "../src/index";
+import { kind, kinds, union } from "../src/index";
 import worker from "./fixtures/worker";
 
 describe("rpc dispatch", () => {
@@ -65,6 +65,97 @@ describe("kind isolation", () => {
     const response = await raw.fetch("https://do/");
     expect(response.status).toBe(400);
     expect(await response.text()).toMatch(/has no kind yet/);
+  });
+
+  it("never initializes an instance through fromId()", async () => {
+    const untouched = env.APP_DO.newUniqueId();
+    const stub = kind(env.APP_DO, "counter").fromId(untouched);
+    await expect(stub.increment()).rejects.toThrow(
+      /fromId\(\), which never initializes/,
+    );
+    // The failed access did not pin any kind.
+    const raw = env.APP_DO.get(env.APP_DO.idFromString(untouched.toString()));
+    expect(await raw.__gdoKind()).toBeUndefined();
+    // fetch() through a fromId() stub does not initialize either.
+    const response = await kind(env.APP_DO, "echo")
+      .fromId(untouched)
+      .fetch("https://do/");
+    expect(response.status).toBe(400);
+  });
+
+  it("explains raw namespace access without a prefix", async () => {
+    const raw = env.APP_DO.get(env.APP_DO.idFromName("no-prefix-here"));
+    const response = await raw.fetch("https://do/");
+    expect(response.status).toBe(400);
+    expect(await response.text()).toMatch(
+      /Raw namespace access .* reaches a different instance/,
+    );
+  });
+});
+
+describe("kinds() accessor", () => {
+  it("provides property access per kind", async () => {
+    const app = kinds(env.APP_DO);
+    expect(await app.counter.get("via-kinds").increment(3)).toBe(3);
+    expect(await app.plain.get("via-kinds").ping()).toBe("pong");
+  });
+});
+
+describe("union() validation", () => {
+  it("rejects kind classes with reserved method names", () => {
+    class BadKind {
+      constructor(_ctx: DurableObjectState, _env: unknown) {}
+      name(): string {
+        return "clash";
+      }
+    }
+    expect(() => union({ bad: BadKind })).toThrow(
+      /defines a method named 'name'/,
+    );
+  });
+});
+
+describe("error fidelity", () => {
+  it("preserves name, fields, and remote stack of thrown errors", async () => {
+    const teapot = kind(env.APP_DO, "teapot").get("kettle");
+    let caught: unknown;
+    try {
+      await teapot.explode();
+    } catch (error) {
+      caught = error;
+    }
+    const error = caught as Error & {
+      status?: number;
+      detail?: { hint: string };
+    };
+    expect(error.name).toBe("TeapotError");
+    expect(error.message).toBe("I am a teapot");
+    expect(error.status).toBe(418);
+    expect(error.detail).toEqual({ hint: "short and stout" });
+    expect(error.stack).toContain("explode");
+    expect(error.stack).toContain(
+      "[remote call teapot.explode() via generic-durable-objects]",
+    );
+  });
+
+  it("distinguishes properties from missing methods", async () => {
+    const plain = kind(env.APP_DO, "plain").get("props");
+    await plain.ping();
+    await expect((plain as any).label()).rejects.toThrow(
+      /'label' on kind 'plain' is a property, not a method/,
+    );
+  });
+});
+
+describe("resetStorage()", () => {
+  it("clears data but keeps the kind pinned on unique instances", async () => {
+    const vault = kind(env.APP_DO, "vault").unique();
+    await vault.set("k", "v");
+    expect(await vault.getValue("k")).toBe("v");
+    await vault.wipe();
+    expect(await vault.getValue("k")).toBeUndefined();
+    const raw = env.APP_DO.get(env.APP_DO.idFromString(vault.id.toString()));
+    expect(await raw.__gdoKind()).toBe("vault");
   });
 });
 

@@ -7,7 +7,7 @@ instance to one fixed kind, forever. You deploy one DO class, one binding, and
 one migration. You never touch migrations again when you add a kind.
 
 ```ts
-import { union, kind } from "generic-durable-objects";
+import { union, kinds } from "generic-durable-objects";
 
 // One exported DO class hosts all kinds.
 export class AppDO extends union({
@@ -17,8 +17,8 @@ export class AppDO extends union({
 }) {}
 
 // Typed access from your Worker.
-const counter = kind(env.APP_DO, "counter").get("user-42");
-await counter.increment(2);
+const app = kinds(env.APP_DO);
+await app.counter.get("user-42").increment(2);
 ```
 
 ## Why
@@ -34,7 +34,7 @@ runtime. This is safe because the kind of an instance never changes:
 - Instance names carry the kind as a prefix: `counter:user-42`.
 - The host persists the kind in the instance storage on first contact.
 - A different kind can never attach to the same instance. The host rejects
-  mismatched access with an error.
+  mismatched access with an error that names the instance and both kinds.
 
 Because one instance always runs one kind, each kind owns the full SQLite
 database, alarms, and WebSockets of its instances. Kinds do not share
@@ -103,6 +103,12 @@ export class AppDO extends union({
 }) {}
 ```
 
+`union()` validates the registry when the module loads: kind names must not
+contain `:` or start with `__`, and kind classes must not define methods named
+`id`, `name`, `kind`, or `stub` (the stub reserves those for metadata).
+Validation failures throw at startup, so `wrangler deploy` and local dev
+catch them before any traffic does.
+
 ### 3. Configure one binding and one migration
 
 ```jsonc
@@ -121,17 +127,18 @@ not migrations.
 ### 4. Call kinds from your Worker
 
 ```ts
-import { kind } from "generic-durable-objects";
+import { kinds } from "generic-durable-objects";
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
+    const app = kinds(env.APP_DO);
+
     // RPC, fully typed from the registry.
-    const value = await kind(env.APP_DO, "counter").get("user-42").increment();
+    const value = await app.counter.get("user-42").increment();
 
     // fetch() and WebSockets forward to the kind implementation.
-    const room = kind(env.APP_DO, "chat").get("lobby");
     if (request.headers.get("Upgrade") === "websocket") {
-      return room.fetch(request);
+      return app.chat.get("lobby").fetch(request);
     }
 
     return Response.json({ value });
@@ -140,8 +147,34 @@ export default {
 ```
 
 TypeScript infers the kind names and the method signatures from the registry.
-`kind(env.APP_DO, "counter")` only accepts registered kind names. The stub
-only exposes the methods of `Counter`, with awaited return types.
+`kinds(env.APP_DO)` only exposes registered kind names, and a typo produces a
+"Did you mean ...?" diagnostic. The stub only exposes the methods of the kind
+class, with awaited return types.
+
+`kind(env.APP_DO, "counter")` is the two-argument equivalent. Use it when the
+kind name is a runtime value; type that value with `KindNameOf`:
+
+```ts
+import { kind, type KindNameOf } from "generic-durable-objects";
+
+const name = pickKind() as KindNameOf<typeof env.APP_DO>;
+const accessor = kind(env.APP_DO, name);
+```
+
+### Calling kinds from inside a kind
+
+Kinds receive `env`, so cross-kind calls work the same inside a Durable
+Object as in a Worker. This is the pattern for coordination between use
+cases:
+
+```ts
+export class Cart extends DurableObject<Env> {
+  async checkout(): Promise<void> {
+    const inventory = kinds(this.env.APP_DO).inventory;
+    await inventory.get(productId).reserve(qty);
+  }
+}
+```
 
 ## How the host resolves the kind
 
@@ -149,23 +182,87 @@ The host resolves the kind of an instance from three sources, in this order:
 
 1. **Storage.** The host persists the kind on first contact. Storage is the
    source of truth after that.
-2. **The name prefix.** `kind(ns, "counter").get("user-42")` names the
-   instance `counter:user-42`. The host reads the prefix from `ctx.id.name`.
+2. **The name prefix.** `app.counter.get("user-42")` names the instance
+   `counter:user-42`. The host reads the prefix from `ctx.id.name`.
 3. **The call hint.** The client helper sends the kind with every RPC call
-   and with a `x-gdo-kind` header on every `fetch()`. This initializes
-   instances that have no readable name, such as `newUniqueId()` instances.
+   and with a `x-gdo-kind` header on every `fetch()`. The hint initializes
+   instances reached through `get()` and `unique()`. `fromId()` sends the
+   hint for validation only and **never initializes** an instance.
 
 If a caller expects one kind and the instance has another, the call fails
-with a clear error. An instance never changes its kind.
+with an error that names the instance and both kinds. An instance never
+changes its kind.
 
 ## Identity
 
 - `get(name)` maps to the Durable Object name `<kind>:<name>`. Equal names
-  under different kinds map to different instances.
-- `unique()` creates a `newUniqueId()` instance. Store `stub.id.toString()`
-  to reach it again with `fromId()`.
+  under different kinds map to different instances. Logical names may
+  themselves contain `:`; only the first segment routes, and only when it
+  matches a registered kind.
+- `unique()` creates a `newUniqueId()` instance. The first call pins the
+  kind. Store `stub.id.toString()` to reach it again with `fromId()`.
+- `fromId(id)` reaches an existing instance. It never initializes: if the
+  instance has no kind yet, calls fail and tell you to create the instance
+  with `get()` or `unique()` first.
 - `instanceName(this.ctx)` returns the logical name without the kind prefix,
-  from inside a kind implementation.
+  from inside a kind implementation. It is safe everywhere in a kind,
+  including its constructor, because kinds construct lazily on first contact.
+  It returns `undefined` for unique-ID instances.
+- Do not mix helper access with raw namespace access. `getByName("room-1")`
+  reaches a *different* instance than `app.chat.get("room-1")` (which maps to
+  `chat:room-1`). If you fetch such an unprefixed instance, the host answers
+  400 with an explanation of this exact mistake.
+
+## Error propagation
+
+When a kind method throws, the stub rethrows an `Error` to the caller with:
+
+- the original `name` and `message`;
+- the original **stack**, pointing into your kind code, followed by a marker
+  line `at [remote call <kind>.<method>() via generic-durable-objects]` and
+  the local frames;
+- all own enumerable fields of the error that survive structured clone
+  (for example `error.code` or `error.productId`).
+
+What does not survive: the prototype. `instanceof MyError` is `false` after
+the hop — match on `error.name` instead. Non-cloneable fields are dropped.
+
+Errors thrown in `alarm()` and `webSocket*` handlers have no caller to reach.
+The host logs them with `console.error`, including the kind and the instance
+identity, then rethrows so the runtime semantics (such as alarm retries) stay
+intact.
+
+## Serialization rules
+
+RPC arguments and return values travel over Workers RPC:
+
+- Structured-cloneable values work: plain objects, arrays, strings, numbers,
+  `Map`, `Set`, `Date`, `ArrayBuffer`, typed arrays.
+- Functions and `RpcTarget` instances become live RPC stubs (a Workers RPC
+  feature — be deliberate about returning them).
+- Custom class instances do **not** serialize. The call fails and the stub
+  wraps the failure with context:
+  `generic-durable-objects: call to <kind>.<method>() failed: Could not serialize object ...`.
+  Return plain objects instead.
+
+## Storage lifecycle
+
+`ctx.storage.deleteAll()` inside a kind also deletes the kind marker the
+library persists. Named instances re-pin from the name prefix, but unique-ID
+instances become kind-less husks. Use the provided helper instead:
+
+```ts
+import { resetStorage } from "generic-durable-objects";
+
+async destroy(): Promise<void> {
+  await resetStorage(this.ctx); // deleteAll, but the kind stays pinned
+  await this.ctx.storage.deleteAlarm();
+}
+```
+
+Durable Object instances cannot be deleted, only emptied; any later access
+revives them. Design "delete" flows as `resetStorage()` plus removal of the
+id from wherever you track instances.
 
 ## Third-party Durable Object libraries
 
@@ -174,7 +271,7 @@ classes match this shape. Register them directly:
 
 ```ts
 import { Server, type Connection, type WSMessage } from "partyserver";
-import { union, kind } from "generic-durable-objects";
+import { union, kinds } from "generic-durable-objects";
 
 class GameRoom extends Server<Env> {
   onMessage(connection: Connection, message: WSMessage): void {
@@ -188,33 +285,50 @@ export class AppDO extends union({
 }) {}
 
 // In the Worker:
-const room = kind(env.APP_DO, "game").get("match-1");
-return room.fetch(request); // upgrade requests reach Server.fetch()
+return kinds(env.APP_DO).game.get("match-1").fetch(request);
 ```
 
-PartyServer reads its server name from `ctx.id.name`, so `this.name` inside
-the `Server` is the full name, for example `game:match-1`.
+What works, and what to know (verified against `partyserver@0.5`):
 
-The integration test suite runs a real PartyServer `Server` as a kind. See
-`test/fixtures/worker.ts`.
+- `Server` lifecycle hooks, broadcast, hibernation, and `onAlarm` work. The
+  integration test suite runs a real `Server` as a kind.
+- `this.name` inside the `Server` is the full instance name, including the
+  kind prefix (for example `game:match-1`), because PartyServer reads
+  `ctx.id.name`. Use `instanceName(this.ctx)` when you need the logical name.
+- `getServerByName()` is **not supported**: it calls a `setName` RPC method
+  on the stub, and the host does not expose arbitrary RPC methods. Use
+  `kinds(env.APP_DO).game.get(name)` instead — it serves the same purpose.
+- `routePartykitRequest()` routes by URL to a binding and passes the room
+  name without a kind prefix, so it reaches unprefixed instances. Route
+  manually instead:
+
+```ts
+// PartyKit-style URLs: /parties/:party/:room
+const match = /^\/parties\/([^/]+)\/([^/]+)$/.exec(url.pathname);
+if (match) {
+  return kinds(env.APP_DO).game.get(match[2]).fetch(request);
+}
+```
 
 ## API
 
 ### `union(kinds)`
 
 Creates the host Durable Object class. `kinds` maps kind names to classes.
-Kind names must not contain `:` and must not start with `__`. Export the
-returned class and point your binding and migration at it.
+Export the returned class and point your binding and migration at it.
+Validates kind names and reserved method names at module load.
 
-### `kind(namespace, kindName)`
+### `kinds(namespace)` / `kind(namespace, kindName)`
 
-Returns a typed accessor for one kind:
+`kinds()` returns one typed accessor per registered kind, as properties.
+`kind()` returns a single accessor; use it with runtime kind names typed as
+`KindNameOf<typeof namespace>`. Each accessor:
 
 | Method | Description |
 | --- | --- |
-| `get(name, options?)` | Stub for the named instance (`<kind>:<name>`). |
-| `unique(options?)` | Stub for a new `newUniqueId()` instance. |
-| `fromId(id)` | Stub from a stored ID string or `DurableObjectId`. |
+| `get(name, options?)` | Stub for the named instance (`<kind>:<name>`). Initializes on first contact. |
+| `unique(options?)` | Stub for a new `newUniqueId()` instance. Initializes on first call. |
+| `fromId(id)` | Stub from a stored ID string or `DurableObjectId`. Never initializes. |
 | `idFromName(name)` | The `DurableObjectId` that `get(name)` resolves to. |
 
 Each stub exposes the public methods of the kind class as async functions,
@@ -224,36 +338,45 @@ plus:
 | --- | --- |
 | `fetch(input, init?)` | Sends a request to the kind's `fetch()` handler. |
 | `id` | The `DurableObjectId`. |
-| `name` | The logical name, when created with `get(name)`. |
+| `name` | The logical name, when created with `get(name)`; otherwise `undefined`. |
 | `kind` | The kind name. |
-| `stub` | The raw `DurableObjectStub`, as an escape hatch. |
+| `stub` | The raw `DurableObjectStub`, as an escape hatch (tests, `runDurableObjectAlarm`). |
 
 ### `instanceName(ctx)`
 
-Returns the logical instance name without the `<kind>:` prefix. Returns
-`undefined` for unique-ID instances. Do not call it in the constructor;
-`ctx.id.name` is not available there.
+Returns the logical instance name without the `<kind>:` prefix, or
+`undefined` for unique-ID instances. Safe anywhere in a kind, including the
+constructor.
+
+### `resetStorage(ctx)`
+
+`deleteAll()` that re-pins the kind marker. Use it instead of a raw
+`ctx.storage.deleteAll()` inside kinds.
 
 ### Forwarded handlers
 
 The host forwards these handlers to the kind implementation when the kind
 defines them: `fetch`, `alarm`, `webSocketMessage`, `webSocketClose`,
-`webSocketError`. Hibernated WebSockets wake the correct kind, because the
-host reads the persisted kind from storage.
+`webSocketError`. Hibernated WebSockets and alarms wake the correct kind,
+because the host reads the persisted kind from storage.
 
 ## Rules and limits
 
-- **RPC covers methods only.** The stub does not proxy property access. Add a
-  getter method when you need a value.
-- **These method names are reserved on stubs:** `fetch`, `id`, `name`,
-  `kind`, `stub`, and the lifecycle handlers. Names that start with `__` are
-  reserved too.
+- **RPC covers methods only.** The stub does not proxy property access.
+  Calling a plain property through the stub fails with a message that names
+  the property and its type; add a getter method instead.
+- **Reserved names.** Kind classes must not define methods named `id`,
+  `name`, `kind`, or `stub` — `union()` rejects them at startup. Getters with
+  those names are fine. Method names starting with `__` are not callable
+  through the stub.
 - **One namespace, one billing and metrics bucket.** All kinds share the DO
   namespace, so per-kind analytics need your own labels.
 - **Kind renames are breaking.** The kind name is part of the instance name
-  and of the persisted state. Treat kind names as permanent identifiers.
-- **Do not register the same instance name across raw and helper access.**
-  Always go through `kind()` so the hint and the prefix stay consistent.
+  and of the persisted state. Renamed kinds fail loudly for initialized
+  instances (`unknown kind`) but `get(name)` under the new name reaches
+  fresh, empty instances. Treat kind names as permanent identifiers.
+- **Always go through the helpers.** Raw namespace access without the
+  `<kind>:` prefix reaches different instances (see Identity).
 
 ## Testing
 
@@ -262,8 +385,23 @@ The repository tests run inside the Workers runtime with
 
 ```sh
 npm install
-npm test
+npm test           # library test suite
+npm run test:examples  # the 8 example apps under examples/
 ```
+
+Tips that apply to your own tests:
+
+- `runDurableObjectAlarm` and `runInDurableObject` from `cloudflare:test`
+  expect a raw `DurableObjectStub`. Pass `stub.stub` (the escape hatch) or a
+  raw `env.APP_DO.get(...)` stub.
+- Isolated storage is per test **file**; tests within one file share DO
+  state. Use distinct instance names per test.
+
+The `examples/` folder contains eight complete applications (chat rooms with
+rate limiting, collaborative documents, an alarm scheduler, instance
+management, a Lunora-style live table, a token-bucket rate limiter, a game
+lobby, and a shop with cross-kind checkout), each with tests and a DX audit
+report.
 
 ## License
 

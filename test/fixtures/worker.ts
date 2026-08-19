@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { Server, type Connection, type WSMessage } from "partyserver";
-import { instanceName, kind, union } from "../../src/index";
+import { instanceName, kind, resetStorage, union } from "../../src/index";
 
 export interface Env {
   APP_DO: DurableObjectNamespace<AppDO>;
@@ -81,8 +81,38 @@ export class Reminder extends DurableObject<Env> {
 
 /** A kind with no handlers, to exercise error paths. */
 export class Plain extends DurableObject<Env> {
+  label = "plain-label";
+
   ping(): string {
     return "pong";
+  }
+}
+
+class TeapotError extends Error {
+  override name = "TeapotError";
+  status = 418;
+  detail = { hint: "short and stout" };
+}
+
+/** A kind that throws a custom error, to exercise error fidelity. */
+export class Teapot extends DurableObject<Env> {
+  explode(): never {
+    throw new TeapotError("I am a teapot");
+  }
+}
+
+/** A kind that wipes its own storage, to exercise resetStorage(). */
+export class Vault extends DurableObject<Env> {
+  async set(key: string, value: string): Promise<void> {
+    await this.ctx.storage.put(`v:${key}`, value);
+  }
+
+  async getValue(key: string): Promise<string | undefined> {
+    return this.ctx.storage.get<string>(`v:${key}`);
+  }
+
+  async wipe(): Promise<void> {
+    await resetStorage(this.ctx);
   }
 }
 
@@ -98,6 +128,8 @@ export class AppDO extends union({
   echo: Echo,
   reminder: Reminder,
   plain: Plain,
+  teapot: Teapot,
+  vault: Vault,
   party: PartyRoom,
 }) {}
 

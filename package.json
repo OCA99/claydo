@@ -33,6 +33,7 @@
     "build": "tsup",
     "check": "tsc --noEmit",
     "test": "vitest run",
+    "test:examples": "for c in examples/*/vitest.config.ts; do vitest run --config \"$c\" || exit 1; done",
     "test:watch": "vitest",
     "prepublishOnly": "npm run check && npm run build"
   },
