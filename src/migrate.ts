@@ -12,21 +12,27 @@
  * 4. When the old namespace is empty, delete its class with a
  *    `deleted_classes` migration. That reclaims the namespace slot.
  *
- * Ordering guarantees: the old instance is sealed (frozen) before data is
- * read, the new instance goes live only after every chunk is applied and
- * verified, and a failed migration is rolled back (partial import aborted,
- * old instance unsealed). A crashed driver resumes where it stopped, because
- * the old instance stays sealed.
+ * Ordering guarantees: the target is reserved first (traffic blocks, so
+ * racing requests cannot pollute it), then the old instance is sealed
+ * (writes freeze), data streams in verified chunks, the kind pins only
+ * after the final chunk, and the old instance records where it moved only
+ * after success. Exactly one driver owns a migration at a time; a crashed
+ * driver's import goes stale and the next run adopts it. On failure, the
+ * partial import is discarded and the old instance is unsealed.
  */
 
 import type { KindAccessor, KindStub } from "./client";
 import {
+  IMPORT_STALE_MS,
+  RESERVED_STORAGE_KEYS,
   SEAL_KEY,
+  SEALED_HEADER,
   quoteIdent,
   sizeOf,
   type ExportChunk,
   type ExportCursor,
   type ImportAck,
+  type ImportBegin,
   type ImportStatus,
   type SqlValue,
 } from "./migrate-wire";
@@ -35,13 +41,16 @@ export type {
   ExportChunk,
   ExportCursor,
   ImportAck,
+  ImportBegin,
   ImportStatus,
 } from "./migrate-wire";
+export { SEALED_HEADER } from "./migrate-wire";
 
 const KV_BATCH = 128; // storage.put() accepts at most 128 keys.
 const DEFAULT_MAX_ROWS = 500;
 const DEFAULT_MAX_BYTES = 256 * 1024;
 const ROWID_FLOOR = -Number.MAX_SAFE_INTEGER;
+const SEALED_ALARM_DEFER_MS = 60_000;
 
 interface SealRecord {
   movedTo?: string;
@@ -55,13 +64,18 @@ interface ExportLimits {
 
 /** The methods that {@link exportable} adds to the old class. */
 export interface ExportableInstance {
-  /** Freezes the instance: every user method fails until unseal. */
+  /**
+   * Freezes the instance: every user method fails until unseal, `fetch()`
+   * answers 410 with the `x-claydo-sealed` header, alarms are preserved but
+   * deferred, and open hibernatable WebSockets close with code 1012 so
+   * clients reconnect.
+   */
   __claydoSeal(secret?: string, movedTo?: string): Promise<void>;
   /** Reverses a seal, for migration rollback. */
   __claydoUnseal(secret?: string): Promise<void>;
   /** Reports the seal state. */
   __claydoSealed(secret?: string): Promise<{ sealed: boolean; movedTo?: string }>;
-  /** True when the instance has any user data (tables or KV entries). */
+  /** True when the instance has any user data (table rows or KV entries). */
   __claydoHasData(secret?: string): Promise<boolean>;
   /** Returns the next export chunk. The instance must be sealed. */
   __claydoExport(
@@ -81,7 +95,6 @@ export interface ExportableOptions {
 }
 
 type DurableObjectLike = { ctx: DurableObjectState; env: unknown };
-type DOClass = abstract new (...args: any[]) => DurableObjectLike;
 
 /** The class type that {@link exportable} returns. */
 export interface ExportableClass<I> {
@@ -91,10 +104,8 @@ export interface ExportableClass<I> {
 /**
  * Wraps a finished Durable Object class so its instances can be exported
  * into a claydo kind. Deploy this wrapper on the OLD Worker; behavior is
- * unchanged until an instance is sealed.
- *
- * While sealed: RPC methods throw, `fetch()` answers 410, `alarm()` becomes
- * a no-op, and the data is frozen so exports are consistent and resumable.
+ * unchanged until an instance is sealed. The seal guards are synchronous,
+ * so internal self-calls (`this.method()`) and sync helpers keep working.
  *
  * Wrap the complete class: the seal guard covers the methods of the wrapped
  * class and its ancestors, not methods added by later subclasses.
@@ -113,13 +124,24 @@ export function exportable<I extends object>(
     ...args: any[]
   ) => DurableObjectLike;
   class Exportable extends ConcreteBase {
-    #sealCache: SealRecord | null | undefined;
+    #sealed: SealRecord | null = null;
+
+    constructor(...args: any[]) {
+      super(...args);
+      // Load the seal state before any event is delivered, so the guards
+      // can stay synchronous and fully transparent while unsealed.
+      this.ctx.blockConcurrencyWhile(async () => {
+        this.#sealed =
+          (await this.ctx.storage.get<SealRecord>(SEAL_KEY)) ?? null;
+      });
+    }
 
     /**
      * Puts seal-guarded wrappers for every method of the wrapped class onto
      * this prototype. Workers RPC resolves methods through the prototype
      * chain, so the wrappers shadow the originals for local and remote
-     * callers alike.
+     * callers alike. The guards are synchronous: unsealed instances behave
+     * exactly as before, including sync return values and self-calls.
      */
     static {
       const seen = new Set<string>();
@@ -143,28 +165,39 @@ export function exportable<I extends object>(
           const original = descriptor.value as (...args: unknown[]) => unknown;
           let wrapper: (this: Exportable, ...args: unknown[]) => unknown;
           if (key === "fetch") {
-            wrapper = async function (this: Exportable, ...args: unknown[]) {
-              const seal = await this.#sealState();
-              if (seal) {
-                return new Response(this.#sealMessage(seal), { status: 410 });
+            wrapper = function (this: Exportable, ...args: unknown[]) {
+              if (this.#sealed) {
+                return new Response(
+                  "claydo: this instance is sealed (migrating or migrated). " +
+                    "Reconnect through the current endpoint.",
+                  { status: 410, headers: { [SEALED_HEADER]: "1" } },
+                );
               }
               return original.apply(this, args);
             };
           } else if (key === "alarm") {
-            wrapper = async function (this: Exportable, ...args: unknown[]) {
-              const seal = await this.#sealState();
+            wrapper = function (this: Exportable, ...args: unknown[]) {
+              const seal = this.#sealed;
               if (seal) {
+                if (seal.movedTo !== undefined) {
+                  // The migration completed; the alarm moved with the data.
+                  return this.ctx.storage.deleteAlarm();
+                }
+                // Preserve the alarm through the sealed window: defer it so
+                // the export can still capture and transfer it.
                 console.warn(
-                  `claydo: alarm() skipped on sealed instance '${this.#identity()}'.`,
+                  `claydo: alarm deferred on sealed instance '${identityOf(this.ctx)}' (migration in progress).`,
                 );
-                return;
+                return this.ctx.storage.setAlarm(
+                  Date.now() + SEALED_ALARM_DEFER_MS,
+                );
               }
               return original.apply(this, args);
             };
           } else {
-            wrapper = async function (this: Exportable, ...args: unknown[]) {
-              const seal = await this.#sealState();
-              if (seal) throw new Error(this.#sealMessage(seal));
+            wrapper = function (this: Exportable, ...args: unknown[]) {
+              const seal = this.#sealed;
+              if (seal) throw new Error(sealMessage(this.ctx, seal));
               return original.apply(this, args);
             };
           }
@@ -178,62 +211,55 @@ export function exportable<I extends object>(
       }
     }
 
-    #identity(): string {
-      return this.ctx.id.name ?? this.ctx.id.toString();
-    }
-
     #auth(secret: string | undefined): void {
       if (options.secret !== undefined && secret !== options.secret) {
         throw new Error("claydo: invalid migration secret.");
       }
     }
 
-    async #sealState(): Promise<SealRecord | undefined> {
-      if (this.#sealCache === undefined) {
-        this.#sealCache =
-          (await this.ctx.storage.get<SealRecord>(SEAL_KEY)) ?? null;
-      }
-      return this.#sealCache ?? undefined;
-    }
-
-    #sealMessage(seal: SealRecord): string {
-      const moved =
-        seal.movedTo === undefined
-          ? " A migration is in progress."
-          : ` It moved to Durable Object id ${seal.movedTo}; route traffic through the claydo binding.`;
-      return `claydo: instance '${this.#identity()}' is sealed.${moved}`;
-    }
-
     async __claydoSeal(secret?: string, movedTo?: string): Promise<void> {
       this.#auth(secret);
-      const existing = await this.#sealState();
+      const existing = this.#sealed;
       const record: SealRecord = {
         movedTo: movedTo ?? existing?.movedTo,
         at: existing?.at ?? Date.now(),
       };
       await this.ctx.storage.put(SEAL_KEY, record);
-      this.#sealCache = record;
+      this.#sealed = record;
+      if (existing === null) {
+        // Close hibernatable WebSockets so clients get a real close event
+        // (1012: service restart) and reconnect through the router.
+        for (const ws of this.ctx.getWebSockets()) {
+          try {
+            ws.close(1012, "claydo: instance migrating; reconnect");
+          } catch {
+            // Already closed.
+          }
+        }
+      }
+      if (record.movedTo !== undefined) {
+        // The data (including the alarm) lives in the new instance now.
+        await this.ctx.storage.deleteAlarm();
+      }
     }
 
     async __claydoUnseal(secret?: string): Promise<void> {
       this.#auth(secret);
       await this.ctx.storage.delete(SEAL_KEY);
-      this.#sealCache = null;
+      this.#sealed = null;
     }
 
     async __claydoSealed(
       secret?: string,
     ): Promise<{ sealed: boolean; movedTo?: string }> {
       this.#auth(secret);
-      const seal = await this.#sealState();
-      return { sealed: seal !== undefined, movedTo: seal?.movedTo };
+      return { sealed: this.#sealed !== null, movedTo: this.#sealed?.movedTo };
     }
 
     async __claydoHasData(secret?: string): Promise<boolean> {
       this.#auth(secret);
       // Schema alone does not count: constructors commonly run
-      // `CREATE TABLE IF NOT EXISTS`, which would mark every probed
-      // instance as "has data". Only rows and KV entries count.
+      // `CREATE TABLE IF NOT EXISTS`. Only rows and KV entries count.
       for (const table of this.#userTables()) {
         const row = this.ctx.storage.sql
           .exec(`SELECT 1 FROM ${quoteIdent(table.name)} LIMIT 1`)
@@ -249,7 +275,7 @@ export function exportable<I extends object>(
         if (listed.size === 0) return false;
         for (const key of listed.keys()) {
           after = key;
-          if (!key.startsWith("__claydo")) return true;
+          if (!RESERVED_STORAGE_KEYS.has(key)) return true;
         }
         if (listed.size < KV_BATCH) return false;
       }
@@ -261,10 +287,9 @@ export function exportable<I extends object>(
       limits: ExportLimits = {},
     ): Promise<ExportChunk> {
       this.#auth(secret);
-      const seal = await this.#sealState();
-      if (seal === undefined) {
+      if (this.#sealed === null) {
         throw new Error(
-          `claydo: instance '${this.#identity()}' is not sealed. Seal it ` +
+          `claydo: instance '${identityOf(this.ctx)}' is not sealed. Seal it ` +
             `with __claydoSeal() before exporting, so the data cannot ` +
             `change during the copy.`,
         );
@@ -298,6 +323,7 @@ export function exportable<I extends object>(
             table: table.name,
             columns: page.columns,
             values: page.values,
+            rowid: table.rowidAlias ?? "__rowid__",
           };
           chunk.cursor = {
             phase: "rows",
@@ -356,7 +382,11 @@ export function exportable<I extends object>(
               `it with custom code.`,
           );
         }
-        return { name: row.name, ddl: row.sql, rowidAlias: this.#rowidAlias(row.name) };
+        return {
+          name: row.name,
+          ddl: row.sql,
+          rowidAlias: this.#rowidAlias(row.name),
+        };
       });
     }
 
@@ -421,7 +451,7 @@ export function exportable<I extends object>(
         let bytes = 0;
         for (const [key, value] of listed) {
           after = key;
-          if (key.startsWith("__claydo")) continue;
+          if (RESERVED_STORAGE_KEYS.has(key)) continue;
           entries.push([key, value]);
           bytes += key.length * 2 + sizeOf(value);
           if (entries.length >= KV_BATCH || bytes >= maxBytes) break;
@@ -442,7 +472,7 @@ export function exportable<I extends object>(
         if (listed.size === 0) return count;
         for (const key of listed.keys()) {
           after = key;
-          if (!key.startsWith("__claydo")) count += 1;
+          if (!RESERVED_STORAGE_KEYS.has(key)) count += 1;
         }
         if (listed.size < KV_BATCH) return count;
       }
@@ -478,16 +508,35 @@ export function exportable<I extends object>(
   return Exportable as unknown as ExportableClass<I>;
 }
 
+function identityOf(ctx: DurableObjectState): string {
+  return ctx.id.name ?? ctx.id.toString();
+}
+
+function sealMessage(ctx: DurableObjectState, seal: SealRecord): string {
+  const moved =
+    seal.movedTo === undefined
+      ? " A migration is in progress."
+      : ` It moved to Durable Object id ${seal.movedTo}; route traffic through the claydo binding.`;
+  return `claydo: instance '${identityOf(ctx)}' is sealed.${moved}`;
+}
+
 /** The host-side migration surface, reachable on a raw claydo stub. */
 interface MigrationHostStub {
   __claydoImportStatus(secret?: string): Promise<ImportStatus>;
+  __claydoBeginImport(
+    kind: string,
+    token: string,
+    secret?: string,
+  ): Promise<ImportBegin>;
   __claydoImport(
     kind: string,
     chunk: ExportChunk,
     seq: number,
+    token: string,
     secret?: string,
   ): Promise<ImportAck>;
-  __claydoAbortImport(secret?: string): Promise<boolean>;
+  __claydoAbortImport(token: string, secret?: string): Promise<boolean>;
+  __claydoReset(confirmId: string, secret?: string): Promise<void>;
   __claydoKind(): Promise<string | undefined>;
 }
 
@@ -525,6 +574,13 @@ export interface MigrateInstanceOptions {
   name: string;
   /** The shared migration secret, when configured on both sides. */
   secret?: string;
+  /**
+   * Migrate instances that have no rows and no KV entries (for example,
+   * schema-only instances). Off by default: empty or never-used instances
+   * are skipped without sealing anything, so stale registry entries do not
+   * fabricate sealed husks.
+   */
+  allowEmpty?: boolean;
   /** Rows per chunk (default 500). */
   maxRowsPerChunk?: number;
   /** Approximate bytes per chunk (default 256 KiB). */
@@ -533,8 +589,10 @@ export interface MigrateInstanceOptions {
 
 /** The result of one {@link migrateInstance} run. */
 export interface MigrationSummary {
-  /** True when there was nothing to do (already migrated, or old instance empty). */
+  /** True when there was nothing to do. See `reason`. */
   skipped: boolean;
+  /** Why the run was skipped, when it was. */
+  reason?: string;
   /** True when the run resumed a crashed migration. */
   resumed: boolean;
   chunks: number;
@@ -544,17 +602,30 @@ export interface MigrationSummary {
   alarm: number | null | undefined;
 }
 
+function skippedSummary(reason: string): MigrationSummary {
+  return {
+    skipped: true,
+    reason,
+    resumed: false,
+    chunks: 0,
+    kv: 0,
+    rows: {},
+    alarm: undefined,
+  };
+}
+
 /**
  * Moves one instance from an old binding into a claydo kind.
  *
- * Sequence: seal the old instance (freezes writes), stream export chunks
- * into the target, verify totals, and pin the kind — the target only serves
- * traffic after the final chunk. On failure, the partial import is aborted
- * and the old instance is unsealed, so traffic continues on the old side.
- * On a crash (no failure handler ran), the old instance stays sealed and the
- * next run resumes from the last applied chunk.
- *
- * Safe to re-run: a completed migration returns `{ skipped: true }`.
+ * Sequence: reserve the target (its traffic blocks, so racing requests
+ * cannot pollute it), seal the old instance (writes freeze, WebSockets
+ * close), stream export chunks, verify totals, pin the kind, and finally
+ * record the move on the old instance. Exactly one driver owns a migration
+ * at a time: concurrent drivers fail fast without touching anything, and a
+ * crashed driver's import goes stale after ~30s so the next run adopts and
+ * resumes it. On failure, the partial import is aborted and the old
+ * instance is unsealed. Re-running a completed migration returns
+ * `{ skipped: true }`.
  */
 export async function migrateInstance(
   options: MigrateInstanceOptions,
@@ -567,57 +638,95 @@ export async function migrateInstance(
     maxRows: options.maxRowsPerChunk,
     maxBytes: options.maxBytesPerChunk,
   };
+  const token = crypto.randomUUID();
+  const targetId = target.id.toString();
 
   const status = await raw.__claydoImportStatus(secret);
+  const oldSeal = await old.__claydoSealed(secret);
+
   if (status.kind !== undefined) {
-    const seal = await old.__claydoSealed(secret);
-    if (seal.sealed) {
-      return { skipped: true, resumed: false, chunks: 0, kv: 0, rows: {}, alarm: undefined };
+    if (oldSeal.sealed) {
+      if (oldSeal.movedTo !== targetId && oldSeal.movedTo !== undefined) {
+        throw new Error(
+          `claydo: the old instance '${options.name}' moved to a different ` +
+            `Durable Object (${oldSeal.movedTo}), but the target ` +
+            `'${target.kind}:${options.name}' is also live. Check your ` +
+            `migration mapping.`,
+        );
+      }
+      if (oldSeal.movedTo === undefined) {
+        // Crash after finalize, before the move marker: record it now.
+        await old.__claydoSeal(secret, targetId);
+      }
+      return skippedSummary("already migrated");
     }
     if (!(await old.__claydoHasData(secret))) {
-      return { skipped: true, resumed: false, chunks: 0, kv: 0, rows: {}, alarm: undefined };
+      return skippedSummary("old instance is empty and the target is live");
     }
     throw new Error(
       `claydo: both the old instance '${options.name}' and the new instance ` +
         `'${target.kind}:${options.name}' are live. Refusing to migrate. ` +
-        `If the new instance is the source of truth, seal the old one; ` +
-        `otherwise wipe the new instance before migrating.`,
+        `If racing traffic polluted the new instance (it has no real data), ` +
+        `wipe it with wipeTarget() from claydo/migrate and re-run. If the ` +
+        `new instance is the source of truth, seal the old one with ` +
+        `__claydoSeal() — its data will NOT be copied.`,
     );
   }
 
-  let seq = 0;
-  let cursor: ExportCursor | null = null;
-  let resumed = false;
-  if (status.importing !== undefined) {
-    const seal = await old.__claydoSealed(secret);
-    if (
-      !seal.sealed ||
-      status.importing.cursor === null ||
-      status.importing.kind !== target.kind
-    ) {
-      // The partial import is not resumable (the old data may have changed,
-      // or verification failed). Start over.
-      await raw.__claydoAbortImport(secret);
-    } else {
-      seq = status.importing.seq;
-      cursor = status.importing.cursor;
-      resumed = true;
+  // Skip empty instances before touching anything, so a stale registry
+  // entry cannot fabricate a sealed, empty instance pair.
+  if (!oldSeal.sealed && !options.allowEmpty) {
+    if (!(await old.__claydoHasData(secret))) {
+      return skippedSummary(
+        "old instance has no data (pass allowEmpty to migrate schema-only instances)",
+      );
     }
   }
 
-  await old.__claydoSeal(secret, target.id.toString());
+  // Reserve the target FIRST: from here on, traffic to it blocks instead of
+  // initializing an empty instance. Ownership errors throw here, before
+  // anything was changed, so there is nothing to roll back.
+  let begin = await raw.__claydoBeginImport(target.kind, token, secret);
+  let seq = begin.seq;
+  let cursor = begin.cursor;
+  let resumed = begin.resumed;
+  if (resumed && (!oldSeal.sealed || cursor === null)) {
+    // Not resumable: the old instance was unsealed mid-import (the data may
+    // have changed) or the previous run failed verification. Start over.
+    await raw.__claydoAbortImport(token, secret);
+    begin = await raw.__claydoBeginImport(target.kind, token, secret);
+    seq = begin.seq;
+    cursor = begin.cursor;
+    resumed = false;
+  }
+
+  let sealedByUs = false;
+  if (!oldSeal.sealed) {
+    await old.__claydoSeal(secret);
+    sealedByUs = true;
+  }
 
   try {
     let chunks = 0;
     for (;;) {
       const chunk = await old.__claydoExport(secret, cursor, limits);
       seq += 1;
-      const ack = await raw.__claydoImport(target.kind, chunk, seq, secret);
+      const ack = await raw.__claydoImport(
+        target.kind,
+        chunk,
+        seq,
+        token,
+        secret,
+      );
       chunks += 1;
       cursor = chunk.cursor;
       if (cursor === null) {
+        // Success. Record the move on the old side (this also silences the
+        // old instance's alarm forever).
+        await old.__claydoSeal(secret, targetId);
         return {
           skipped: false,
+          reason: undefined,
           resumed,
           chunks,
           kv: ack.applied.kv,
@@ -627,24 +736,62 @@ export async function migrateInstance(
       }
     }
   } catch (error) {
-    // Roll back: discard the partial import, unfreeze the old instance.
+    // Before rolling anything back, check whether the migration actually
+    // completed — possibly through a concurrent driver.
+    let targetLive = false;
     try {
-      await raw.__claydoAbortImport(secret);
+      const after = await raw.__claydoImportStatus(secret);
+      targetLive = after.kind !== undefined;
     } catch {
-      // The abort is best effort; the import state also blocks traffic.
+      // Keep the conservative default.
     }
+    if (targetLive) {
+      try {
+        await old.__claydoSeal(secret, targetId);
+      } catch {
+        // The move marker is best effort here.
+      }
+      return skippedSummary("completed by a concurrent driver");
+    }
+    // Roll back only what this driver owns. If another driver took over the
+    // import, the abort fails on ownership and everything stays in place.
+    let ownedRollback = true;
     try {
-      await old.__claydoUnseal(secret);
+      await raw.__claydoAbortImport(token, secret);
     } catch {
-      // Leave the seal in place if unsealing fails; better frozen than torn.
+      ownedRollback = false;
+    }
+    if (ownedRollback && sealedByUs) {
+      try {
+        await old.__claydoUnseal(secret);
+      } catch {
+        // Better frozen than torn.
+      }
     }
     const message = error instanceof Error ? error.message : String(error);
     throw new Error(
       `claydo: migration of '${options.name}' to kind '${target.kind}' ` +
-        `failed and was rolled back (old instance unsealed): ${message}`,
+        `failed${ownedRollback ? " and was rolled back (old instance unsealed)" : " (another driver owns the import; nothing was rolled back)"}: ${message}`,
       { cause: error },
     );
   }
+}
+
+/**
+ * Wipes a migration target completely: storage, alarm, import state, and
+ * the in-memory kind pin. Use it to recover a target that racing traffic
+ * polluted before a migration. Requires `{ importable }` on the host.
+ *
+ * Destructive: only call it when the target holds no data you need.
+ */
+export async function wipeTarget(
+  accessor: KindAccessor<any>,
+  name: string,
+  secret?: string,
+): Promise<void> {
+  const target = accessor.get(name);
+  const raw = target.stub as unknown as MigrationHostStub;
+  await raw.__claydoReset(`${target.kind}:${name}`, secret);
 }
 
 /** Routing strategies for {@link migrated}. */
@@ -680,8 +827,10 @@ export interface MigratedAccessor<T> {
  * Routes resolve as: new instance live → new; old instance sealed or empty →
  * new; otherwise the strategy decides. A "new" decision is cached for the
  * Worker's lifetime; an "old" decision expires so external migrations are
- * noticed. If a call hits a freshly sealed old instance, the facade
- * re-resolves once and retries on the new side.
+ * noticed. Calls (RPC and `fetch()`, including WebSocket upgrades) that hit
+ * a freshly sealed old instance re-resolve once and retry on the new side.
+ * When another worker is migrating the instance right now, the facade waits
+ * briefly for it to finish instead of failing.
  */
 export function migrated<T, NS extends DurableObjectNamespace<any>>(
   oldNamespace: NS,
@@ -690,13 +839,31 @@ export function migrated<T, NS extends DurableObjectNamespace<any>>(
 ): MigratedAccessor<T> {
   const secret = options.secret;
   const oldRouteTtlMs = options.oldRouteTtlMs ?? 30_000;
-  const routes = new Map<string, { promise: Promise<"new" | "old">; at: number }>();
+  const routes = new Map<
+    string,
+    { promise: Promise<"new" | "old">; at: number }
+  >();
   const ns = oldNamespace as DurableObjectNamespace;
 
   function oldStubFor(name: string): ExportableOldStub & ExportableStub {
-    return ns.get(
-      ns.idFromName(name),
-    ) as unknown as ExportableOldStub & ExportableStub;
+    return ns.get(ns.idFromName(name)) as unknown as ExportableOldStub &
+      ExportableStub;
+  }
+
+  function rawFor(name: string): MigrationHostStub {
+    return accessor.get(name).stub as unknown as MigrationHostStub;
+  }
+
+  /** Waits for a migration another worker is running on this instance. */
+  async function waitForMigration(name: string): Promise<boolean> {
+    const deadline = Date.now() + 15_000;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const status = await rawFor(name).__claydoImportStatus(secret);
+      if (status.kind !== undefined) return true;
+      if (status.importing === undefined) return false;
+    }
+    return false;
   }
 
   async function resolve(name: string): Promise<"new" | "old"> {
@@ -710,16 +877,36 @@ export function migrated<T, NS extends DurableObjectNamespace<any>>(
         throw new Error(
           `claydo: both the old instance '${name}' and the new instance ` +
             `'${target.kind}:${name}' are live. Fix the split before ` +
-            `routing traffic (seal the old instance, or wipe the new one).`,
+            `routing traffic: wipe the polluted new instance with ` +
+            `wipeTarget() and migrate, or seal the old one if the new ` +
+            `instance is the source of truth.`,
         );
       }
       return "new";
+    }
+    if (status.importing !== undefined) {
+      // Another worker is migrating this instance right now.
+      if (await waitForMigration(name)) return "new";
     }
     const seal = await oldStub.__claydoSealed(secret);
     if (seal.sealed) return "new";
     if (!(await oldStub.__claydoHasData(secret))) return "new";
     if (options.strategy === "lazy") {
-      await migrateInstance({ from: oldStub, to: accessor, name, secret });
+      try {
+        await migrateInstance({ from: oldStub, to: accessor, name, secret });
+      } catch (error) {
+        // A concurrent lazy migration may own the instance; wait for it.
+        const message = error instanceof Error ? error.message : "";
+        if (
+          /owns the import|is importing kind|another migration driver/.test(
+            message,
+          ) &&
+          (await waitForMigration(name))
+        ) {
+          return "new";
+        }
+        throw error;
+      }
       return "new";
     }
     return "old";
@@ -727,16 +914,8 @@ export function migrated<T, NS extends DurableObjectNamespace<any>>(
 
   function resolveCached(name: string): Promise<"new" | "old"> {
     const cached = routes.get(name);
-    if (cached !== undefined) {
-      const expired = Date.now() - cached.at > oldRouteTtlMs;
-      // "new" is final; "old" decisions expire so external drivers are seen.
-      if (!expired) return cached.promise;
-      const keep = cached.promise.then(
-        (route) => route === "new",
-        () => false,
-      );
-      routes.delete(name);
-      void keep;
+    if (cached !== undefined && Date.now() - cached.at <= oldRouteTtlMs) {
+      return cached.promise;
     }
     const entry = {
       promise: resolve(name).catch((error) => {
@@ -746,9 +925,15 @@ export function migrated<T, NS extends DurableObjectNamespace<any>>(
       at: Date.now(),
     };
     routes.set(name, entry);
-    entry.promise.then((route) => {
-      if (route === "new") entry.at = Number.MAX_SAFE_INTEGER; // never expires
-    });
+    entry.promise.then(
+      (route) => {
+        // "new" is final; "old" decisions keep their TTL.
+        if (route === "new") entry.at = Number.MAX_SAFE_INTEGER;
+      },
+      () => {
+        // Failure already evicted the cache entry above.
+      },
+    );
     return entry.promise;
   }
 
@@ -762,7 +947,20 @@ export function migrated<T, NS extends DurableObjectNamespace<any>>(
       fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
         const route = await resolveCached(name);
         if (route === "new") return target.fetch(input, init);
-        return oldStubFor(name).fetch(new Request(input, init));
+        const request = new Request(input, init);
+        const retryRequest = request.clone();
+        const response = await oldStubFor(name).fetch(request);
+        if (
+          response.status === 410 &&
+          response.headers.get(SEALED_HEADER) !== null
+        ) {
+          // The old instance sealed since the route was cached; re-resolve
+          // and retry on the new side (covers WebSocket upgrades too).
+          routes.delete(name);
+          const retry = await resolveCached(name);
+          if (retry === "new") return target.fetch(retryRequest);
+        }
+        return response;
       },
     };
     return new Proxy(meta, {
@@ -775,9 +973,9 @@ export function migrated<T, NS extends DurableObjectNamespace<any>>(
         return async (...args: unknown[]) => {
           const route = await resolveCached(name);
           if (route === "new") {
-            return (target as unknown as Record<string, (...a: unknown[]) => unknown>)[
-              prop
-            ]!(...args);
+            return (
+              target as unknown as Record<string, (...a: unknown[]) => unknown>
+            )[prop]!(...args);
           }
           try {
             const oldStub = oldStubFor(name) as unknown as Record<
@@ -788,12 +986,18 @@ export function migrated<T, NS extends DurableObjectNamespace<any>>(
           } catch (error) {
             // The old instance may have been sealed between the route check
             // and the call. Re-resolve once and retry on the new side.
-            if (error instanceof Error && error.message.includes("is sealed")) {
+            if (
+              error instanceof Error &&
+              error.message.includes("is sealed")
+            ) {
               routes.delete(name);
               const retry = await resolveCached(name);
               if (retry === "new") {
                 return (
-                  target as unknown as Record<string, (...a: unknown[]) => unknown>
+                  target as unknown as Record<
+                    string,
+                    (...a: unknown[]) => unknown
+                  >
                 )[prop]!(...args);
               }
             }

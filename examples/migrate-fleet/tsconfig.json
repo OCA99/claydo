@@ -1,0 +1,8 @@
+{
+  "extends": "../../tsconfig.json",
+  // vitest.config.ts is excluded: the workers-types `ImportMeta` has no
+  // `url` property, so `new URL(..., import.meta.url)` fails to typecheck
+  // under the workspace tsconfig (it runs under Node, not workerd).
+  "include": ["."],
+  "exclude": ["vitest.config.ts"]
+}

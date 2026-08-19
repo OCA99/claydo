@@ -281,9 +281,10 @@ class TallyImpl extends DurableObject<Env> { /* unchanged */ }
 export class Tally extends exportable(TallyImpl) {}
 ```
 
-Behavior is unchanged until an instance is sealed. Wrap the finished class:
-the seal guard covers the wrapped class and its ancestors, not methods that
-later subclasses add.
+Behavior is unchanged until an instance is sealed: the seal guards are
+synchronous, so sync methods, internal self-calls, and framework helpers
+keep working. Wrap the finished class: the seal guard covers the wrapped
+class and its ancestors, not methods that later subclasses add.
 
 ### 2. Enable imports on the host
 
@@ -327,6 +328,12 @@ instances); `manual` routes to the old instance until an external driver
 migrates it; `drain` never migrates — old instances stay old until their
 data expires, new names go to the kind.
 
+The router notices migrations quickly: RPC calls and `fetch()` requests
+(including WebSocket upgrades) that hit a freshly sealed old instance
+re-resolve the route once and retry on the new side, concurrent lazy first
+touches migrate exactly once, and when another worker is migrating an
+instance the facade waits briefly for it to finish instead of failing.
+
 ### 4. Cut over and reclaim the slot
 
 When the old namespace is empty, replace `migrated()` with the plain
@@ -335,18 +342,43 @@ deletes the old namespace — the goal of the exercise.
 
 ### What moves, and the guarantees
 
-The copy includes SQLite tables (with rowids, indexes, triggers, views, and
-AUTOINCREMENT sequences), KV entries, and the pending alarm. The order is
-strict: seal the old instance (writes freeze; its `fetch()` answers 410, its
-`alarm()` becomes a no-op), stream chunks, verify row and KV totals, then
-pin the kind — the new instance serves no traffic until the final chunk. On
-failure, the partial import is discarded and the old instance is unsealed.
-On a crash, the old instance stays sealed and the next run resumes from the
-last applied chunk. Re-running a completed migration is a no-op.
+The copy includes SQLite tables (with rowids, rowid-alias primary keys in
+any column position, indexes, triggers, views, and AUTOINCREMENT
+sequences), KV entries (all user keys, including keys that start with
+`__claydo` — only the library's three exact reserved keys stay behind), and
+the pending alarm.
+
+The order is strict and race-proof:
+
+1. **Reserve the target.** From this moment, traffic to the target blocks
+   with a clear "importing" error instead of initializing an empty
+   instance. Exactly one driver owns the reservation; concurrent drivers
+   fail fast without touching anything, and a crashed driver's reservation
+   goes stale after ~30 seconds so the next run adopts and resumes it.
+2. **Seal the old instance.** Writes freeze, `fetch()` answers 410 with the
+   `x-claydo-sealed` header, open hibernatable WebSockets close with code
+   1012 so clients reconnect, and alarms that come due are deferred — not
+   lost — until the migration completes.
+3. **Stream, verify, go live.** Chunks apply idempotently; totals are
+   verified; the kind pins only after the final chunk.
+4. **Record the move.** The old instance remembers where it moved and
+   deletes its alarm. Only now does a re-run report `{ skipped: true }`.
+
+On failure, the partial import is discarded and the old instance is
+unsealed — unless another driver owns the migration, in which case nothing
+is touched. Instances with no rows and no KV entries are skipped without
+sealing anything (pass `allowEmpty: true` to migrate schema-only
+instances), so stale registry entries cannot fabricate sealed husks.
+
+Recovery: if traffic reached the target before the migration ever ran, the
+target is "polluted" and the driver refuses with a both-live error. Wipe
+the polluted target with `wipeTarget(accessor, name)` and re-run — it
+clears storage, alarms, import state, and the in-memory kind pin.
 
 Limits: `WITHOUT ROWID` and virtual tables are not supported (the export
-fails with a clear error). Live WebSockets do not move — clients reconnect
-and land on the new instance. Old `newUniqueId()` instances cannot keep
+fails with a clear error and rolls back). Live WebSocket connections do not
+move — sealing closes them with code 1012 and reconnects land on the new
+instance through the router. Old `newUniqueId()` instances cannot keep
 their IDs; give them names (for example `migrated:<oldId>`). When the old
 class lives in another Worker, set the same `secret` on `exportable()`, on
 `union()`, and in the driver options.

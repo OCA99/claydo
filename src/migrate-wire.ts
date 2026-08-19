@@ -10,6 +10,26 @@ export const SEAL_KEY = "__claydo:sealed";
 /** Storage key on the NEW instance that tracks an import in progress. */
 export const IMPORT_STATE_KEY = "__claydo:import";
 
+/**
+ * The exact storage keys the library reserves. Everything else — including
+ * other keys that happen to start with `__claydo` — is user data and
+ * migrates normally.
+ */
+export const RESERVED_STORAGE_KEYS: ReadonlySet<string> = new Set([
+  SEAL_KEY,
+  IMPORT_STATE_KEY,
+  "__claydo:kind",
+]);
+
+/** Response header set on 410 responses from sealed instances. */
+export const SEALED_HEADER = "x-claydo-sealed";
+
+/**
+ * An import in progress goes stale when no chunk arrived for this long.
+ * A stale import can be adopted (resumed or restarted) by another driver.
+ */
+export const IMPORT_STALE_MS = 30_000;
+
 /** A value that SQLite can hold. */
 export type SqlValue = null | number | string | ArrayBuffer;
 
@@ -27,8 +47,18 @@ export interface ExportChunk {
   tables?: { name: string; ddl: string }[];
   /** A page of KV entries (never more than 128, the batch-put limit). */
   kv?: [string, unknown][];
-  /** A page of rows for one table. `columns` starts with `__rowid__`. */
-  rows?: { table: string; columns: string[]; values: SqlValue[][] };
+  /**
+   * A page of rows for one table. When `rowid` is `"__rowid__"`, the first
+   * column carries the rowid explicitly. When `rowid` names a column, that
+   * column is the INTEGER PRIMARY KEY alias and carries the rowid itself,
+   * wherever it sits in the column list.
+   */
+  rows?: {
+    table: string;
+    columns: string[];
+    values: SqlValue[][];
+    rowid: string;
+  };
   /** DDL for indexes, triggers, and views. Final chunk only, applied after rows. */
   post?: string[];
   /** `sqlite_sequence` entries for AUTOINCREMENT tables. Final chunk only. */
@@ -47,6 +77,20 @@ export interface ImportState {
   seq: number;
   cursor: ExportCursor | null;
   applied: { kv: number; rows: Record<string, number> };
+  /** The driver that owns this import. Chunks from other drivers fail. */
+  token: string;
+  /** Refreshed on every chunk; used for stale-import adoption. */
+  updatedAtMs: number;
+}
+
+/** The result of reserving an import with `__claydoBeginImport`. */
+export interface ImportBegin {
+  /** The last applied chunk seq; 0 for a fresh import. */
+  seq: number;
+  /** The cursor to resume the export from; null for a fresh import. */
+  cursor: ExportCursor | null;
+  /** True when this call adopted an existing (stale or own) import. */
+  resumed: boolean;
 }
 
 /** Acknowledgement returned by the host for each imported chunk. */
@@ -64,7 +108,13 @@ export interface ImportStatus {
   /** The pinned kind, when the instance is live. */
   kind?: string;
   /** Present while an import is in progress. */
-  importing?: { kind: string; seq: number; cursor: ExportCursor | null };
+  importing?: {
+    kind: string;
+    seq: number;
+    cursor: ExportCursor | null;
+    /** Milliseconds since the last applied chunk. */
+    ageMs: number;
+  };
 }
 
 /** Quotes an SQLite identifier. */

@@ -157,6 +157,54 @@ export class Tally extends DurableObject<Env> {
       .one().value;
   }
 
+  /** Sync self-call: breaks if a wrapper turns bump() async. */
+  bumpAndRead(label: string): number {
+    const value = this.bump(label);
+    return value + 100;
+  }
+
+  removeLabel(label: string): void {
+    this.ctx.storage.sql.exec(`DELETE FROM counts WHERE label = ?`, label);
+  }
+
+  maxCountId(): number {
+    return this.ctx.storage.sql
+      .exec<{ m: number }>(`SELECT COALESCE(MAX(id), 0) AS m FROM counts`)
+      .one().m;
+  }
+
+  /** A rowid-alias table whose INTEGER PRIMARY KEY is NOT the first column. */
+  addEvent(ts: number, note: string): void {
+    this.ctx.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS events (
+        ts INTEGER NOT NULL,
+        id INTEGER PRIMARY KEY,
+        note TEXT NOT NULL
+      )`,
+    );
+    this.ctx.storage.sql.exec(
+      `INSERT INTO events (ts, note) VALUES (?, ?)`,
+      ts,
+      note,
+    );
+  }
+
+  events(): { ts: number; id: number; note: string }[] {
+    return this.ctx.storage.sql
+      .exec<{ ts: number; id: number; note: string }>(
+        `SELECT ts, id, note FROM events ORDER BY id`,
+      )
+      .toArray();
+  }
+
+  async putRaw(key: string, value: string): Promise<void> {
+    await this.ctx.storage.put(key, value);
+  }
+
+  async getRaw(key: string): Promise<string | undefined> {
+    return this.ctx.storage.get<string>(key);
+  }
+
   total(): number {
     return this.ctx.storage.sql
       .exec<{ total: number }>(
