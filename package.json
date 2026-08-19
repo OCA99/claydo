@@ -1,5 +1,5 @@
 {
-  "name": "generic-durable-objects",
+  "name": "claydo",
   "version": "0.1.0",
   "description": "One Durable Object class, many use cases. Route each instance to a fixed kind and stay under the namespace limit.",
   "license": "MIT",

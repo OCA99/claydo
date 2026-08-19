@@ -101,7 +101,7 @@ describe("token bucket: config persistence", () => {
     expect(await again.config()).toEqual({ capacity: 42, refillPerSec: 7 });
     // The kind pin also persisted: raw access resolves it from storage.
     const raw = env.APP_DO.get(buckets().idFromName("key-persist"));
-    expect(await raw.__gdoKind()).toBe("bucket");
+    expect(await raw.__claydoKind()).toBe("bucket");
   });
 
   it("reconfigure refills to the new capacity", async () => {
@@ -145,7 +145,7 @@ describe("error propagation through the stub", () => {
     // NEW: the remote stack survives, followed by a marker line, then local frames.
     expect(err.stack).toContain("Bucket.configure");
     expect(err.stack).toContain(
-      "at [remote call bucket.configure() via generic-durable-objects]",
+      "at [remote call bucket.configure() via claydo]",
     );
     // Unchanged (documented as by-design): the class does not survive.
     expect(err).not.toBeInstanceOf(RangeError);
@@ -164,7 +164,7 @@ describe("resetStorage keeps the kind pinned", () => {
     expect((await bucket.take()).allowed).toBe(true);
     // The kind pin survived the deleteAll (this is what resetStorage adds).
     const raw = env.APP_DO.get(buckets().idFromName("key-reset"));
-    expect(await raw.__gdoKind()).toBe("bucket");
+    expect(await raw.__claydoKind()).toBe("bucket");
   });
 });
 

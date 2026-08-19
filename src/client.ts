@@ -1,5 +1,5 @@
 import type {
-  GdoCallResult,
+  ClaydoCallResult,
   GenericDurableObjectInstance,
   WireError,
 } from "./host";
@@ -183,22 +183,22 @@ function makeStub<T>(
       // Do not present the stub as a thenable to `await`.
       if (prop === "then") return undefined;
       return async (...args: unknown[]) => {
-        let result: GdoCallResult;
+        let result: ClaydoCallResult;
         try {
           // The RPC type mapping widens the `ok` literal, so restate the type.
-          result = (await stub.__gdoCall(
+          result = (await stub.__claydoCall(
             kindName,
             prop,
             args,
             allowInit,
-          )) as GdoCallResult;
+          )) as ClaydoCallResult;
         } catch (transport) {
           // The call failed outside the envelope: transport errors, or the
           // return value did not serialize. Add call context.
           const message =
             transport instanceof Error ? transport.message : String(transport);
           throw new Error(
-            `generic-durable-objects: call to ${kindName}.${prop}() failed: ${message}`,
+            `claydo: call to ${kindName}.${prop}() failed: ${message}`,
             { cause: transport },
           );
         }
@@ -222,7 +222,7 @@ function reviveError(wire: WireError, kindName: string, method: string): Error {
   const localFrames = error.stack?.split("\n").slice(1).join("\n");
   const remote = wire.stack ?? `${wire.name}: ${wire.message}`;
   error.stack =
-    `${remote}\n    at [remote call ${kindName}.${method}() via generic-durable-objects]` +
+    `${remote}\n    at [remote call ${kindName}.${method}() via claydo]` +
     (localFrames ? `\n${localFrames}` : "");
   return error;
 }

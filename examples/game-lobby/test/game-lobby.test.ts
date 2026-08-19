@@ -202,7 +202,7 @@ describe("dx probes", () => {
     const wrong = kind(env.APP_DO, "lobby").fromId(id);
     // Post-fix: the message now names the exact instance.
     await expect(wrong.listMatches()).rejects.toThrow(
-      `generic-durable-objects: instance '${id}' is kind 'game', but the caller expected kind 'lobby'.`,
+      `claydo: instance '${id}' is kind 'game', but the caller expected kind 'lobby'.`,
     );
   });
 
@@ -210,7 +210,7 @@ describe("dx probes", () => {
     const freshId = env.APP_DO.newUniqueId().toString();
     const ghost = kind(env.APP_DO, "game").fromId(freshId);
     const expected =
-      `generic-durable-objects: instance '${freshId}' has no kind yet. ` +
+      `claydo: instance '${freshId}' has no kind yet. ` +
       `It was accessed as kind 'game' through fromId(), which never ` +
       `initializes an instance. Create the instance first with ` +
       `kind(ns, 'game').get(name) or .unique(), then reach it by id.`;
@@ -222,7 +222,7 @@ describe("dx probes", () => {
     // The refusal left no kind pinned: a later legitimate unique()-style
     // initialization path would still be possible (nothing was persisted).
     const raw = env.APP_DO.get(env.APP_DO.idFromString(freshId));
-    expect(await raw.__gdoKind()).toBeUndefined();
+    expect(await raw.__claydoKind()).toBeUndefined();
   });
 
   it("PROBE: unique() id round-trip through lobby SQLite", async () => {
@@ -248,7 +248,7 @@ describe("dx probes", () => {
     const viaGame = kind(env.APP_DO, "game").fromId(raw.id.toString());
     // Post-fix: the message now names the affected instance.
     await expect(viaGame.state()).rejects.toThrow(
-      `generic-durable-objects: unknown kind 'match' on instance '${raw.id.toString()}'. Registered kinds: lobby, game.`,
+      `claydo: unknown kind 'match' on instance '${raw.id.toString()}'. Registered kinds: lobby, game.`,
     );
   });
 
@@ -256,7 +256,7 @@ describe("dx probes", () => {
     expect(() =>
       union({ "bad:kind": Game }),
     ).toThrowErrorMatchingInlineSnapshot(
-      `[Error: generic-durable-objects: invalid kind name 'bad:kind'. Kind names must be non-empty, must not contain ':' and must not start with '__'.]`,
+      `[Error: claydo: invalid kind name 'bad:kind'. Kind names must be non-empty, must not contain ':' and must not start with '__'.]`,
     );
   });
 
@@ -268,14 +268,14 @@ describe("dx probes", () => {
     // MetricsDO's registry (TypeScript rejects it; runtime check below).
     const confused = kind(env.METRICS_DO as any, "game").get("x");
     await expect((confused as any).state()).rejects.toThrow(
-      "generic-durable-objects: unknown kind 'game' on instance 'game:x'. Registered kinds: metrics.",
+      "claydo: unknown kind 'game' on instance 'game:x'. Registered kinds: metrics.",
     );
   });
 
   it("PROBE: calling a plain property through the stub explains itself", async () => {
     const metrics = kind(env.METRICS_DO, "metrics").get("props");
     await expect((metrics as any).version()).rejects.toThrow(
-      "generic-durable-objects: 'version' on kind 'metrics' is a property, not a method (type: number). The stub only proxies methods; add a getter method to read it.",
+      "claydo: 'version' on kind 'metrics' is a property, not a method (type: number). The stub only proxies methods; add a getter method to read it.",
     );
   });
 
@@ -287,7 +287,7 @@ describe("dx probes", () => {
       }
     }
     expect(() => union({ bad: BadKind })).toThrow(
-      "generic-durable-objects: kind 'bad' (class BadKind) defines a method " +
+      "claydo: kind 'bad' (class BadKind) defines a method " +
         "named 'name'. The stub reserves 'id', 'name', 'kind', 'stub' for " +
         "metadata, so this method would not be callable. Rename the method.",
     );
@@ -305,7 +305,7 @@ describe("dx probes", () => {
     const id = await lobby().createMatch(["alice", "bob"]);
     const game = games().fromId(id);
     await expect((game as any).moev("alice", 0)).rejects.toThrow(
-      "generic-durable-objects: kind 'game' has no method 'moev'.",
+      "claydo: kind 'game' has no method 'moev'.",
     );
   });
 
@@ -315,7 +315,7 @@ describe("dx probes", () => {
     expect(response.status).toBe(400);
     // Post-fix: names the instance and the unique-id initialization path.
     expect(await response.text()).toBe(
-      `generic-durable-objects: instance '${raw.id.toString()}' has no kind yet. ` +
+      `claydo: instance '${raw.id.toString()}' has no kind yet. ` +
         `Unique-ID instances initialize on their first call through kind(ns, '<kind>').unique().`,
     );
   });

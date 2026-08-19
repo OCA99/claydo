@@ -1,6 +1,6 @@
 export { union, instanceName, resetStorage } from "./host";
 export type {
-  GdoCallResult,
+  ClaydoCallResult,
   GenericDurableObjectClass,
   GenericDurableObjectInstance,
   WireError,

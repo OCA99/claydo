@@ -1,6 +1,6 @@
 {
   "$schema": "../../node_modules/wrangler/config-schema.json",
-  "name": "gdo-example-chat-rooms",
+  "name": "claydo-example-chat-rooms",
   "main": "./worker.ts",
   "compatibility_date": "2026-08-01",
   "durable_objects": {

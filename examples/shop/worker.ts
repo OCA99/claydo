@@ -1,5 +1,5 @@
 /**
- * shop example for generic-durable-objects.
+ * shop example for claydo.
  *
  * Two kinds share one host DO class:
  *  - `inventory`: one instance per product (`get(productId)`), stock in SQLite.

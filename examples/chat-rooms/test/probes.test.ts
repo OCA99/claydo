@@ -15,7 +15,7 @@ describe("stub misuse", () => {
   it("rejects a typo'd method name at runtime", async () => {
     const limiter = kind(env.APP_DO, "limiter").get("typo-probe");
     await expect((limiter as any).consme()).rejects.toThrow(
-      "generic-durable-objects: kind 'limiter' has no method 'consme'.",
+      "claydo: kind 'limiter' has no method 'consme'.",
     );
   });
 
@@ -32,7 +32,7 @@ describe("stub misuse", () => {
     // `windowMs` is a real public property on Limiter (value 60000). The
     // error no longer claims it does not exist; it names the actual problem.
     await expect((limiter as any).windowMs()).rejects.toThrow(
-      "generic-durable-objects: 'windowMs' on kind 'limiter' is a property, " +
+      "claydo: 'windowMs' on kind 'limiter' is a property, " +
         "not a method (type: number). The stub only proxies methods; " +
         "add a getter method to read it.",
     );
@@ -41,7 +41,7 @@ describe("stub misuse", () => {
   it("rejects a kind name that is not in the registry, naming the instance", async () => {
     const nope = kind(env.APP_DO as any, "mailer").get("x");
     await expect((nope as any).send()).rejects.toThrow(
-      "generic-durable-objects: unknown kind 'mailer' on instance 'mailer:x'. " +
+      "claydo: unknown kind 'mailer' on instance 'mailer:x'. " +
         "Registered kinds: chat, limiter.",
     );
   });
@@ -59,7 +59,7 @@ describe("kind identity", () => {
     await limiter.consume();
     const wrong = kind(env.APP_DO, "chat").fromId(limiter.id);
     await expect(wrong.roomInfo()).rejects.toThrow(
-      "generic-durable-objects: instance 'limiter:locked-user' is kind " +
+      "claydo: instance 'limiter:locked-user' is kind " +
         "'limiter', but the caller expected kind 'chat'.",
     );
   });
@@ -70,7 +70,7 @@ describe("kind identity", () => {
     const intended = kind(env.APP_DO, "limiter").unique();
     const impostor = kind(env.APP_DO, "chat").fromId(intended.id);
     const noKindMessage =
-      `generic-durable-objects: instance '${intended.id.toString()}' has no ` +
+      `claydo: instance '${intended.id.toString()}' has no ` +
       "kind yet. It was accessed as kind 'chat' through fromId(), which " +
       "never initializes an instance. Create the instance first with " +
       "kind(ns, 'chat').get(name) or .unique(), then reach it by id.";
@@ -116,7 +116,7 @@ describe("error propagation", () => {
     expect(error.stack).toContain("src/host.ts");
     // ...followed by the boundary marker...
     expect(error.stack).toContain(
-      "at [remote call chat.roomInfo() via generic-durable-objects]",
+      "at [remote call chat.roomInfo() via claydo]",
     );
     // ...followed by local frames (this test file).
     expect(error.stack).toContain("probes.test.ts");
@@ -132,7 +132,7 @@ describe("reserved names", () => {
       }
     }
     expect(() => union({ bad: BadKind })).toThrow(
-      "generic-durable-objects: kind 'bad' (class BadKind) defines a method " +
+      "claydo: kind 'bad' (class BadKind) defines a method " +
         "named 'name'. The stub reserves 'id', 'name', 'kind', 'stub' for " +
         "metadata, so this method would not be callable. Rename the method.",
     );
@@ -173,7 +173,7 @@ describe("partyserver ecosystem integration", () => {
     expect(response!.status).toBe(400);
     // The message now names the instance and spells out the raw-access trap.
     expect(await response!.text()).toBe(
-      "generic-durable-objects: instance 'plain-room' has no kind yet. " +
+      "claydo: instance 'plain-room' has no kind yet. " +
         "Its name has no registered '<kind>:' prefix. Raw namespace access " +
         "(for example getByName('plain-room')) reaches a different instance " +
         "than kind(ns, '<kind>').get('plain-room'). Access instances through " +

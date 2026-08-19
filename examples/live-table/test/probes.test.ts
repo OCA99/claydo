@@ -57,7 +57,7 @@ describe("probe: raw namespace access without the kind prefix", () => {
     const response = await raw.fetch("https://do/");
     expect(response.status).toBe(400);
     expect(await messageOf(response)).toBe(
-      "generic-durable-objects: instance 'room-raw' has no kind yet. " +
+      "claydo: instance 'room-raw' has no kind yet. " +
         "Its name has no registered '<kind>:' prefix. Raw namespace access " +
         "(for example getByName('room-raw')) reaches a different instance than " +
         "kind(ns, '<kind>').get('room-raw'). Access instances through the " +
@@ -106,7 +106,7 @@ describe("probe: fromId() no longer initializes", () => {
       thrown = error;
     }
     expect((thrown as Error).message).toBe(
-      `generic-durable-objects: instance '${id.toString()}' has no kind yet. ` +
+      `claydo: instance '${id.toString()}' has no kind yet. ` +
         "It was accessed as kind 'shard' through fromId(), which never " +
         "initializes an instance. Create the instance first with " +
         "kind(ns, 'shard').get(name) or .unique(), then reach it by id.",
@@ -135,7 +135,7 @@ describe("probe: fromId() no longer initializes", () => {
     await shard.insert("probe-mismatch", "x");
     const wrong = kind(env.APP_DO, "session").fromId(shard.id);
     await expect(wrong.recent()).rejects.toThrow(
-      "generic-durable-objects: instance 'shard:probe-mismatch' is kind " +
+      "claydo: instance 'shard:probe-mismatch' is kind " +
         "'shard', but the caller expected kind 'session'.",
     );
   });
@@ -168,7 +168,7 @@ describe("probe: non-method members and reserved-name shadowing", () => {
     const leaked = (probe as any).version;
     expect(typeof leaked).toBe("function"); // still truthy, still looks defined
     await expect(leaked()).rejects.toThrow(
-      "generic-durable-objects: 'version' on kind 'probe' is a property, " +
+      "claydo: 'version' on kind 'probe' is a property, " +
         "not a method (type: number). The stub only proxies methods; " +
         "add a getter method to read it.",
     );
@@ -184,7 +184,7 @@ describe("probe: non-method members and reserved-name shadowing", () => {
     // This used to be silently shadowed (stub.name() typechecked, then threw
     // TypeError at runtime). Now it fails fast, at class-creation time:
     expect(() => union({ bad: BadKind })).toThrowError(
-      "generic-durable-objects: kind 'bad' (class BadKind) defines a method " +
+      "claydo: kind 'bad' (class BadKind) defines a method " +
         "named 'name'. The stub reserves 'id', 'name', 'kind', 'stub' for " +
         "metadata, so this method would not be callable. Rename the method.",
     );
@@ -234,7 +234,7 @@ describe("probe: RPC return value serialization", () => {
     // Fixed (was my issue #1): the transport failure is wrapped with the
     // kind and method name, and the original DataCloneError rides as `cause`.
     expect((thrown as Error).message).toBe(
-      "generic-durable-objects: call to probe.returnCustomClass() failed: " +
+      "claydo: call to probe.returnCustomClass() failed: " +
         'Could not serialize object of type "Widget". This type does not support serialization.',
     );
     const cause = (thrown as Error).cause as Error;
@@ -247,7 +247,7 @@ describe("probe: typos and runtime kind names", () => {
   it("typo through `as any` fails at runtime with the library's error", async () => {
     const shard = kind(env.APP_DO, "shard").get("probe-typo");
     await expect((shard as any).isnert("probe-typo", "x")).rejects.toThrow(
-      "generic-durable-objects: kind 'shard' has no method 'isnert'.",
+      "claydo: kind 'shard' has no method 'isnert'.",
     );
     // Without `as any`, TS catches it (verbatim):
     // @ts-expect-error TS2551: Property 'isnert' does not exist on type 'KindStub<Shard>'. Did you mean 'insert'?
@@ -272,7 +272,7 @@ describe("probe: typos and runtime kind names", () => {
   it("an unregistered runtime kind name fails with the kind list AND the instance identity", async () => {
     const nope = kind(env.APP_DO, "coutner" as "probe").get("x");
     await expect(nope.echoLength("hi")).rejects.toThrow(
-      "generic-durable-objects: unknown kind 'coutner' on instance 'coutner:x'. " +
+      "claydo: unknown kind 'coutner' on instance 'coutner:x'. " +
         "Registered kinds: shard, session, probe.",
     );
   });

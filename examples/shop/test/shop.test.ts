@@ -154,7 +154,7 @@ describe("dx probes: cross-kind error propagation", () => {
     const stack = e.stack ?? "";
     const throwSite = stack.indexOf("at Inventory.reserve");
     const marker = stack.indexOf(
-      "at [remote call inventory.reserve() via generic-durable-objects]",
+      "at [remote call inventory.reserve() via claydo]",
     );
     const local = stack.indexOf("shop.test.ts");
     expect(throwSite).toBeGreaterThan(-1);
@@ -206,18 +206,18 @@ describe("dx probes: cross-kind error propagation", () => {
     expect(e.available).toBe(1);
     // Post-fix stack is a causal chain, innermost first:
     //   Inventory.reserve (worker.ts)
-    //   ... at [remote call inventory.reserve() via generic-durable-objects]
+    //   ... at [remote call inventory.reserve() via claydo]
     //   Cart.checkout (worker.ts)
-    //   ... at [remote call cart.checkout() via generic-durable-objects]
+    //   ... at [remote call cart.checkout() via claydo]
     //   <test frames>
     const stack = e.stack ?? "";
     const throwSite = stack.indexOf("at Inventory.reserve");
     const innerMarker = stack.indexOf(
-      "at [remote call inventory.reserve() via generic-durable-objects]",
+      "at [remote call inventory.reserve() via claydo]",
     );
     const rethrowSite = stack.indexOf("at Cart.checkout");
     const outerMarker = stack.indexOf(
-      "at [remote call cart.checkout() via generic-durable-objects]",
+      "at [remote call cart.checkout() via claydo]",
     );
     const local = stack.indexOf("shop.test.ts");
     expect(throwSite).toBeGreaterThan(-1);
@@ -241,7 +241,7 @@ describe("dx probes: cross-kind error propagation", () => {
     }
     const e = caught as Error & { cause?: Error };
     expect(e.message).toBe(
-      'generic-durable-objects: call to inventory.snapshot() failed: ' +
+      'claydo: call to inventory.snapshot() failed: ' +
         'Could not serialize object of type "StockSnapshot". ' +
         'This type does not support serialization.',
     );

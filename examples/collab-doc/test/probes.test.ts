@@ -27,7 +27,7 @@ describe("rpc error propagation", () => {
     expect(error.stack).toContain("collab-doc/worker.ts");
     // ...followed by the boundary marker...
     expect(error.stack).toContain(
-      "at [remote call doc.applyOp() via generic-durable-objects]",
+      "at [remote call doc.applyOp() via claydo]",
     );
     // ...followed by local frames (this test file).
     expect(error.stack).toContain("probes.test.ts");
@@ -36,7 +36,7 @@ describe("rpc error propagation", () => {
   it("rejects a typo'd method name at runtime", async () => {
     const doc = kind(env.APP_DO, "doc").get("typo");
     await expect((doc as any).getTxt()).rejects.toThrow(
-      "generic-durable-objects: kind 'doc' has no method 'getTxt'.",
+      "claydo: kind 'doc' has no method 'getTxt'.",
     );
   });
 });
@@ -68,7 +68,7 @@ describe("serialization limits", () => {
     // The bare DataCloneError is now wrapped with kind + method context.
     expect(error.name).toBe("Error");
     expect(error.message).toBe(
-      "generic-durable-objects: call to doc.getHandle() failed: " +
+      "claydo: call to doc.getHandle() failed: " +
         'Could not serialize object of type "SnapshotHandle". ' +
         "This type does not support serialization.",
     );

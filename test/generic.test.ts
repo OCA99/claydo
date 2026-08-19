@@ -61,7 +61,7 @@ describe("kind isolation", () => {
 
   it("reports no kind for untouched unique-id instances", async () => {
     const raw = env.APP_DO.get(env.APP_DO.newUniqueId());
-    expect(await raw.__gdoKind()).toBeUndefined();
+    expect(await raw.__claydoKind()).toBeUndefined();
     const response = await raw.fetch("https://do/");
     expect(response.status).toBe(400);
     expect(await response.text()).toMatch(/has no kind yet/);
@@ -75,7 +75,7 @@ describe("kind isolation", () => {
     );
     // The failed access did not pin any kind.
     const raw = env.APP_DO.get(env.APP_DO.idFromString(untouched.toString()));
-    expect(await raw.__gdoKind()).toBeUndefined();
+    expect(await raw.__claydoKind()).toBeUndefined();
     // fetch() through a fromId() stub does not initialize either.
     const response = await kind(env.APP_DO, "echo")
       .fromId(untouched)
@@ -134,7 +134,7 @@ describe("error fidelity", () => {
     expect(error.detail).toEqual({ hint: "short and stout" });
     expect(error.stack).toContain("explode");
     expect(error.stack).toContain(
-      "[remote call teapot.explode() via generic-durable-objects]",
+      "[remote call teapot.explode() via claydo]",
     );
   });
 
@@ -155,7 +155,7 @@ describe("resetStorage()", () => {
     await vault.wipe();
     expect(await vault.getValue("k")).toBeUndefined();
     const raw = env.APP_DO.get(env.APP_DO.idFromString(vault.id.toString()));
-    expect(await raw.__gdoKind()).toBe("vault");
+    expect(await raw.__claydoKind()).toBe("vault");
   });
 });
 
@@ -165,7 +165,7 @@ describe("kind resolution", () => {
     await counter.increment(7);
     // Access the same instance without the client helper.
     const raw = env.APP_DO.get(env.APP_DO.idFromName("counter:from-name"));
-    expect(await raw.__gdoKind()).toBe("counter");
+    expect(await raw.__claydoKind()).toBe("counter");
   });
 
   it("initializes unique-id instances from the call hint and pins the kind", async () => {
@@ -173,7 +173,7 @@ describe("kind resolution", () => {
     expect(await counter.increment(4)).toBe(4);
     // The kind persists, so a raw stub resolves it from storage.
     const raw = env.APP_DO.get(env.APP_DO.idFromString(counter.id.toString()));
-    expect(await raw.__gdoKind()).toBe("counter");
+    expect(await raw.__claydoKind()).toBe("counter");
     // The same unique instance is reachable again through fromId().
     const again = kind(env.APP_DO, "counter").fromId(counter.id.toString());
     expect(await again.value()).toBe(4);
@@ -184,7 +184,7 @@ describe("kind resolution", () => {
     await expect(
       (counter as any).webSocketMessage("x"),
     ).rejects.toThrow(/reserved/);
-    await expect((counter as any).__gdoCall("a", "b", [])).rejects.toThrow(
+    await expect((counter as any).__claydoCall("a", "b", [])).rejects.toThrow(
       /reserved/,
     );
     await expect((counter as any).missing()).rejects.toThrow(

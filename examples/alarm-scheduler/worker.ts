@@ -1,5 +1,5 @@
 /**
- * alarm-scheduler example for generic-durable-objects.
+ * alarm-scheduler example for claydo.
  *
  * One kind, `scheduler`, multiplexes many named logical timers over the
  * single Durable Object alarm, Cloudflare-Actors style. Jobs live in a

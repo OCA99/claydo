@@ -1,7 +1,7 @@
 # Example catalog
 
 This catalog collects Durable Object use cases from the ecosystem and maps
-them to examples in this folder. Each example uses `generic-durable-objects`
+them to examples in this folder. Each example uses `claydo`
 instead of one DO class per use case.
 
 ## Sources

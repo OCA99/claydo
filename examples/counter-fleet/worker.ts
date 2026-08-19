@@ -1,5 +1,5 @@
 /**
- * counter-fleet example for generic-durable-objects.
+ * counter-fleet example for claydo.
  *
  * Actors-style "manage instances" pattern with TWO kinds in one host class:
  *
@@ -66,7 +66,7 @@ export class Counter extends DurableObject<Env> {
 
   /**
    * Best-effort deletion, using the library's `resetStorage()` helper: it
-   * wipes all storage but re-pins the `__gdo:kind` marker, so the instance
+   * wipes all storage but re-pins the `__claydo:kind` marker, so the instance
    * never becomes a kind-less husk. The instance keeps existing as an empty
    * shell; once the registry forgets its id, nothing addresses it again.
    *

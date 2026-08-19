@@ -12,16 +12,16 @@ export type KindClass = new (ctx: DurableObjectState, env: any) => object;
 export type KindRegistry = Record<string, KindClass>;
 
 /** The header that carries the kind hint on `fetch()` calls to the stub. */
-export const KIND_HEADER = "x-gdo-kind";
+export const KIND_HEADER = "x-claydo-kind";
 
 /**
  * The header that marks a `fetch()` from a `fromId()` stub. It tells the
  * host that the kind hint must validate only, never initialize.
  */
-export const NO_INIT_HEADER = "x-gdo-no-init";
+export const NO_INIT_HEADER = "x-claydo-no-init";
 
 /** The storage key that persists the kind of an instance. */
-export const KIND_STORAGE_KEY = "__gdo:kind";
+export const KIND_STORAGE_KEY = "__claydo:kind";
 
 /**
  * Handler methods that the host Durable Object forwards to the kind

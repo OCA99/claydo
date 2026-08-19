@@ -11,7 +11,7 @@ import worker from "../worker";
 const hostedHere =
   (await env.APP_DO.get(
     env.APP_DO.idFromName("registry:__config-probe"),
-  ).__gdoKind()) === "registry";
+  ).__claydoKind()) === "registry";
 const describeHosted = describe.skipIf(!hostedHere);
 
 // NOTE: one registry instance PER TEST. Durable Object storage persisted
@@ -74,7 +74,7 @@ describeHosted("fleet management through the registry", () => {
     // frames. instanceof custom classes still does not survive (by design).
     expect(error.stack).toContain("at Registry.createCounter");
     expect(error.stack).toContain(
-      "at [remote call registry.createCounter() via generic-durable-objects]",
+      "at [remote call registry.createCounter() via claydo]",
     );
     expect(error).toBeInstanceOf(Error);
   });
@@ -172,7 +172,7 @@ describeHosted("DX probes (adversarial)", () => {
     // error, which now names the instance (verbatim):
     const wrong = kind(env.APP_DO, "registry").fromId(record.id);
     await expect(wrong.listCounters()).rejects.toThrow(
-      `generic-durable-objects: instance '${record.id}' is kind 'counter', ` +
+      `claydo: instance '${record.id}' is kind 'counter', ` +
         "but the caller expected kind 'registry'.",
     );
   });
@@ -186,7 +186,7 @@ describeHosted("DX probes (adversarial)", () => {
     // silently pinned the instance as 'tally'. POST-FIX it fails (verbatim):
     const impostor = kind(env.APP_DO, "tally").fromId(id);
     await expect(impostor.increment(1)).rejects.toThrow(
-      `generic-durable-objects: instance '${id}' has no kind yet. ` +
+      `claydo: instance '${id}' has no kind yet. ` +
         "It was accessed as kind 'tally' through fromId(), which never " +
         "initializes an instance. Create the instance first with " +
         "kind(ns, 'tally').get(name) or .unique(), then reach it by id.",
@@ -195,7 +195,7 @@ describeHosted("DX probes (adversarial)", () => {
     // fromId() is now uniformly non-initializing: even the CORRECT kind
     // cannot first-contact an instance through it.
     await expect(kind(env.APP_DO, "counter").fromId(id).value()).rejects.toThrow(
-      `generic-durable-objects: instance '${id}' has no kind yet. ` +
+      `claydo: instance '${id}' has no kind yet. ` +
         "It was accessed as kind 'counter' through fromId(), which never " +
         "initializes an instance.",
     );
@@ -209,7 +209,7 @@ describeHosted("DX probes (adversarial)", () => {
     expect(await minted.increment(1)).toBe(1);
     expect(await kind(env.APP_DO, "counter").fromId(id).value()).toBe(1);
     await expect(kind(env.APP_DO, "tally").fromId(id).value()).rejects.toThrow(
-      `generic-durable-objects: instance '${id}' is kind 'counter', ` +
+      `claydo: instance '${id}' is kind 'counter', ` +
         "but the caller expected kind 'tally'.",
     );
   });
@@ -221,7 +221,7 @@ describeHosted("DX probes (adversarial)", () => {
     //   'KindStub<Counter>'.
     // (kept as a comment so the suite stays green; verified with tsc)
     await expect((c as any).incremnt(1)).rejects.toThrow(
-      "generic-durable-objects: kind 'counter' has no method 'incremnt'.",
+      "claydo: kind 'counter' has no method 'incremnt'.",
     );
     // Property access on a missing member returns an async function rather
     // than undefined, so `typeof` checks lie:
@@ -241,7 +241,7 @@ describeHosted("DX probes (adversarial)", () => {
     await expect(
       kind(env.APP_DO, "tally").fromId(c.id).value(),
     ).rejects.toThrow(
-      "generic-durable-objects: instance 'counter:shared-name' is kind " +
+      "claydo: instance 'counter:shared-name' is kind " +
         "'counter', but the caller expected kind 'tally'.",
     );
   });
@@ -254,7 +254,7 @@ describeHosted("DX probes (adversarial)", () => {
     // The kind was already pinned in storage BEFORE the constructor ran,
     // so the instance reports a kind it has never successfully been.
     const raw = env.APP_DO.get(env.APP_DO.idFromName("broken:boom"));
-    expect(await raw.__gdoKind()).toBe("broken");
+    expect(await raw.__claydoKind()).toBe("broken");
     // Every retry re-runs the constructor and fails the same way.
     await expect(b.ping()).rejects.toThrow(
       "BrokenKind constructor exploded: missing config",
@@ -279,7 +279,7 @@ describeHosted("DX probes (adversarial)", () => {
     expect(caught!.message).toBe("no such table: counter: SQLITE_ERROR");
     expect(caught!.stack).toContain("at Counter.increment");
     expect(caught!.stack).toContain(
-      "at [remote call counter.increment() via generic-durable-objects]",
+      "at [remote call counter.increment() via claydo]",
     );
 
     // A fresh stub reaches the same broken warm instance:
@@ -302,7 +302,7 @@ describeHosted("DX probes (adversarial)", () => {
     // is a counter, even without a name prefix, and fromId() (which never
     // initializes) works because no initialization is needed.
     const raw = env.APP_DO.get(env.APP_DO.idFromString(id));
-    expect(await raw.__gdoKind()).toBe("counter");
+    expect(await raw.__claydoKind()).toBe("counter");
     const fresh = kind(env.APP_DO, "counter").fromId(id);
     expect(await fresh.value()).toBe(0); // data gone, identity intact
     expect(await fresh.increment(2)).toBe(2);
@@ -332,11 +332,11 @@ describeHosted("DX probes (adversarial)", () => {
     // call silently resurrected (and could mis-pin) it. POST-FIX fromId()
     // never initializes, so the husk is unreachable forever (verbatim):
     const raw = env.APP_DO.get(env.APP_DO.idFromString(record.id));
-    expect(await raw.__gdoKind()).toBeUndefined();
+    expect(await raw.__claydoKind()).toBeUndefined();
     await expect(
       kind(env.APP_DO, "counter").fromId(record.id).value(),
     ).rejects.toThrow(
-      `generic-durable-objects: instance '${record.id}' has no kind yet. ` +
+      `claydo: instance '${record.id}' has no kind yet. ` +
         "It was accessed as kind 'counter' through fromId(), which never " +
         "initializes an instance. Create the instance first with " +
         "kind(ns, 'counter').get(name) or .unique(), then reach it by id.",
@@ -361,7 +361,7 @@ describeHosted("post-fix library behaviors", () => {
       }
     }
     expect(() => union({ bad: Bad })).toThrow(
-      "generic-durable-objects: kind 'bad' (class Bad) defines a method " +
+      "claydo: kind 'bad' (class Bad) defines a method " +
         "named 'name'. The stub reserves 'id', 'name', 'kind', 'stub' for " +
         "metadata, so this method would not be callable. Rename the method.",
     );
@@ -378,7 +378,7 @@ describeHosted("post-fix library behaviors", () => {
     const c = kind(env.APP_DO, "counter").get("prop-probe");
     await c.increment(0); // initialize
     await expect((c as any).flavor()).rejects.toThrow(
-      "generic-durable-objects: 'flavor' on kind 'counter' is a property, " +
+      "claydo: 'flavor' on kind 'counter' is a property, " +
         "not a method (type: string). The stub only proxies methods; add a " +
         "getter method to read it.",
     );
@@ -393,7 +393,7 @@ describeHosted("post-fix library behaviors", () => {
       caught = error as Error;
     }
     expect(caught!.message).toMatch(
-      /^generic-durable-objects: call to counter\.weird\(\) failed: /,
+      /^claydo: call to counter\.weird\(\) failed: /,
     );
     expect(caught!.cause).toBeDefined();
   });

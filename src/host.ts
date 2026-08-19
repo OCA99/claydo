@@ -8,7 +8,7 @@ import {
 } from "./types";
 
 /**
- * Methods that remote callers must not invoke through `__gdoCall`.
+ * Methods that remote callers must not invoke through `__claydoCall`.
  * Lifecycle handlers run through their dedicated host handlers instead.
  */
 const RESERVED_METHODS = new Set([
@@ -41,7 +41,7 @@ export interface WireError {
  * The result envelope of a dispatched RPC call. The client helper unwraps it
  * and rethrows errors locally with the remote stack and fields attached.
  */
-export type GdoCallResult =
+export type ClaydoCallResult =
   | { ok: true; value: unknown }
   | { ok: false; error: WireError };
 
@@ -77,17 +77,17 @@ export interface GenericDurableObjectInstance<R extends KindRegistry>
   ctx: DurableObjectState;
   env: unknown;
   /** Dispatches an RPC call to the kind implementation. Internal. */
-  __gdoCall(
+  __claydoCall(
     kind: string,
     method: string,
     args: unknown[],
     allowInit?: boolean,
-  ): Promise<GdoCallResult>;
+  ): Promise<ClaydoCallResult>;
   /**
    * Returns the kind of this instance, or `undefined` when the instance has
    * no kind yet. This call never initializes the instance.
    */
-  __gdoKind(): Promise<string | undefined>;
+  __claydoKind(): Promise<string | undefined>;
   fetch(request: Request): Promise<Response>;
   alarm(alarmInfo?: AlarmInvocationInfo): Promise<void>;
   webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void>;
@@ -130,7 +130,7 @@ export function union<R extends KindRegistry>(
   for (const [name, Kind] of Object.entries(kinds)) {
     if (name.includes(":") || name.startsWith("__") || name.length === 0) {
       throw new Error(
-        `generic-durable-objects: invalid kind name '${name}'. ` +
+        `claydo: invalid kind name '${name}'. ` +
           `Kind names must be non-empty, must not contain ':' and must not start with '__'.`,
       );
     }
@@ -141,7 +141,7 @@ export function union<R extends KindRegistry>(
         const descriptor = Object.getOwnPropertyDescriptor(proto, key);
         if (descriptor && typeof descriptor.value === "function") {
           throw new Error(
-            `generic-durable-objects: kind '${name}' (class ${Kind.name}) ` +
+            `claydo: kind '${name}' (class ${Kind.name}) ` +
               `defines a method named '${key}'. The stub reserves ` +
               `'${RESERVED_STUB_KEYS.join("', '")}' for metadata, so this ` +
               `method would not be callable. Rename the method.`,
@@ -176,7 +176,7 @@ export function union<R extends KindRegistry>(
       }
       if (hint !== undefined && hint !== this.#kind) {
         throw new Error(
-          `generic-durable-objects: instance '${this.#identity()}' is kind ` +
+          `claydo: instance '${this.#identity()}' is kind ` +
             `'${this.#kind}', but the caller expected kind '${hint}'.`,
         );
       }
@@ -193,7 +193,7 @@ export function union<R extends KindRegistry>(
       const Kind = kinds[kind];
       if (Kind === undefined) {
         throw new Error(
-          `generic-durable-objects: unknown kind '${kind}' on instance ` +
+          `claydo: unknown kind '${kind}' on instance ` +
             `'${this.#identity()}'. Registered kinds: ${Object.keys(kinds).join(", ")}.`,
         );
       }
@@ -206,7 +206,7 @@ export function union<R extends KindRegistry>(
 
     #noKindMessage(hint: string | undefined, allowInit: boolean): string {
       const identity = this.#identity();
-      let message = `generic-durable-objects: instance '${identity}' has no kind yet.`;
+      let message = `claydo: instance '${identity}' has no kind yet.`;
       if (hint !== undefined && !allowInit) {
         return (
           message +
@@ -241,12 +241,12 @@ export function union<R extends KindRegistry>(
       return prefix in kinds ? prefix : undefined;
     }
 
-    async __gdoCall(
+    async __claydoCall(
       kind: string,
       method: string,
       args: unknown[],
       allowInit = true,
-    ): Promise<GdoCallResult> {
+    ): Promise<ClaydoCallResult> {
       try {
         const impl = await this.#load(kind, allowInit);
         if (
@@ -255,7 +255,7 @@ export function union<R extends KindRegistry>(
           RESERVED_METHODS.has(method)
         ) {
           throw new Error(
-            `generic-durable-objects: method '${method}' is reserved and is not callable through the stub.`,
+            `claydo: method '${method}' is reserved and is not callable through the stub.`,
           );
         }
         const fn = (impl as Record<string, unknown>)[method];
@@ -265,13 +265,13 @@ export function union<R extends KindRegistry>(
         ) {
           if (method in impl && typeof fn !== "function") {
             throw new Error(
-              `generic-durable-objects: '${method}' on kind '${kind}' is a ` +
+              `claydo: '${method}' on kind '${kind}' is a ` +
                 `property, not a method (type: ${typeof fn}). The stub only ` +
                 `proxies methods; add a getter method to read it.`,
             );
           }
           throw new Error(
-            `generic-durable-objects: kind '${kind}' has no method '${method}'.`,
+            `claydo: kind '${kind}' has no method '${method}'.`,
           );
         }
         return { ok: true, value: await fn.apply(impl, args) };
@@ -280,7 +280,7 @@ export function union<R extends KindRegistry>(
       }
     }
 
-    async __gdoKind(): Promise<string | undefined> {
+    async __claydoKind(): Promise<string | undefined> {
       if (this.#kind !== undefined) return this.#kind;
       const stored = await this.ctx.storage.get<string>(KIND_STORAGE_KEY);
       return stored ?? this.#kindFromName();
@@ -300,7 +300,7 @@ export function union<R extends KindRegistry>(
       }
       if (typeof impl.fetch !== "function") {
         return new Response(
-          `generic-durable-objects: kind '${this.#kind}' does not implement fetch().`,
+          `claydo: kind '${this.#kind}' does not implement fetch().`,
           { status: 501 },
         );
       }
@@ -320,7 +320,7 @@ export function union<R extends KindRegistry>(
         await run(impl);
       } catch (error) {
         console.error(
-          `generic-durable-objects: ${handler} failed on kind ` +
+          `claydo: ${handler} failed on kind ` +
             `'${this.#kind ?? "?"}' instance '${this.#identity()}':`,
           error,
         );

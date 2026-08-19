@@ -10,7 +10,7 @@ import { kind } from "../../../src/index";
 const hostedHere =
   (await env.APP_DO.get(
     env.APP_DO.idFromName("scheduler:__config-probe"),
-  ).__gdoKind()) === "scheduler";
+  ).__claydoKind()) === "scheduler";
 const describeHosted = describe.skipIf(!hostedHere);
 
 /** Convenience: the raw stub for a named scheduler instance. */
@@ -165,7 +165,7 @@ describeHosted("DX probes (adversarial)", () => {
       runDurableObjectAlarm(rawSchedulerStub("poison")),
     ).rejects.toThrow("poison job exploded");
     expect(errorSpy).toHaveBeenCalledWith(
-      "generic-durable-objects: alarm() failed on kind 'scheduler' " +
+      "claydo: alarm() failed on kind 'scheduler' " +
         "instance 'scheduler:poison':",
       expect.objectContaining({ message: "poison job exploded" }),
     );
@@ -179,7 +179,7 @@ describeHosted("DX probes (adversarial)", () => {
   it("PROBE: typo'd method through the stub (as any) fails at runtime", async () => {
     const s = kind(env.APP_DO, "scheduler").get("typo");
     await expect((s as any).schedul("x", 1)).rejects.toThrow(
-      "generic-durable-objects: kind 'scheduler' has no method 'schedul'.",
+      "claydo: kind 'scheduler' has no method 'schedul'.",
     );
   });
 
@@ -217,11 +217,11 @@ describeHosted("DX probes (adversarial)", () => {
     expect(caught!.message).toBe("no such table: jobs: SQLITE_ERROR");
     expect(caught!.stack).toContain("at Scheduler.list");
     expect(caught!.stack).toContain(
-      "at [remote call scheduler.list() via generic-durable-objects]",
+      "at [remote call scheduler.list() via claydo]",
     );
 
     // Restart the instance. deleteAll() does NOT delete the pending alarm,
-    // and storage no longer has `__gdo:kind`, but the name prefix
+    // and storage no longer has `__claydo:kind`, but the name prefix
     // `scheduler:` re-resolves and re-pins the kind, and the constructor
     // recreates the tables. The instance heals; only the data is gone.
     await expect(s.crash()).rejects.toThrow("scheduler crashed on purpose");
@@ -235,7 +235,7 @@ describeHosted("DX probes (adversarial)", () => {
     expect(await runDurableObjectAlarm(rawSchedulerStub("wipe-named"))).toBe(
       false,
     );
-    expect(await rawSchedulerStub("wipe-named").__gdoKind()).toBe("scheduler");
+    expect(await rawSchedulerStub("wipe-named").__claydoKind()).toBe("scheduler");
   });
 
   it("PROBE: raw deleteAll() on a UNIQUE instance now strands it permanently", async () => {
@@ -251,14 +251,14 @@ describeHosted("DX probes (adversarial)", () => {
     // DO), so the feared "alarm fires on a kind-less instance" state cannot
     // be reached through deleteAll().
     const raw = env.APP_DO.get(env.APP_DO.idFromString(id));
-    expect(await raw.__gdoKind()).toBeUndefined();
+    expect(await raw.__claydoKind()).toBeUndefined();
     expect(await runDurableObjectAlarm(raw)).toBe(false);
 
     // Raw access without a hint is rejected outright...
     const response = await raw.fetch("https://do/");
     expect(response.status).toBe(400);
     expect(await response.text()).toBe(
-      `generic-durable-objects: instance '${id}' has no kind yet. ` +
+      `claydo: instance '${id}' has no kind yet. ` +
         "Unique-ID instances initialize on their first call through " +
         "kind(ns, '<kind>').unique().",
     );
@@ -268,12 +268,12 @@ describeHosted("DX probes (adversarial)", () => {
     // amnesia is now explicit instead of a silent re-pin (verbatim):
     const again = kind(env.APP_DO, "scheduler").fromId(id);
     await expect(again.list()).rejects.toThrow(
-      `generic-durable-objects: instance '${id}' has no kind yet. ` +
+      `claydo: instance '${id}' has no kind yet. ` +
         "It was accessed as kind 'scheduler' through fromId(), which never " +
         "initializes an instance. Create the instance first with " +
         "kind(ns, 'scheduler').get(name) or .unique(), then reach it by id.",
     );
-    expect(await raw.__gdoKind()).toBeUndefined(); // still unpinned
+    expect(await raw.__claydoKind()).toBeUndefined(); // still unpinned
     // Moral: inside a kind, use the library's resetStorage(ctx) instead of
     // ctx.storage.deleteAll() (proven in the counter-fleet example).
   });
@@ -288,7 +288,7 @@ describeHosted("DX probes (adversarial)", () => {
     const response = await raw.fetch("https://do/");
     expect(response.status).toBe(400);
     expect(await response.text()).toBe(
-      `generic-durable-objects: instance '${raw.id.toString()}' has no kind yet. ` +
+      `claydo: instance '${raw.id.toString()}' has no kind yet. ` +
         "Unique-ID instances initialize on their first call through " +
         "kind(ns, '<kind>').unique().",
     );

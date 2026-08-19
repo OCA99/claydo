@@ -1,4 +1,4 @@
-# generic-durable-objects
+# claydo
 
 One Durable Object class, many use cases.
 
@@ -7,7 +7,7 @@ instance to one fixed kind, forever. You deploy one DO class, one binding, and
 one migration. You never touch migrations again when you add a kind.
 
 ```ts
-import { union, kinds } from "generic-durable-objects";
+import { union, kinds } from "claydo";
 
 // One exported DO class hosts all kinds.
 export class AppDO extends union({
@@ -43,7 +43,7 @@ instances, so they need no schema coordination and no cross-kind migrations.
 ## Install
 
 ```sh
-npm install generic-durable-objects
+npm install claydo
 ```
 
 ## Quickstart
@@ -94,7 +94,7 @@ export class ChatRoom extends DurableObject<Env> {
 
 ```ts
 // src/index.ts
-import { union } from "generic-durable-objects";
+import { union } from "claydo";
 import { Counter, ChatRoom } from "./kinds";
 
 export class AppDO extends union({
@@ -127,7 +127,7 @@ not migrations.
 ### 4. Call kinds from your Worker
 
 ```ts
-import { kinds } from "generic-durable-objects";
+import { kinds } from "claydo";
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -155,7 +155,7 @@ class, with awaited return types.
 kind name is a runtime value; type that value with `KindNameOf`:
 
 ```ts
-import { kind, type KindNameOf } from "generic-durable-objects";
+import { kind, type KindNameOf } from "claydo";
 
 const name = pickKind() as KindNameOf<typeof env.APP_DO>;
 const accessor = kind(env.APP_DO, name);
@@ -185,7 +185,7 @@ The host resolves the kind of an instance from three sources, in this order:
 2. **The name prefix.** `app.counter.get("user-42")` names the instance
    `counter:user-42`. The host reads the prefix from `ctx.id.name`.
 3. **The call hint.** The client helper sends the kind with every RPC call
-   and with a `x-gdo-kind` header on every `fetch()`. The hint initializes
+   and with a `x-claydo-kind` header on every `fetch()`. The hint initializes
    instances reached through `get()` and `unique()`. `fromId()` sends the
    hint for validation only and **never initializes** an instance.
 
@@ -219,7 +219,7 @@ When a kind method throws, the stub rethrows an `Error` to the caller with:
 
 - the original `name` and `message`;
 - the original **stack**, pointing into your kind code, followed by a marker
-  line `at [remote call <kind>.<method>() via generic-durable-objects]` and
+  line `at [remote call <kind>.<method>() via claydo]` and
   the local frames;
 - all own enumerable fields of the error that survive structured clone
   (for example `error.code` or `error.productId`).
@@ -242,7 +242,7 @@ RPC arguments and return values travel over Workers RPC:
   feature — be deliberate about returning them).
 - Custom class instances do **not** serialize. The call fails and the stub
   wraps the failure with context:
-  `generic-durable-objects: call to <kind>.<method>() failed: Could not serialize object ...`.
+  `claydo: call to <kind>.<method>() failed: Could not serialize object ...`.
   Return plain objects instead.
 
 ## Storage lifecycle
@@ -252,7 +252,7 @@ library persists. Named instances re-pin from the name prefix, but unique-ID
 instances become kind-less husks. Use the provided helper instead:
 
 ```ts
-import { resetStorage } from "generic-durable-objects";
+import { resetStorage } from "claydo";
 
 async destroy(): Promise<void> {
   await resetStorage(this.ctx); // deleteAll, but the kind stays pinned
@@ -271,7 +271,7 @@ classes match this shape. Register them directly:
 
 ```ts
 import { Server, type Connection, type WSMessage } from "partyserver";
-import { union, kinds } from "generic-durable-objects";
+import { union, kinds } from "claydo";
 
 class GameRoom extends Server<Env> {
   onMessage(connection: Connection, message: WSMessage): void {

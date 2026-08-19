@@ -1,6 +1,6 @@
 {
   "$schema": "../../node_modules/wrangler/config-schema.json",
-  "name": "gdo-example-collab-doc",
+  "name": "claydo-example-collab-doc",
   "main": "./worker.ts",
   "compatibility_date": "2026-08-01",
   "durable_objects": {

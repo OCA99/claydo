@@ -1,5 +1,5 @@
 /**
- * game-lobby example for generic-durable-objects.
+ * game-lobby example for claydo.
  *
  * Two kinds share one host DO class:
  *  - `lobby`: a singleton (`get("main")`) that creates matches and lists them.
