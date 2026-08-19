@@ -1,9 +1,11 @@
 import { DurableObject } from "cloudflare:workers";
 import { Server, type Connection, type WSMessage } from "partyserver";
 import { instanceName, kind, resetStorage, union } from "../../src/index";
+import { exportable } from "../../src/migrate";
 
 export interface Env {
   APP_DO: DurableObjectNamespace<AppDO>;
+  LEGACY: DurableObjectNamespace<LegacyTally>;
 }
 
 /** A SQLite-backed counter kind. */
@@ -123,15 +125,87 @@ export class PartyRoom extends Server<Env> {
   }
 }
 
-export class AppDO extends union({
-  counter: Counter,
-  echo: Echo,
-  reminder: Reminder,
-  plain: Plain,
-  teapot: Teapot,
-  vault: Vault,
-  party: PartyRoom,
-}) {}
+/**
+ * The class that used to be its own binding. It serves as the kind
+ * implementation after migration, and — wrapped with exportable() — as the
+ * old binding's class during migration.
+ */
+export class Tally extends DurableObject<Env> {
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    ctx.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS counts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        label TEXT NOT NULL UNIQUE,
+        value INTEGER NOT NULL
+      )`,
+    );
+    ctx.storage.sql.exec(
+      `CREATE INDEX IF NOT EXISTS counts_by_value ON counts (value)`,
+    );
+  }
+
+  bump(label: string, by = 1): number {
+    return this.ctx.storage.sql
+      .exec<{ value: number }>(
+        `INSERT INTO counts (label, value) VALUES (?, ?)
+         ON CONFLICT(label) DO UPDATE SET value = value + excluded.value
+         RETURNING value`,
+        label,
+        by,
+      )
+      .one().value;
+  }
+
+  total(): number {
+    return this.ctx.storage.sql
+      .exec<{ total: number }>(
+        `SELECT COALESCE(SUM(value), 0) AS total FROM counts`,
+      )
+      .one().total;
+  }
+
+  async note(key: string, value: string): Promise<void> {
+    await this.ctx.storage.put(`note:${key}`, value);
+  }
+
+  async getNote(key: string): Promise<string | undefined> {
+    return this.ctx.storage.get<string>(`note:${key}`);
+  }
+
+  async remindAt(timestamp: number): Promise<void> {
+    await this.ctx.storage.setAlarm(timestamp);
+  }
+
+  async alarm(): Promise<void> {
+    await this.ctx.storage.put("alarm-fired-at", Date.now());
+  }
+
+  async alarmFiredAt(): Promise<number | undefined> {
+    return this.ctx.storage.get<number>("alarm-fired-at");
+  }
+
+  async fetch(_request: Request): Promise<Response> {
+    return new Response(`tally:${instanceName(this.ctx) ?? "?"}`);
+  }
+}
+
+/** The old binding's class: the same behavior, plus the export surface. */
+export class LegacyTally extends exportable(Tally) {}
+
+export class AppDO extends union(
+  {
+    counter: Counter,
+    echo: Echo,
+    reminder: Reminder,
+    plain: Plain,
+    teapot: Teapot,
+    vault: Vault,
+    party: PartyRoom,
+    tally: Tally,
+  },
+  { importable: ["tally"] },
+) {}
 
 export default {
   async fetch(

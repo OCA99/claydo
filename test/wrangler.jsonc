@@ -4,7 +4,12 @@
   "main": "./fixtures/worker.ts",
   "compatibility_date": "2026-08-01",
   "durable_objects": {
-    "bindings": [{ "name": "APP_DO", "class_name": "AppDO" }]
+    "bindings": [
+      { "name": "APP_DO", "class_name": "AppDO" },
+      { "name": "LEGACY", "class_name": "LegacyTally" }
+    ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AppDO"] }]
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["AppDO", "LegacyTally"] }
+  ]
 }

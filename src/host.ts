@@ -1,5 +1,14 @@
 import { DurableObject } from "cloudflare:workers";
 import {
+  IMPORT_STATE_KEY,
+  quoteIdent,
+  type ExportChunk,
+  type ImportAck,
+  type ImportState,
+  type ImportStatus,
+  type SqlValue,
+} from "./migrate-wire";
+import {
   KIND_HEADER,
   KIND_STORAGE_KEY,
   NO_INIT_HEADER,
@@ -88,6 +97,17 @@ export interface GenericDurableObjectInstance<R extends KindRegistry>
    * no kind yet. This call never initializes the instance.
    */
   __claydoKind(): Promise<string | undefined>;
+  /** Applies one migration chunk. See `claydo/migrate`. Internal. */
+  __claydoImport(
+    kind: string,
+    chunk: ExportChunk,
+    seq: number,
+    secret?: string,
+  ): Promise<ImportAck>;
+  /** Reports the migration state of this instance. See `claydo/migrate`. */
+  __claydoImportStatus(secret?: string): Promise<ImportStatus>;
+  /** Discards a partial import and wipes the instance. See `claydo/migrate`. */
+  __claydoAbortImport(secret?: string): Promise<boolean>;
   fetch(request: Request): Promise<Response>;
   alarm(alarmInfo?: AlarmInvocationInfo): Promise<void>;
   webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void>;
@@ -105,6 +125,22 @@ export type GenericDurableObjectClass<R extends KindRegistry> = new (
   ctx: DurableObjectState,
   env: any,
 ) => GenericDurableObjectInstance<R>;
+
+/** Options for {@link union}. */
+export interface UnionOptions<R extends KindRegistry> {
+  /**
+   * Enables `claydo/migrate` imports into the listed kinds (or all kinds
+   * when `true`). Off by default: with imports disabled, the host rejects
+   * every `__claydoImport` call.
+   */
+  importable?: boolean | (keyof R & string)[];
+  /**
+   * When set, migration calls (`__claydoImport`, `__claydoImportStatus`,
+   * `__claydoAbortImport`) must present the same secret. Use this when the
+   * old Durable Objects live in another Worker.
+   */
+  secret?: string;
+}
 
 /**
  * Creates one Durable Object class that hosts many kinds.
@@ -126,6 +162,7 @@ export type GenericDurableObjectClass<R extends KindRegistry> = new (
  */
 export function union<R extends KindRegistry>(
   kinds: R,
+  options: UnionOptions<R> = {},
 ): GenericDurableObjectClass<R> {
   for (const [name, Kind] of Object.entries(kinds)) {
     if (name.includes(":") || name.startsWith("__") || name.length === 0) {
@@ -184,7 +221,21 @@ export function union<R extends KindRegistry>(
     }
 
     async #initialize(hint?: string, allowInit = true): Promise<void> {
-      const stored = await this.ctx.storage.get<string>(KIND_STORAGE_KEY);
+      const persisted = await this.ctx.storage.get<unknown>([
+        KIND_STORAGE_KEY,
+        IMPORT_STATE_KEY,
+      ]);
+      const importing = persisted.get(IMPORT_STATE_KEY) as
+        | ImportState
+        | undefined;
+      if (importing !== undefined) {
+        throw new Error(
+          `claydo: instance '${this.#identity()}' is importing kind ` +
+            `'${importing.kind}'. Traffic is blocked until the migration ` +
+            `completes or is aborted.`,
+        );
+      }
+      const stored = persisted.get(KIND_STORAGE_KEY) as string | undefined;
       const kind =
         stored ?? this.#kindFromName() ?? (allowInit ? hint : undefined);
       if (kind === undefined) {
@@ -284,6 +335,196 @@ export function union<R extends KindRegistry>(
       if (this.#kind !== undefined) return this.#kind;
       const stored = await this.ctx.storage.get<string>(KIND_STORAGE_KEY);
       return stored ?? this.#kindFromName();
+    }
+
+    #checkMigrationAuth(secret: string | undefined): void {
+      if (options.secret !== undefined && secret !== options.secret) {
+        throw new Error("claydo: invalid migration secret.");
+      }
+    }
+
+    async __claydoImportStatus(secret?: string): Promise<ImportStatus> {
+      this.#checkMigrationAuth(secret);
+      const persisted = await this.ctx.storage.get<unknown>([
+        KIND_STORAGE_KEY,
+        IMPORT_STATE_KEY,
+      ]);
+      const state = persisted.get(IMPORT_STATE_KEY) as ImportState | undefined;
+      const kind =
+        (persisted.get(KIND_STORAGE_KEY) as string | undefined) ?? this.#kind;
+      return {
+        kind,
+        importing: state
+          ? { kind: state.kind, seq: state.seq, cursor: state.cursor }
+          : undefined,
+      };
+    }
+
+    async __claydoImport(
+      kind: string,
+      chunk: ExportChunk,
+      seq: number,
+      secret?: string,
+    ): Promise<ImportAck> {
+      this.#checkMigrationAuth(secret);
+      const importable = options.importable ?? false;
+      const enabled =
+        importable === true ||
+        (Array.isArray(importable) && importable.includes(kind));
+      if (!enabled) {
+        throw new Error(
+          `claydo: imports are not enabled for kind '${kind}'. Pass ` +
+            `{ importable: true } or { importable: ["${kind}"] } to union().`,
+        );
+      }
+      if (!(kind in kinds)) {
+        throw new Error(
+          `claydo: unknown kind '${kind}'. Registered kinds: ` +
+            `${Object.keys(kinds).join(", ")}.`,
+        );
+      }
+      if (this.#impl !== undefined) {
+        throw new Error(
+          `claydo: instance '${this.#identity()}' is live as kind ` +
+            `'${this.#kind}'. Imports only target untouched instances.`,
+        );
+      }
+      const persisted = await this.ctx.storage.get<unknown>([
+        KIND_STORAGE_KEY,
+        IMPORT_STATE_KEY,
+      ]);
+      const pinned = persisted.get(KIND_STORAGE_KEY) as string | undefined;
+      if (pinned !== undefined) {
+        throw new Error(
+          `claydo: instance '${this.#identity()}' is already live as kind ` +
+            `'${pinned}'. Imports only target untouched instances.`,
+        );
+      }
+      const nameKind = this.#kindFromName();
+      if (nameKind !== undefined && nameKind !== kind) {
+        throw new Error(
+          `claydo: the target name '${this.ctx.id.name}' implies kind ` +
+            `'${nameKind}', but the import declares kind '${kind}'.`,
+        );
+      }
+      let state = persisted.get(IMPORT_STATE_KEY) as ImportState | undefined;
+      if (state === undefined) {
+        if (seq !== 1) {
+          throw new Error(
+            `claydo: the first import chunk must have seq 1, got ${seq}. ` +
+              `A previous import may have been aborted; check ` +
+              `__claydoImportStatus() and restart from scratch.`,
+          );
+        }
+        state = { kind, seq: 0, cursor: null, applied: { kv: 0, rows: {} } };
+      } else {
+        if (state.kind !== kind) {
+          throw new Error(
+            `claydo: an import of kind '${state.kind}' is in progress on ` +
+              `instance '${this.#identity()}'; cannot import kind '${kind}'.`,
+          );
+        }
+        if (seq <= state.seq) {
+          return {
+            seq,
+            alreadyApplied: true,
+            done: false,
+            applied: state.applied,
+          };
+        }
+        if (seq !== state.seq + 1) {
+          throw new Error(
+            `claydo: out-of-order import chunk on instance ` +
+              `'${this.#identity()}': expected seq ${state.seq + 1}, got ` +
+              `${seq}. Another migration driver may be running.`,
+          );
+        }
+      }
+
+      const sql = this.ctx.storage.sql;
+      for (const table of chunk.tables ?? []) {
+        sql.exec(table.ddl);
+      }
+      if (chunk.rows !== undefined) {
+        const { table, columns, values } = chunk.rows;
+        const cols = ["rowid", ...columns.slice(1).map(quoteIdent)];
+        const statement =
+          `INSERT INTO ${quoteIdent(table)} (${cols.join(", ")}) ` +
+          `VALUES (${cols.map(() => "?").join(", ")})`;
+        for (const row of values) {
+          sql.exec(statement, ...(row as SqlValue[]));
+        }
+        state.applied.rows[table] =
+          (state.applied.rows[table] ?? 0) + values.length;
+      }
+      if (chunk.kv !== undefined && chunk.kv.length > 0) {
+        await this.ctx.storage.put(Object.fromEntries(chunk.kv));
+        state.applied.kv += chunk.kv.length;
+      }
+      state.seq = seq;
+      state.cursor = chunk.cursor;
+
+      if (chunk.cursor !== null) {
+        await this.ctx.storage.put(IMPORT_STATE_KEY, state);
+        return { seq, alreadyApplied: false, done: false, applied: state.applied };
+      }
+
+      // Final chunk: replay post DDL, restore sequences, verify, go live.
+      for (const ddl of chunk.post ?? []) {
+        sql.exec(ddl);
+      }
+      for (const [name, value] of chunk.sequences ?? []) {
+        try {
+          sql.exec(
+            `INSERT OR REPLACE INTO sqlite_sequence (name, seq) VALUES (?, ?)`,
+            name,
+            value,
+          );
+        } catch {
+          // No AUTOINCREMENT table was created; nothing to restore.
+        }
+      }
+      if (chunk.totals !== undefined) {
+        const mismatches: string[] = [];
+        if (chunk.totals.kv !== state.applied.kv) {
+          mismatches.push(
+            `kv: expected ${chunk.totals.kv}, applied ${state.applied.kv}`,
+          );
+        }
+        for (const [table, count] of Object.entries(chunk.totals.rows)) {
+          const applied = state.applied.rows[table] ?? 0;
+          if (applied !== count) {
+            mismatches.push(
+              `table '${table}': expected ${count} rows, applied ${applied}`,
+            );
+          }
+        }
+        if (mismatches.length > 0) {
+          await this.ctx.storage.put(IMPORT_STATE_KEY, state);
+          throw new Error(
+            `claydo: import verification failed on instance ` +
+              `'${this.#identity()}': ${mismatches.join("; ")}. Abort with ` +
+              `__claydoAbortImport() and retry.`,
+          );
+        }
+      }
+      if (typeof chunk.alarm === "number") {
+        await this.ctx.storage.setAlarm(
+          Math.max(chunk.alarm, Date.now() + 1000),
+        );
+      }
+      await this.ctx.storage.delete(IMPORT_STATE_KEY);
+      await this.ctx.storage.put(KIND_STORAGE_KEY, kind);
+      return { seq, alreadyApplied: false, done: true, applied: state.applied };
+    }
+
+    async __claydoAbortImport(secret?: string): Promise<boolean> {
+      this.#checkMigrationAuth(secret);
+      const state = await this.ctx.storage.get<ImportState>(IMPORT_STATE_KEY);
+      if (state === undefined) return false;
+      await this.ctx.storage.deleteAll();
+      await this.ctx.storage.deleteAlarm();
+      return true;
     }
 
     async fetch(request: Request): Promise<Response> {

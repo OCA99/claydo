@@ -264,6 +264,93 @@ Durable Object instances cannot be deleted, only emptied; any later access
 revives them. Design "delete" flows as `resetStorage()` plus removal of the
 id from wherever you track instances.
 
+## Migrating existing bindings
+
+`claydo/migrate` moves instances of an existing Durable Object binding into
+a kind, so you can delete the old binding and reclaim its namespace slot.
+There is no platform way to merge namespaces, so a migration is an
+application-level data copy plus a routing cutover — gradual, per instance,
+and reversible until cutover.
+
+### 1. Wrap the old class and redeploy the old Worker
+
+```ts
+import { exportable } from "claydo/migrate";
+
+class TallyImpl extends DurableObject<Env> { /* unchanged */ }
+export class Tally extends exportable(TallyImpl) {}
+```
+
+Behavior is unchanged until an instance is sealed. Wrap the finished class:
+the seal guard covers the wrapped class and its ancestors, not methods that
+later subclasses add.
+
+### 2. Enable imports on the host
+
+```ts
+export class AppDO extends union(
+  { tally: TallyImpl, ...otherKinds },
+  { importable: ["tally"] },
+) {}
+```
+
+The old class usually becomes the kind implementation as-is.
+
+### 3. Move instances
+
+Bulk, from a Worker, cron, or Workflow — you supply the instance names (from
+your own registry; Cloudflare cannot list a namespace's names):
+
+```ts
+import { migrateInstance } from "claydo/migrate";
+
+const summary = await migrateInstance({
+  from: env.OLD_TALLY.getByName(name),
+  to: kinds(env.APP_DO).tally,
+  name,
+});
+```
+
+Or lazily, on first touch, through the transitional router:
+
+```ts
+import { migrated } from "claydo/migrate";
+
+const tally = migrated(env.OLD_TALLY, kinds(env.APP_DO).tally, {
+  strategy: "lazy",
+});
+await tally.get("user-42").bump(); // migrates on first touch, then serves new
+```
+
+Router strategies: `lazy` migrates inline on first touch (fleets of small
+instances); `manual` routes to the old instance until an external driver
+migrates it; `drain` never migrates — old instances stay old until their
+data expires, new names go to the kind.
+
+### 4. Cut over and reclaim the slot
+
+When the old namespace is empty, replace `migrated()` with the plain
+accessor and ship a `deleted_classes` migration for the old class. That
+deletes the old namespace — the goal of the exercise.
+
+### What moves, and the guarantees
+
+The copy includes SQLite tables (with rowids, indexes, triggers, views, and
+AUTOINCREMENT sequences), KV entries, and the pending alarm. The order is
+strict: seal the old instance (writes freeze; its `fetch()` answers 410, its
+`alarm()` becomes a no-op), stream chunks, verify row and KV totals, then
+pin the kind — the new instance serves no traffic until the final chunk. On
+failure, the partial import is discarded and the old instance is unsealed.
+On a crash, the old instance stays sealed and the next run resumes from the
+last applied chunk. Re-running a completed migration is a no-op.
+
+Limits: `WITHOUT ROWID` and virtual tables are not supported (the export
+fails with a clear error). Live WebSockets do not move — clients reconnect
+and land on the new instance. Old `newUniqueId()` instances cannot keep
+their IDs; give them names (for example `migrated:<oldId>`). When the old
+class lives in another Worker, set the same `secret` on `exportable()`, on
+`union()`, and in the driver options.
+
 ## Third-party Durable Object libraries
 
 A kind is any class with a `(ctx, env)` constructor. Durable Object framework
