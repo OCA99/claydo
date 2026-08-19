@@ -1,0 +1,7 @@
+{
+  "extends": "../../tsconfig.json",
+  "include": ["."],
+  // import.meta.url is not declared by @cloudflare/workers-types; the vitest
+  // config runs under vitest's own loader, so keep it out of this program.
+  "exclude": ["vitest.config.ts"]
+}
