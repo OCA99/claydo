@@ -208,7 +208,10 @@ changes its kind.
   kind. Store `stub.id.toString()` to reach it again with `fromId()`.
 - `fromId(id)` reaches an existing instance. It never initializes: if the
   instance has no kind yet, calls fail and tell you to create the instance
-  with `get()` or `unique()` first.
+  with `get()` or `unique()` first. It is also the place kind mismatches
+  surface: `kind(ns, "order").fromId(productStub.id)` fails with an error
+  naming both kinds. (`get("same-name")` under two kinds is NOT a
+  mismatch — the names map to two different instances by design.)
 - `instanceName(this.ctx)` returns the logical name without the kind prefix,
   from inside a kind implementation. It is safe everywhere in a kind,
   including its constructor, because kinds construct lazily on first contact.
@@ -233,7 +236,13 @@ What does not survive: the prototype. `instanceof MyError` is `false` after
 the hop — match on `error.name` instead. Non-cloneable fields are dropped.
 For errors your callers must branch on, attach a stable discriminator field
 (for example `error.code = "RATE_LIMITED"`): fields survive the hop, and
-matching on `code` is sturdier than matching on message text.
+matching on `code` is sturdier than matching on message text. Under strict
+TypeScript the caught value is `unknown`, so narrow it once:
+
+```ts
+const remote = error as Error & { code?: string; retryAfterMs?: number };
+if (remote.code === "RATE_LIMITED") { ... }
+```
 
 Errors thrown in `alarm()` and `webSocket*` handlers have no caller to reach.
 The host logs them with `console.error`, including the kind and the instance
@@ -629,22 +638,46 @@ way. Everything above applies, plus:
 - Add `"compatibility_flags": ["nodejs_compat"]` to wrangler — the Agents
   SDK requires it.
 - Drive the agent through the claydo stub: RPC methods such as `runTurn()`
-  work directly (the host runs the agent's startup hook first, so the
-  session exists). `fetch()` through the stub reaches the agent's own
-  router.
-- `getAgentByName()` is `getServerByName()` and fails the same way, with the
-  same redirect to `kinds(ns).<kind>.get(name)`.
-- `routeAgentRequest()` looks for a binding named after the agent class, not
-  your claydo binding, and addresses instances without the kind prefix.
-  Either route manually (parse `/agents/:agent/:name` and call
+  work directly on a cold instance (the host runs the agent's startup hook
+  first, so the session exists). `fetch()` through the stub reaches the
+  agent's own router.
+- A minimal Think kind, wrapper included:
+
+```ts
+import { Think } from "@cloudflare/think";
+
+class Assistant extends Think {
+  getModel() { return myModel(this.env); }
+  // The typed stub keeps only the LAST overload of an overloaded method
+  // (a TypeScript mapped-type limit), so runTurn's "wait" mode fails to
+  // type-check remotely. The runtime accepts every mode — this wrapper is
+  // a TypeScript shim, not a runtime requirement.
+  ask(input: string) {
+    return this.runTurn({ input, mode: "wait" });
+  }
+}
+
+export class AppDO extends union({ assistant: Assistant, ...others }) {}
+// kinds(env.APP_DO).assistant.get("alice").ask("hello")
+```
+
+- Do NOT copy the routing setup from the Think quickstart. Its
+  `routeAgentRequest()` URLs (`/agents/<agent-class>/<name>`) fail against
+  a claydo host with PartyServer's error `...does not match any server
+  namespace. Did you forget to add a durable object binding to the class
+  Assistant...` — adding that binding is exactly what claydo avoids, so do
+  not follow that suggestion. Either route manually (parse
+  `/agents/:agent/:name` and call
   `kinds(env.APP_DO).<kind>.get(name).fetch(request)`), or keep
-  `routeAgentRequest()` and use kind-prefixed room names in the URL
-  (`/agents/app-do/assistant:alice` reaches the `assistant` kind instance
-  `alice`). Client helpers such as `useAgent` follow the same URL contract.
-- Overloaded methods (Think's `runTurn` has `wait`/`submit`/`stream`
-  overloads) collapse to the last overload on the typed stub — a TypeScript
-  mapped-type limit. Add a small non-overloaded wrapper method on your
-  subclass for the mode you call remotely.
+  `routeAgentRequest()` and put your claydo binding plus a kind-prefixed
+  room name in the URL: `/agents/app-do/assistant:alice` reaches the
+  `assistant` kind instance `alice`. Client helpers such as `useAgent`
+  follow the same URL contract.
+- `getAgentByName()` is `getServerByName()` and fails the same way, with
+  the same redirect to `kinds(ns).<kind>.get(name)`. Its parameter type
+  also expects an `Agent` namespace, so the call only compiles against a
+  claydo host with a cast (`getAgentByName(env.APP_DO as never, name)`) —
+  another sign to use the kind helper instead.
 - Inside the agent, `this.name` is the prefixed instance name
   (`assistant:alice`). Use `instanceName(this.ctx)` for the logical name.
 
@@ -757,7 +790,10 @@ export {};
   "compilerOptions": {
     "types": [
       "@cloudflare/workers-types",
-      "@cloudflare/vitest-pool-workers"
+      // The `/types` subpath declares the "cloudflare:test" module; the
+      // bare package name only types the Vite plugin and leaves
+      // `tsc --noEmit` failing with TS2307 on "cloudflare:test".
+      "@cloudflare/vitest-pool-workers/types"
     ]
   }
 }
@@ -777,14 +813,24 @@ it("increments", async () => {
 
 Tips that apply to your own tests:
 
+- Every call through a stub is async, even when the kind method is
+  synchronous. Always `await`; using an unawaited call as a value fails
+  with `DataCloneError: Could not serialize object of type "RpcPromise"`.
 - `runDurableObjectAlarm` and `runInDurableObject` from `cloudflare:test`
   expect a raw `DurableObjectStub`. Pass `stub.stub` (the escape hatch) or a
   raw `env.APP_DO.get(...)` stub.
 - The claydo stub proxies your kind's methods only. Introspection such as
   `stub.storage` or `stub.getAlarm()` is not RPC-reachable — use
   `runInDurableObject(stub.stub, ...)` or add a helper method to the kind.
+- `SELF.fetch()` from `cloudflare:test` drives your Worker's routes
+  end-to-end, claydo helpers included.
 - Isolated storage is per test **file**; tests within one file share DO
-  state. Use distinct instance names per test.
+  state. Give each test its own instance-name prefix (`t1-room`,
+  `t2-room`, ...) — reused names carry state between tests.
+- Expected rejections from Durable Object methods (sealed instances, wrong
+  secrets, and similar) may additionally print as `uncaught exception`
+  lines in vitest-pool-workers output even when your test catches them.
+  The tests still pass; the lines are harness noise.
 
 For the library's own suites: `npm test` (library) and
 `npm run test:examples` (the example apps under `examples/`).
