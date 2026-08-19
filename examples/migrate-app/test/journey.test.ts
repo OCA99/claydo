@@ -398,19 +398,15 @@ describe("GameCo consolidation journey", () => {
     );
   });
 
-  it("4d. the old sealed match rejects RPC; the documented 410 story needs a fetch() the class never had", async () => {
+  it("4d. the old sealed match rejects RPC; fetch() answers 410 even without a fetch() on the class", async () => {
     const old = oldMatch(matches[0]!.oldId);
     await expectRejects(() => old.state(), /is sealed/);
-    // MatchImpl never defined fetch(), and exportable() only wraps methods
-    // that exist — so there is no sealed-410 response here, just a runtime
-    // type error. (Rooms DO get the 410, see journey step 2c.)
-    let message = "";
-    try {
-      await old.fetch("https://old.gameco/");
-    } catch (error) {
-      message = (error as Error).message;
-    }
-    expect(message).toMatch(/does not define a `fetch\(\)` method/);
+    // POST-FIX: exportable() answers the sealed 410 itself, so classes that
+    // never defined fetch() still tell HTTP clients where they stand.
+    // (Previously this was a bare runtime type error.)
+    const gone = await old.fetch("https://old.gameco/");
+    expect(gone.status).toBe(410);
+    expect(gone.headers.get("x-claydo-sealed")).toBe("1");
   });
 
   // -------------------------------------------------------------------------
@@ -435,10 +431,10 @@ describe("GameCo consolidation journey", () => {
     // POST-FIX: recording the move marker deletes the old alarm, so the
     // sealed husk never wakes again (previously: armed forever, no-op fires).
     expect(await runDurableObjectAlarm(old)).toBe(false);
-    const oldFired = await runInDurableObject(old, async (instance) =>
-      (instance as unknown as { ctx: DurableObjectState }).ctx.storage.get<number>(
-        "timeout-fired-at",
-      ),
+    // `instance.ctx` is the seal-guarded state; the harness-provided state
+    // is the real one, which tests may use for introspection.
+    const oldFired = await runInDurableObject(old, async (_instance, state) =>
+      state.storage.get<number>("timeout-fired-at"),
     );
     expect(oldFired).toBeUndefined();
   });

@@ -193,7 +193,10 @@ describe("secrets", () => {
     const message = await messageOf(
       migrateInstance({ from: oldSecure(name), to: secureSessions(), name }),
     );
-    expect(message).toBe("claydo: invalid migration secret.");
+    // POST-FIX: the message names the side that rejected (the host is
+    // contacted first) and lists all three places the secret must match.
+    expect(message).toMatch(/invalid migration secret/);
+    expect(message).toMatch(/union\(\) options/);
     // Nothing happened: the old instance is untouched and unsealed.
     expect((await oldSecure(name).__claydoSealed("s1")).sealed).toBe(false);
     expect(await oldSecure(name).eventCount()).toBe(3);
@@ -210,7 +213,7 @@ describe("secrets", () => {
         secret: "not-s1",
       }),
     );
-    expect(message).toBe("claydo: invalid migration secret.");
+    expect(message).toMatch(/invalid migration secret/);
     expect((await oldSecure(name).__claydoSealed("s1")).sealed).toBe(false);
   });
 
@@ -249,7 +252,9 @@ describe("secrets", () => {
     const message = await messageOf(
       migrateInstance({ from: oldSecure(name), to: sessions(), name }),
     );
-    expect(message).toBe("claydo: invalid migration secret.");
+    // POST-FIX: the message says the OLD side (exportable wrapper) rejected.
+    expect(message).toMatch(/invalid migration secret/);
+    expect(message).toMatch(/exportable\(\) wrapper/);
     // The old instance still serves traffic.
     expect(await oldSecure(name).eventCount()).toBe(3);
   });
@@ -260,7 +265,8 @@ describe("secrets", () => {
     const message = await messageOf(
       migrateInstance({ from: old(name), to: secureSessions(), name }),
     );
-    expect(message).toBe("claydo: invalid migration secret.");
+    expect(message).toMatch(/invalid migration secret/);
+    expect(message).toMatch(/union\(\) options/);
     // The old side has no secret configured, so it accepts any value.
     const summary = await migrateInstance({
       from: old(name),

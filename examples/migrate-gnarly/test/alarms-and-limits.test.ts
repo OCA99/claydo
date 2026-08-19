@@ -188,40 +188,43 @@ describe("6. WITHOUT ROWID and virtual tables", () => {
     expect(after.tables["keep_t"]).toEqual(before.tables["keep_t"]);
   });
 
-  it("virtual table (fts5 exists in DO SQLite): fails pre-flight with a clear error and migrates after dropping it", async () => {
+  it("FTS5 virtual table (POST-FIX): migrates with searchability intact, shadow tables rebuilt", async () => {
     const source = old("virt");
     // fts5 IS available in Durable Object SQLite.
     expect(await source.seedVirtual()).toBe("ok");
 
-    await expectRejects(
-      () => migrateInstance({ from: source, to: gnarly(), name: "virt" }),
-      /^Error: claydo: table 'fts_docs' is a virtual table, which the exporter does not support\. Drop it before migrating or copy it with custom code\.$/,
-    );
-    expect(await source.__claydoSealed()).toEqual({ sealed: false });
-
-    // fts5 leaves five shadow tables behind; DROP TABLE removes them all,
-    // after which the migration succeeds.
-    const shadows = await source.runSql(
-      `SELECT name FROM sqlite_master WHERE name LIKE 'fts\\_docs%' ESCAPE '\\' ORDER BY name`,
-    );
-    expect(shadows.rows.map((r) => r[0])).toEqual([
-      "fts_docs",
-      "fts_docs_config",
-      "fts_docs_content",
-      "fts_docs_data",
-      "fts_docs_docsize",
-      "fts_docs_idx",
-    ]);
-    await source.dropTableByName("fts_docs");
+    // POST-FIX: self-contained FTS5 tables migrate. The exporter copies the
+    // fts table's own rows and skips the five shadow tables; inserting on
+    // the target rebuilds the index as it goes.
     const summary = await migrateInstance({
       from: source,
       to: gnarly(),
       name: "virt",
     });
     expect(summary.rows["keep_t"]).toBe(2);
+    expect(summary.rows["fts_docs"]).toBe(1);
+
     const rows = await gnarly()
       .get("virt")
       .runSql(`SELECT v FROM keep_t ORDER BY id`);
     expect(rows.rows.map((r) => r[0])).toEqual(["x", "y"]);
+    // The full-text index answers on the new side.
+    const hits = await gnarly()
+      .get("virt")
+      .runSql(`SELECT body FROM fts_docs WHERE fts_docs MATCH 'gnarly'`);
+    expect(hits.rows.map((r) => r[0])).toEqual(["hello gnarly world"]);
+    // The shadow tables exist on the target (recreated by the DDL replay).
+    const shadows = await gnarly()
+      .get("virt")
+      .runSql(
+        `SELECT name FROM sqlite_master WHERE name LIKE 'fts\\_docs\\_%' ESCAPE '\\' ORDER BY name`,
+      );
+    expect(shadows.rows.map((r) => r[0])).toEqual([
+      "fts_docs_config",
+      "fts_docs_content",
+      "fts_docs_data",
+      "fts_docs_docsize",
+      "fts_docs_idx",
+    ]);
   });
 });

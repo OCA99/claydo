@@ -66,9 +66,12 @@ describe("A. exportable() wrapper vs partyserver sync helpers (fixed: sync guard
     ws.accept();
     expect(await old.connectionCount()).toBe(1);
 
-    // Sealing: RPC guards throw, and the live socket is closed with 1012.
+    // Sealing: storage access throws, and the live socket is closed with
+    // 1012. Memory-only helpers (like counting connections) keep answering:
+    // the seal freezes the data, not the event loop.
     await old.__claydoSeal();
-    await expectRejects(() => old.connectionCount(), /is sealed/);
+    await expectRejects(() => old.post("system", "frozen?"), /is sealed/);
+    expect(typeof (await old.connectionCount())).toBe("number");
     const deadline = Date.now() + 2_000;
     while (closes.length === 0 && Date.now() < deadline) await sleep(50);
     expect(closes).toEqual([

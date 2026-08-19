@@ -245,10 +245,13 @@ export function union<R extends KindRegistry>(
         | ImportState
         | undefined;
       if (importing !== undefined) {
-        throw new Error(
-          `claydo: instance '${this.#identity()}' is importing kind ` +
-            `'${importing.kind}'. Traffic is blocked until the migration ` +
-            `completes or is aborted.`,
+        throw Object.assign(
+          new Error(
+            `claydo: instance '${this.#identity()}' is importing kind ` +
+              `'${importing.kind}'. Traffic is blocked until the migration ` +
+              `completes or is aborted.`,
+          ),
+          { code: "claydo_importing" },
         );
       }
       const stored = persisted.get(KIND_STORAGE_KEY) as string | undefined;
@@ -387,7 +390,11 @@ export function union<R extends KindRegistry>(
 
     #checkMigrationAuth(secret: string | undefined): void {
       if (options.secret !== undefined && secret !== options.secret) {
-        throw new Error("claydo: invalid migration secret.");
+        throw new Error(
+          "claydo: invalid migration secret (rejected by the claydo " +
+            "host's union() options). The same secret must be set on " +
+            "exportable(), on union(), and in the driver options.",
+        );
       }
     }
 
@@ -475,17 +482,20 @@ export function union<R extends KindRegistry>(
         }
         const ageMs = Date.now() - state.updatedAtMs;
         if (state.token !== token && ageMs < IMPORT_STALE_MS) {
-          throw new Error(
-            `claydo: another migration driver owns the import on instance ` +
-              `'${this.#identity()}' (last progress ${ageMs}ms ago). It is ` +
-              `not stale yet; retry later.`,
-          );
+          // A refusal is a normal outcome of correct concurrency, so it
+          // travels as a value instead of polluting logs with a throw.
+          return { ok: false, reason: "owned", ageMs };
         }
         // Adopt: same driver retrying, or a stale import from a crashed one.
         state.token = token;
         state.updatedAtMs = Date.now();
         await this.ctx.storage.put(IMPORT_STATE_KEY, state);
-        return { seq: state.seq, cursor: state.cursor, resumed: state.seq > 0 };
+        return {
+          ok: true,
+          seq: state.seq,
+          cursor: state.cursor,
+          resumed: state.seq > 0,
+        };
       }
       const fresh: ImportState = {
         kind,
@@ -496,7 +506,7 @@ export function union<R extends KindRegistry>(
         updatedAtMs: Date.now(),
       };
       await this.ctx.storage.put(IMPORT_STATE_KEY, fresh);
-      return { seq: 0, cursor: null, resumed: false };
+      return { ok: true, seq: 0, cursor: null, resumed: false };
     }
 
     async __claydoImport(
@@ -674,7 +684,9 @@ export function union<R extends KindRegistry>(
       } catch (error) {
         const message =
           error instanceof Error ? error.message : String(error);
-        if (message.includes("is importing kind")) {
+        if (
+          (error as { code?: unknown } | null)?.code === "claydo_importing"
+        ) {
           // Transient: a migration is filling this instance right now.
           return new Response(message, {
             status: 503,

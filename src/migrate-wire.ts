@@ -83,15 +83,28 @@ export interface ImportState {
   updatedAtMs: number;
 }
 
-/** The result of reserving an import with `__claydoBeginImport`. */
-export interface ImportBegin {
-  /** The last applied chunk seq; 0 for a fresh import. */
-  seq: number;
-  /** The cursor to resume the export from; null for a fresh import. */
-  cursor: ExportCursor | null;
-  /** True when this call adopted an existing (stale or own) import. */
-  resumed: boolean;
-}
+/**
+ * The result of reserving an import with `__claydoBeginImport`.
+ * A refusal (another driver owns a non-stale import) is a return value, not
+ * a thrown error, so correct concurrent behavior does not pollute the
+ * target's logs with exceptions.
+ */
+export type ImportBegin =
+  | {
+      ok: true;
+      /** The last applied chunk seq; 0 for a fresh import. */
+      seq: number;
+      /** The cursor to resume the export from; null for a fresh import. */
+      cursor: ExportCursor | null;
+      /** True when this call adopted an existing (stale or own) import. */
+      resumed: boolean;
+    }
+  | {
+      ok: false;
+      reason: "owned";
+      /** Milliseconds since the owning driver's last progress. */
+      ageMs: number;
+    };
 
 /** Acknowledgement returned by the host for each imported chunk. */
 export interface ImportAck {

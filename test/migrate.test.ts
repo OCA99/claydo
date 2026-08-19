@@ -5,7 +5,13 @@ import {
 } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { kind } from "../src/index";
-import { migrateInstance, migrated, wipeTarget } from "../src/migrate";
+import {
+  migrateInstance,
+  migrated,
+  previewInstance,
+  wipeTarget,
+  type MigrationProgress,
+} from "../src/migrate";
 import type { ImportState } from "../src/migrate-wire";
 
 const tally = () => kind(env.APP_DO, "tally");
@@ -374,5 +380,185 @@ describe("migrated() router", () => {
     );
     for (const value of results) expect(value).toBe((20 * 21) / 2);
     expect(await tally().get("r8").total()).toBe((20 * 21) / 2);
+  });
+
+  it("resolve() reports which side serves a name", async () => {
+    await seed("r9");
+    const accessor = migrated(env.LEGACY, tally(), {
+      strategy: "manual",
+      oldRouteTtlMs: 0,
+    });
+    expect(await accessor.resolve("r9")).toBe("old");
+    await migrateInstance({ from: legacy("r9"), to: tally(), name: "r9" });
+    expect(await accessor.resolve("r9")).toBe("new");
+  });
+});
+
+describe("data fidelity extensions", () => {
+  it("excludes generated columns and recomputes them on the target", async () => {
+    const old = legacy("g1");
+    await old.bump("x");
+    await old.addPriced("widget", 250);
+    await old.addPriced("gadget", 999);
+    await migrateInstance({ from: old, to: tally(), name: "g1" });
+    expect(await tally().get("g1").pricedRows()).toEqual([
+      { name: "widget", cents: 250, dollars: 2.5, upper_name: "WIDGET" },
+      { name: "gadget", cents: 999, dollars: 9.99, upper_name: "GADGET" },
+    ]);
+  });
+
+  it("migrates a self-contained FTS5 table with searchability intact", async () => {
+    const old = legacy("g2");
+    await old.bump("x");
+    await old.addDoc("the quick brown fox");
+    await old.addDoc("jumped over the lazy dog");
+    await migrateInstance({ from: old, to: tally(), name: "g2" });
+    const moved = tally().get("g2");
+    expect(await moved.searchDocs("fox")).toEqual(["the quick brown fox"]);
+    expect(await moved.searchDocs("lazy")).toEqual([
+      "jumped over the lazy dog",
+    ]);
+    // The index keeps working for rows added after the migration.
+    await moved.addDoc("a newly added document");
+    expect(await moved.searchDocs("newly")).toEqual(["a newly added document"]);
+  });
+
+  it("migrates an external-content FTS5 index by rebuilding it", async () => {
+    const old = legacy("g3");
+    await old.bump("x");
+    await runInDurableObject(old, async (_instance, state) => {
+      state.storage.sql.exec(
+        `CREATE TABLE IF NOT EXISTS articles (id INTEGER PRIMARY KEY, body TEXT NOT NULL)`,
+      );
+      state.storage.sql.exec(
+        `INSERT INTO articles (body) VALUES ('claydo migrates namespaces'), ('roses are red')`,
+      );
+      state.storage.sql.exec(
+        `CREATE VIRTUAL TABLE articles_fts USING fts5(body, content='articles', content_rowid='id')`,
+      );
+      state.storage.sql.exec(
+        `INSERT INTO articles_fts(articles_fts) VALUES('rebuild')`,
+      );
+    });
+    await migrateInstance({ from: old, to: tally(), name: "g3" });
+    const hits = await runInDurableObject(
+      rawTarget("g3"),
+      async (_instance, state) =>
+        state.storage.sql
+          .exec<{ body: string }>(
+            `SELECT body FROM articles_fts WHERE articles_fts MATCH 'namespaces'`,
+          )
+          .toArray(),
+    );
+    expect(hits).toEqual([{ body: "claydo migrates namespaces" }]);
+  });
+
+  it("refuses contentless FTS5 pre-flight, before sealing anything", async () => {
+    const old = legacy("g4");
+    await old.bump("x");
+    await runInDurableObject(old, async (_instance, state) => {
+      state.storage.sql.exec(
+        `CREATE VIRTUAL TABLE ghost USING fts5(body, content='')`,
+      );
+    });
+    await expectRejects(
+      () => migrateInstance({ from: old, to: tally(), name: "g4" }),
+      /contentless FTS5/,
+    );
+    expect((await old.__claydoSealed()).sealed).toBe(false);
+  });
+
+  it("refuses tables with a column that shadows the rowid", async () => {
+    const old = legacy("g5");
+    await old.bump("x");
+    await runInDurableObject(old, async (_instance, state) => {
+      state.storage.sql.exec(`CREATE TABLE weird (rowid TEXT, data TEXT)`);
+      state.storage.sql.exec(`INSERT INTO weird VALUES ('a', 'b')`);
+    });
+    await expectRejects(
+      () => migrateInstance({ from: old, to: tally(), name: "g5" }),
+      /shadows the rowid/,
+    );
+    expect((await old.__claydoSealed()).sealed).toBe(false);
+  });
+});
+
+describe("previewInstance and progress", () => {
+  it("previews sizes and blockers without sealing", async () => {
+    await seed("p1");
+    const preview = await previewInstance({ from: legacy("p1") });
+    expect(preview.sealed).toBe(false);
+    expect(preview.hasData).toBe(true);
+    expect(preview.rows["counts"]).toBe(2);
+    expect(preview.kv).toBe(1);
+    expect(preview.blockers).toEqual([]);
+    // Preview changed nothing.
+    expect((await legacy("p1").__claydoSealed()).sealed).toBe(false);
+    expect(await legacy("p1").bump("apples")).toBe(3);
+  });
+
+  it("preview reports blockers instead of throwing", async () => {
+    const old = legacy("p2");
+    await old.bump("x");
+    await runInDurableObject(old, async (_instance, state) => {
+      state.storage.sql.exec(
+        `CREATE TABLE norow (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID`,
+      );
+    });
+    const preview = await previewInstance({ from: old });
+    expect(preview.blockers.length).toBe(1);
+    expect(preview.blockers[0]).toMatch(/WITHOUT ROWID/);
+  });
+
+  it("reports progress per chunk", async () => {
+    const old = legacy("p3");
+    for (let i = 0; i < 9; i++) await old.bump(`l${i}`);
+    const progress: MigrationProgress[] = [];
+    const summary = await migrateInstance({
+      from: old,
+      to: tally(),
+      name: "p3",
+      maxRowsPerChunk: 2,
+      onProgress: (update) => progress.push(update),
+    });
+    expect(progress.length).toBe(summary.chunks);
+    expect(progress.at(-1)!.done).toBe(true);
+    expect(progress.at(-1)!.applied.rows["counts"]).toBe(9);
+    expect(progress.slice(0, -1).every((update) => !update.done)).toBe(true);
+  });
+});
+
+describe("framework-shaped classes", () => {
+  const fw = () => kind(env.APP_DO, "fw");
+
+  function legacyFw(name: string) {
+    return env.LEGACY_FW.get(env.LEGACY_FW.idFromName(name));
+  }
+
+  it("exportable() preserves construction and prototype shape", async () => {
+    // FrameworkImpl's constructor calls a prototype method during super()
+    // and then verifies no prototype level owns both deprecated hooks.
+    // Construction succeeding at all is the assertion.
+    const old = legacyFw("f1");
+    await old.setEntry("greeting", "hello");
+    expect(await old.getEntry("greeting")).toBe("hello");
+  });
+
+  it("seals framework instances and migrates them", async () => {
+    const old = legacyFw("f2");
+    await old.setEntry("a", "1");
+    await old.setEntry("b", "2");
+    const summary = await migrateInstance({
+      from: old as never,
+      to: fw(),
+      name: "f2",
+    });
+    expect(summary.skipped).toBe(false);
+    expect(summary.rows["fw"]).toBe(2);
+    expect(await fw().get("f2").getEntry("a")).toBe("1");
+    // The old side is frozen: storage access fails with the seal message.
+    await expectRejects(() => old.getEntry("a"), /is sealed/);
+    const gone = await old.fetch("https://do/");
+    expect(gone.status).toBe(410);
   });
 });

@@ -57,18 +57,120 @@ interface SealRecord {
   at: number;
 }
 
+/**
+ * Per-instance migration state, held off the instance so the wrapper never
+ * needs private fields (framework base classes call their own methods from
+ * inside `super()`, before a subclass private field would exist) and never
+ * reshapes the prototype chain (framework base classes inspect it).
+ */
+interface SealHolder {
+  sealed: SealRecord | null;
+  /** The real, unguarded state. The library's own operations use it. */
+  ctx: DurableObjectState;
+}
+
+const holders = new WeakMap<object, SealHolder>();
+
+function holderOf(instance: object): SealHolder {
+  const holder = holders.get(instance);
+  if (holder === undefined) {
+    throw new Error(
+      "claydo: exportable() state missing. Construct instances only " +
+        "through the wrapped class.",
+    );
+  }
+  return holder;
+}
+
+/**
+ * Wraps `ctx.storage` (and `ctx.storage.sql`) so every storage access
+ * fails while the instance is sealed — however the wrapped class captured
+ * the reference. Guarding effects instead of rewriting methods keeps the
+ * class's prototype chain untouched, which framework base classes (Agents
+ * SDK, PartyServer) inspect and depend on. The guard is synchronous:
+ * unsealed instances behave exactly as before, including sync return
+ * values and self-calls.
+ */
+function guardObject<T extends object>(real: T, holder: SealHolder): T {
+  return new Proxy(real, {
+    get(target, prop) {
+      const value = Reflect.get(target, prop, target);
+      if (typeof value !== "function") return value;
+      return (...args: unknown[]) => {
+        const seal = holder.sealed;
+        if (seal) throw new Error(sealMessage(holder.ctx, seal));
+        return Reflect.apply(value, target, args);
+      };
+    },
+  }) as T;
+}
+
+function guardState(holder: SealHolder): DurableObjectState {
+  const real = holder.ctx;
+  const storage = new Proxy(real.storage, {
+    get(target, prop) {
+      if (prop === "sql") return sql;
+      const value = Reflect.get(target, prop, target);
+      if (typeof value !== "function") return value;
+      return (...args: unknown[]) => {
+        const seal = holder.sealed;
+        if (seal) throw new Error(sealMessage(holder.ctx, seal));
+        return Reflect.apply(value, target, args);
+      };
+    },
+  }) as DurableObjectStorage;
+  const sql = guardObject(real.storage.sql, holder);
+  return new Proxy(real, {
+    get(target, prop) {
+      if (prop === "storage") return storage;
+      const value = Reflect.get(target, prop, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  }) as DurableObjectState;
+}
+
+type AnyMethod = (this: unknown, ...args: unknown[]) => unknown;
+
+/** Finds a prototype method of the wrapped class (or its ancestors). */
+function protoMethod(proto: object, name: string): AnyMethod | undefined {
+  let current: object | null = proto;
+  while (current !== null && current !== Object.prototype) {
+    const descriptor = Object.getOwnPropertyDescriptor(current, name);
+    if (descriptor && typeof descriptor.value === "function") {
+      return descriptor.value as AnyMethod;
+    }
+    current = Object.getPrototypeOf(current);
+  }
+  return undefined;
+}
+
 interface ExportLimits {
   maxRows?: number;
   maxBytes?: number;
 }
 
+/** What {@link previewInstance} reports, without sealing anything. */
+export interface MigrationPreview {
+  sealed: boolean;
+  /** Where the instance moved, when the migration already completed. */
+  movedTo?: string;
+  /** True when the instance holds any rows or KV entries. */
+  hasData: boolean;
+  kv: number;
+  rows: Record<string, number>;
+  /** The pending alarm timestamp, or null. */
+  alarm: number | null;
+  /** Problems that would make `migrateInstance` fail on this instance. */
+  blockers: string[];
+}
+
 /** The methods that {@link exportable} adds to the old class. */
 export interface ExportableInstance {
   /**
-   * Freezes the instance: every user method fails until unseal, `fetch()`
-   * answers 410 with the `x-claydo-sealed` header, alarms are preserved but
-   * deferred, and open hibernatable WebSockets close with code 1012 so
-   * clients reconnect.
+   * Freezes the instance: every storage access fails until unseal,
+   * `fetch()` answers 410 with the `x-claydo-sealed` header, alarms are
+   * preserved but deferred, and open hibernatable WebSockets close with
+   * code 1012 so clients reconnect.
    */
   __claydoSeal(secret?: string, movedTo?: string): Promise<void>;
   /** Reverses a seal, for migration rollback. */
@@ -77,6 +179,8 @@ export interface ExportableInstance {
   __claydoSealed(secret?: string): Promise<{ sealed: boolean; movedTo?: string }>;
   /** True when the instance has any user data (table rows or KV entries). */
   __claydoHasData(secret?: string): Promise<boolean>;
+  /** Reports sizes, alarm, seal state, and blockers. Never seals. */
+  __claydoStats(secret?: string): Promise<MigrationPreview>;
   /** Returns the next export chunk. The instance must be sealed. */
   __claydoExport(
     secret: string | undefined,
@@ -101,14 +205,35 @@ export interface ExportableClass<I> {
   new (...args: any[]): I & ExportableInstance;
 }
 
+/** A table whose rows stream chunk by chunk. */
+interface TableMeta {
+  name: string;
+  ddl: string;
+  rowidAlias: string | null;
+  /** Visible, non-generated columns, in declaration order. */
+  columns: string[];
+}
+
+interface TableInspection {
+  tables: TableMeta[];
+  /** DDL replayed on the target after all rows (external-content FTS5). */
+  post: string[];
+  /** Problems that make the instance non-exportable as-is. */
+  blockers: string[];
+}
+
 /**
  * Wraps a finished Durable Object class so its instances can be exported
  * into a claydo kind. Deploy this wrapper on the OLD Worker; behavior is
- * unchanged until an instance is sealed. The seal guards are synchronous,
- * so internal self-calls (`this.method()`) and sync helpers keep working.
+ * unchanged until an instance is sealed.
  *
- * Wrap the complete class: the seal guard covers the methods of the wrapped
- * class and its ancestors, not methods added by later subclasses.
+ * The wrapper does not touch the class's methods or prototype chain (so
+ * framework base classes such as PartyServer `Server` or the Agents SDK
+ * `Agent` keep working). Instead it wraps `ctx.storage`: while sealed,
+ * every storage read and write fails, `fetch()` answers 410, alarms defer,
+ * and WebSocket handlers go quiet. The guards are synchronous, so internal
+ * self-calls (`this.method()`) and sync helpers keep working while
+ * unsealed.
  *
  * @example
  * class TallyImpl extends DurableObject<Env> { ... }
@@ -123,120 +248,117 @@ export function exportable<I extends object>(
   const ConcreteBase = Base as unknown as new (
     ...args: any[]
   ) => DurableObjectLike;
-  class Exportable extends ConcreteBase {
-    #sealed: SealRecord | null = null;
 
+  const baseFetch = protoMethod(ConcreteBase.prototype, "fetch");
+  const baseAlarm = protoMethod(ConcreteBase.prototype, "alarm");
+  const baseWsMessage = protoMethod(ConcreteBase.prototype, "webSocketMessage");
+  const baseWsClose = protoMethod(ConcreteBase.prototype, "webSocketClose");
+  const baseWsError = protoMethod(ConcreteBase.prototype, "webSocketError");
+
+  class Exportable extends ConcreteBase {
     constructor(...args: any[]) {
+      // The runtime brand-checks the state argument, so the real one must
+      // travel through the constructor chain untouched.
       super(...args);
+      const realCtx = args[0] as DurableObjectState;
+      const holder: SealHolder = { sealed: null, ctx: realCtx };
+      holders.set(this, holder);
+      // Shadow `this.ctx` with the guarded state, so every storage access
+      // after construction honors the seal. (References captured inside
+      // the wrapped constructor itself still reach the real storage; the
+      // entry-point guards below cover those paths.)
+      Object.defineProperty(this, "ctx", {
+        value: guardState(holder),
+        writable: true,
+        configurable: true,
+      });
       // Load the seal state before any event is delivered, so the guards
-      // can stay synchronous and fully transparent while unsealed.
-      this.ctx.blockConcurrencyWhile(async () => {
-        this.#sealed =
-          (await this.ctx.storage.get<SealRecord>(SEAL_KEY)) ?? null;
+      // stay synchronous and fully transparent while unsealed.
+      realCtx.blockConcurrencyWhile(async () => {
+        holder.sealed =
+          (await realCtx.storage.get<SealRecord>(SEAL_KEY)) ?? null;
       });
     }
 
-    /**
-     * Puts seal-guarded wrappers for every method of the wrapped class onto
-     * this prototype. Workers RPC resolves methods through the prototype
-     * chain, so the wrappers shadow the originals for local and remote
-     * callers alike. The guards are synchronous: unsealed instances behave
-     * exactly as before, including sync return values and self-calls.
-     */
-    static {
-      const seen = new Set<string>();
-      let proto: object | null = ConcreteBase.prototype as object;
-      while (
-        proto !== null &&
-        proto !== Object.prototype &&
-        proto.constructor?.name !== "DurableObject"
-      ) {
-        for (const key of Object.getOwnPropertyNames(proto)) {
-          if (
-            key === "constructor" ||
-            key.startsWith("__claydo") ||
-            seen.has(key)
-          ) {
-            continue;
-          }
-          const descriptor = Object.getOwnPropertyDescriptor(proto, key);
-          if (!descriptor || typeof descriptor.value !== "function") continue;
-          seen.add(key);
-          const original = descriptor.value as (...args: unknown[]) => unknown;
-          let wrapper: (this: Exportable, ...args: unknown[]) => unknown;
-          if (key === "fetch") {
-            wrapper = function (this: Exportable, ...args: unknown[]) {
-              if (this.#sealed) {
-                return new Response(
-                  "claydo: this instance is sealed (migrating or migrated). " +
-                    "Reconnect through the current endpoint.",
-                  { status: 410, headers: { [SEALED_HEADER]: "1" } },
-                );
-              }
-              return original.apply(this, args);
-            };
-          } else if (key === "alarm") {
-            wrapper = function (this: Exportable, ...args: unknown[]) {
-              const seal = this.#sealed;
-              if (seal) {
-                if (seal.movedTo !== undefined) {
-                  // The migration completed; the alarm moved with the data.
-                  return this.ctx.storage.deleteAlarm();
-                }
-                // Preserve the alarm through the sealed window: defer it so
-                // the export can still capture and transfer it.
-                console.warn(
-                  `claydo: alarm deferred on sealed instance '${identityOf(this.ctx)}' (migration in progress).`,
-                );
-                return this.ctx.storage.setAlarm(
-                  Date.now() + SEALED_ALARM_DEFER_MS,
-                );
-              }
-              return original.apply(this, args);
-            };
-          } else if (key === "webSocketClose" || key === "webSocketError") {
-            // Sealing closes the instance's own sockets, which fires these
-            // handlers; a throw here would only produce log noise.
-            wrapper = function (this: Exportable, ...args: unknown[]) {
-              if (this.#sealed) return;
-              return original.apply(this, args);
-            };
-          } else {
-            wrapper = function (this: Exportable, ...args: unknown[]) {
-              const seal = this.#sealed;
-              if (seal) throw new Error(sealMessage(this.ctx, seal));
-              return original.apply(this, args);
-            };
-          }
-          Object.defineProperty(Exportable.prototype, key, {
-            value: wrapper,
-            writable: true,
-            configurable: true,
-          });
-        }
-        proto = Object.getPrototypeOf(proto);
+    fetch(request: Request): Response | Promise<Response> {
+      if (holders.get(this)?.sealed) {
+        return new Response(
+          "claydo: this instance is sealed (migrating or migrated). " +
+            "Reconnect through the current endpoint.",
+          { status: 410, headers: { [SEALED_HEADER]: "1" } },
+        );
       }
+      if (baseFetch === undefined) {
+        return new Response(
+          `claydo: ${ConcreteBase.name} does not implement fetch().`,
+          { status: 501 },
+        );
+      }
+      return baseFetch.apply(this, [request]) as Response | Promise<Response>;
+    }
+
+    alarm(...args: unknown[]): unknown {
+      const holder = holders.get(this);
+      const seal = holder?.sealed;
+      if (holder !== undefined && seal) {
+        if (seal.movedTo !== undefined) {
+          // The migration completed; the alarm moved with the data.
+          return holder.ctx.storage.deleteAlarm();
+        }
+        // Preserve the alarm through the sealed window: defer it so the
+        // export can still capture and transfer it.
+        console.warn(
+          `claydo: alarm deferred on sealed instance '${identityOf(holder.ctx)}' (migration in progress).`,
+        );
+        return holder.ctx.storage.setAlarm(
+          Date.now() + SEALED_ALARM_DEFER_MS,
+        );
+      }
+      return baseAlarm?.apply(this, args);
+    }
+
+    webSocketMessage(...args: unknown[]): unknown {
+      // Sealing closed this instance's sockets; drop racing messages.
+      if (holders.get(this)?.sealed) return;
+      return baseWsMessage?.apply(this, args);
+    }
+
+    webSocketClose(...args: unknown[]): unknown {
+      // Sealing closes the instance's own sockets, which fires this
+      // handler; running user code (or throwing) here is only noise.
+      if (holders.get(this)?.sealed) return;
+      return baseWsClose?.apply(this, args);
+    }
+
+    webSocketError(...args: unknown[]): unknown {
+      if (holders.get(this)?.sealed) return;
+      return baseWsError?.apply(this, args);
     }
 
     #auth(secret: string | undefined): void {
       if (options.secret !== undefined && secret !== options.secret) {
-        throw new Error("claydo: invalid migration secret.");
+        throw new Error(
+          "claydo: invalid migration secret (rejected by the old " +
+            "instance's exportable() wrapper). The same secret must be " +
+            "set on exportable(), on union(), and in the driver options.",
+        );
       }
     }
 
     async __claydoSeal(secret?: string, movedTo?: string): Promise<void> {
       this.#auth(secret);
-      const existing = this.#sealed;
+      const holder = holderOf(this);
+      const existing = holder.sealed;
       const record: SealRecord = {
         movedTo: movedTo ?? existing?.movedTo,
         at: existing?.at ?? Date.now(),
       };
-      await this.ctx.storage.put(SEAL_KEY, record);
-      this.#sealed = record;
+      await holder.ctx.storage.put(SEAL_KEY, record);
+      holder.sealed = record;
       if (existing === null) {
         // Close hibernatable WebSockets so clients get a real close event
         // (1012: service restart) and reconnect through the router.
-        for (const ws of this.ctx.getWebSockets()) {
+        for (const ws of holder.ctx.getWebSockets()) {
           try {
             ws.close(1012, "claydo: instance migrating; reconnect");
           } catch {
@@ -246,36 +368,42 @@ export function exportable<I extends object>(
       }
       if (record.movedTo !== undefined) {
         // The data (including the alarm) lives in the new instance now.
-        await this.ctx.storage.deleteAlarm();
+        await holder.ctx.storage.deleteAlarm();
       }
     }
 
     async __claydoUnseal(secret?: string): Promise<void> {
       this.#auth(secret);
-      await this.ctx.storage.delete(SEAL_KEY);
-      this.#sealed = null;
+      const holder = holderOf(this);
+      await holder.ctx.storage.delete(SEAL_KEY);
+      holder.sealed = null;
     }
 
     async __claydoSealed(
       secret?: string,
     ): Promise<{ sealed: boolean; movedTo?: string }> {
       this.#auth(secret);
-      return { sealed: this.#sealed !== null, movedTo: this.#sealed?.movedTo };
+      const holder = holderOf(this);
+      return {
+        sealed: holder.sealed !== null,
+        movedTo: holder.sealed?.movedTo,
+      };
     }
 
     async __claydoHasData(secret?: string): Promise<boolean> {
       this.#auth(secret);
+      const { ctx } = holderOf(this);
       // Schema alone does not count: constructors commonly run
       // `CREATE TABLE IF NOT EXISTS`. Only rows and KV entries count.
-      for (const table of this.#userTables()) {
-        const row = this.ctx.storage.sql
+      for (const table of this.#userTables().tables) {
+        const row = ctx.storage.sql
           .exec(`SELECT 1 FROM ${quoteIdent(table.name)} LIMIT 1`)
           .toArray();
         if (row.length > 0) return true;
       }
       let after: string | undefined;
       for (;;) {
-        const listed = await this.ctx.storage.list({
+        const listed = await ctx.storage.list({
           startAfter: after,
           limit: KV_BATCH,
         });
@@ -288,22 +416,48 @@ export function exportable<I extends object>(
       }
     }
 
+    async __claydoStats(secret?: string): Promise<MigrationPreview> {
+      this.#auth(secret);
+      const holder = holderOf(this);
+      const inspection = this.#inspectTables();
+      const rows: Record<string, number> = {};
+      for (const table of inspection.tables) {
+        rows[table.name] = holder.ctx.storage.sql
+          .exec<{ n: number }>(
+            `SELECT count(*) AS n FROM ${quoteIdent(table.name)}`,
+          )
+          .one().n;
+      }
+      const kv = await this.#kvCount();
+      return {
+        sealed: holder.sealed !== null,
+        movedTo: holder.sealed?.movedTo,
+        hasData: kv > 0 || Object.values(rows).some((n) => n > 0),
+        kv,
+        rows,
+        alarm: await holder.ctx.storage.getAlarm(),
+        blockers: inspection.blockers,
+      };
+    }
+
     async __claydoExport(
       secret: string | undefined,
       cursor: ExportCursor | null,
       limits: ExportLimits = {},
     ): Promise<ExportChunk> {
       this.#auth(secret);
-      if (this.#sealed === null) {
+      const holder = holderOf(this);
+      if (holder.sealed === null) {
         throw new Error(
-          `claydo: instance '${identityOf(this.ctx)}' is not sealed. Seal it ` +
+          `claydo: instance '${identityOf(holder.ctx)}' is not sealed. Seal it ` +
             `with __claydoSeal() before exporting, so the data cannot ` +
             `change during the copy.`,
         );
       }
       const maxRows = limits.maxRows ?? DEFAULT_MAX_ROWS;
       const maxBytes = limits.maxBytes ?? DEFAULT_MAX_BYTES;
-      const tables = this.#userTables();
+      const inspection = this.#userTables();
+      const tables = inspection.tables;
       const chunk: ExportChunk = { cursor: null };
 
       if (cursor === null) {
@@ -344,15 +498,15 @@ export function exportable<I extends object>(
       }
 
       // Final chunk.
-      chunk.post = this.#postDdl();
+      chunk.post = [...this.#postDdl(), ...inspection.post];
       chunk.sequences = this.#sequences();
-      chunk.alarm = await this.ctx.storage.getAlarm();
+      chunk.alarm = await holder.ctx.storage.getAlarm();
       chunk.totals = {
         kv: await this.#kvCount(),
         rows: Object.fromEntries(
           tables.map((t) => [
             t.name,
-            this.ctx.storage.sql
+            holder.ctx.storage.sql
               .exec<{ n: number }>(
                 `SELECT count(*) AS n FROM ${quoteIdent(t.name)}`,
               )
@@ -364,8 +518,19 @@ export function exportable<I extends object>(
       return chunk;
     }
 
-    #userTables(): { name: string; ddl: string; rowidAlias: string | null }[] {
-      const rows = this.ctx.storage.sql
+    /** Like {@link #inspectTables}, but blockers throw. */
+    #userTables(): TableInspection {
+      const inspection = this.#inspectTables();
+      if (inspection.blockers.length > 0) {
+        throw new Error(`claydo: ${inspection.blockers.join(" Also: ")}`);
+      }
+      return inspection;
+    }
+
+    #inspectTables(): TableInspection {
+      const { ctx } = holderOf(this);
+      const sql = ctx.storage.sql;
+      const all = sql
         .exec<{ name: string; sql: string }>(
           `SELECT name, sql FROM sqlite_master
            WHERE type = 'table' AND sql IS NOT NULL
@@ -374,60 +539,158 @@ export function exportable<I extends object>(
            ORDER BY name`,
         )
         .toArray();
-      return rows.map((row) => {
+      const shadows = this.#shadowTables(all);
+      const tables: TableMeta[] = [];
+      const post: string[] = [];
+      const blockers: string[] = [];
+      for (const row of all) {
+        if (shadows.has(row.name)) continue;
+        if (/^\s*CREATE\s+VIRTUAL\s+TABLE/i.test(row.sql)) {
+          if (!/USING\s+fts5\b/i.test(row.sql)) {
+            blockers.push(
+              `table '${row.name}' is a virtual table (module other than ` +
+                `FTS5), which the exporter does not support. Drop it ` +
+                `before migrating or copy it with custom code.`,
+            );
+            continue;
+          }
+          const content = /content\s*=\s*(?:'([^']*)'|"([^"]*)"|([^,\s)'"]+))/i.exec(
+            row.sql,
+          );
+          const contentValue = content
+            ? (content[1] ?? content[2] ?? content[3])
+            : undefined;
+          if (contentValue === "") {
+            blockers.push(
+              `table '${row.name}' is a contentless FTS5 table ` +
+                `(content=''), whose text cannot be read back. Drop it ` +
+                `before migrating or copy it with custom code.`,
+            );
+            continue;
+          }
+          if (contentValue !== undefined) {
+            // External content: recreate the index on the target after the
+            // content table's rows arrive, then rebuild it.
+            post.push(
+              row.sql,
+              `INSERT INTO ${quoteIdent(row.name)}(${quoteIdent(row.name)}) VALUES('rebuild')`,
+            );
+            continue;
+          }
+          // Self-contained FTS5: rows read and insert like a table's, and
+          // inserting rebuilds the index on the target as it goes.
+          const columns = sql
+            .exec<{ name: string }>(
+              `PRAGMA table_info(${quoteIdent(row.name)})`,
+            )
+            .toArray()
+            .map((column) => column.name);
+          tables.push({
+            name: row.name,
+            ddl: row.sql,
+            rowidAlias: null,
+            columns,
+          });
+          continue;
+        }
         if (/WITHOUT\s+ROWID/i.test(row.sql)) {
-          throw new Error(
-            `claydo: table '${row.name}' is WITHOUT ROWID, which the ` +
-              `exporter does not support yet. Copy this table with custom ` +
-              `code, or recreate it with a rowid.`,
+          blockers.push(
+            `table '${row.name}' is WITHOUT ROWID, which the exporter ` +
+              `does not support yet. Copy this table with custom code, or ` +
+              `recreate it with a rowid.`,
           );
+          continue;
         }
-        if (/^\s*CREATE\s+VIRTUAL/i.test(row.sql)) {
-          throw new Error(
-            `claydo: table '${row.name}' is a virtual table, which the ` +
-              `exporter does not support. Drop it before migrating or copy ` +
-              `it with custom code.`,
-          );
+        const info = sql
+          .exec<{ name: string; type: string; pk: number; hidden: number }>(
+            `PRAGMA table_xinfo(${quoteIdent(row.name)})`,
+          )
+          .toArray();
+        // hidden 2 and 3 are generated columns: they recompute on insert,
+        // so they are excluded from the copy instead of breaking it.
+        const visible = info.filter((column) => column.hidden === 0);
+        const pks = visible.filter((column) => column.pk > 0);
+        const rowidAlias =
+          pks.length === 1 && pks[0]!.type.toUpperCase() === "INTEGER"
+            ? pks[0]!.name
+            : null;
+        for (const column of visible) {
+          const lower = column.name.toLowerCase();
+          if (
+            (lower === "rowid" ||
+              lower === "_rowid_" ||
+              lower === "oid" ||
+              column.name === "__rowid__") &&
+            column.name !== rowidAlias
+          ) {
+            blockers.push(
+              `table '${row.name}' has a column named '${column.name}', ` +
+                `which shadows the rowid the exporter pages by. Rename ` +
+                `the column before migrating.`,
+            );
+          }
         }
-        return {
+        tables.push({
           name: row.name,
           ddl: row.sql,
-          rowidAlias: this.#rowidAlias(row.name),
-        };
-      });
+          rowidAlias,
+          columns: visible.map((column) => column.name),
+        });
+      }
+      return { tables, post, blockers };
     }
 
-    /**
-     * Returns the column name that aliases the rowid (a single INTEGER
-     * PRIMARY KEY), or null. Alias tables must not receive an explicit
-     * rowid on insert, because the alias column already carries it.
-     */
-    #rowidAlias(table: string): string | null {
-      const info = this.ctx.storage.sql
-        .exec<{ name: string; type: string; pk: number }>(
-          `PRAGMA table_info(${quoteIdent(table)})`,
-        )
-        .toArray();
-      const pks = info.filter((column) => column.pk > 0);
-      if (pks.length === 1 && pks[0]!.type.toUpperCase() === "INTEGER") {
-        return pks[0]!.name;
+    /** Names of shadow tables (FTS5 internals) that must not be copied. */
+    #shadowTables(all: { name: string; sql: string }[]): Set<string> {
+      const { ctx } = holderOf(this);
+      try {
+        return new Set(
+          ctx.storage.sql
+            .exec<{ name: string }>(
+              `SELECT name FROM pragma_table_list WHERE type = 'shadow'`,
+            )
+            .toArray()
+            .map((row) => row.name),
+        );
+      } catch {
+        // Fallback for runtimes without pragma_table_list: the FTS5 shadow
+        // table names are fixed.
+        const set = new Set<string>();
+        for (const row of all) {
+          if (
+            /^\s*CREATE\s+VIRTUAL\s+TABLE/i.test(row.sql) &&
+            /USING\s+fts5\b/i.test(row.sql)
+          ) {
+            for (const suffix of [
+              "config",
+              "content",
+              "data",
+              "docsize",
+              "idx",
+            ]) {
+              set.add(`${row.name}_${suffix}`);
+            }
+          }
+        }
+        return set;
       }
-      return null;
     }
 
     #rowPage(
-      table: { name: string; rowidAlias: string | null },
+      table: TableMeta,
       afterRowid: number,
       maxRows: number,
       maxBytes: number,
     ): { columns: string[]; values: SqlValue[][]; lastRowid: number } {
+      const { ctx } = holderOf(this);
+      const cols = table.columns.map(quoteIdent).join(", ");
       const select =
         table.rowidAlias === null
-          ? `SELECT rowid AS __rowid__, * FROM ${quoteIdent(table.name)}
+          ? `SELECT rowid AS __rowid__, ${cols} FROM ${quoteIdent(table.name)}
              WHERE rowid > ? ORDER BY rowid LIMIT ?`
-          : `SELECT * FROM ${quoteIdent(table.name)}
+          : `SELECT ${cols} FROM ${quoteIdent(table.name)}
              WHERE rowid > ? ORDER BY rowid LIMIT ?`;
-      const query = this.ctx.storage.sql.exec(select, afterRowid, maxRows);
+      const query = ctx.storage.sql.exec(select, afterRowid, maxRows);
       const columns = query.columnNames;
       const rowidIndex =
         table.rowidAlias === null ? 0 : columns.indexOf(table.rowidAlias);
@@ -447,9 +710,10 @@ export function exportable<I extends object>(
       afterKey: string,
       maxBytes: number,
     ): Promise<{ entries: [string, unknown][]; afterKey: string } | null> {
+      const { ctx } = holderOf(this);
       let after = afterKey === "" ? undefined : afterKey;
       for (;;) {
-        const listed = await this.ctx.storage.list({
+        const listed = await ctx.storage.list({
           startAfter: after,
           limit: KV_BATCH,
         });
@@ -469,10 +733,11 @@ export function exportable<I extends object>(
     }
 
     async #kvCount(): Promise<number> {
+      const { ctx } = holderOf(this);
       let count = 0;
       let after: string | undefined;
       for (;;) {
-        const listed = await this.ctx.storage.list({
+        const listed = await ctx.storage.list({
           startAfter: after,
           limit: KV_BATCH,
         });
@@ -486,7 +751,8 @@ export function exportable<I extends object>(
     }
 
     #postDdl(): string[] {
-      return this.ctx.storage.sql
+      const { ctx } = holderOf(this);
+      return ctx.storage.sql
         .exec<{ sql: string }>(
           `SELECT sql FROM sqlite_master
            WHERE type IN ('index', 'trigger', 'view') AND sql IS NOT NULL
@@ -499,8 +765,9 @@ export function exportable<I extends object>(
     }
 
     #sequences(): [string, number][] {
+      const { ctx } = holderOf(this);
       try {
-        return this.ctx.storage.sql
+        return ctx.storage.sql
           .exec<{ name: string; seq: number }>(
             `SELECT name, seq FROM sqlite_sequence`,
           )
@@ -571,6 +838,18 @@ export interface ExportableOldStub {
   ): Promise<ExportChunk>;
 }
 
+/** Progress of one running {@link migrateInstance} call. */
+export interface MigrationProgress {
+  /** Chunks applied by this run so far (1-based). */
+  chunk: number;
+  /** The sequence number of the chunk that was just applied. */
+  seq: number;
+  /** True when this was the final chunk. */
+  done: boolean;
+  /** Cumulative applied counts on the target. */
+  applied: { kv: number; rows: Record<string, number> };
+}
+
 /** Options for {@link migrateInstance}. */
 export interface MigrateInstanceOptions {
   /** A stub of the OLD instance. Its class must be wrapped with `exportable()`. */
@@ -592,6 +871,11 @@ export interface MigrateInstanceOptions {
   maxRowsPerChunk?: number;
   /** Approximate bytes per chunk (default 256 KiB). */
   maxBytesPerChunk?: number;
+  /**
+   * Called after each applied chunk, for progress logs and metrics. Keep
+   * it non-throwing: an exception here aborts the migration.
+   */
+  onProgress?: (progress: MigrationProgress) => void;
 }
 
 /** The result of one {@link migrateInstance} run. */
@@ -619,6 +903,28 @@ function skippedSummary(reason: string): MigrationSummary {
     rows: {},
     alarm: undefined,
   };
+}
+
+function ownedError(kind: string, name: string, ageMs: number): Error {
+  return new Error(
+    `claydo: another migration driver owns the import on instance ` +
+      `'${kind}:${name}' (last progress ${ageMs}ms ago). It is not stale ` +
+      `yet; retry later.`,
+  );
+}
+
+/**
+ * Reports what a migration of `from` would move, without sealing or
+ * changing anything: row counts per table, KV entry count, the pending
+ * alarm, the seal state, and any blockers (unsupported tables) that would
+ * make {@link migrateInstance} fail. Use it for dry runs and runbooks.
+ */
+export async function previewInstance(options: {
+  from: ExportableOldStub;
+  secret?: string;
+}): Promise<MigrationPreview> {
+  const old = options.from as unknown as ExportableStub;
+  return old.__claydoStats(options.secret);
 }
 
 /**
@@ -691,21 +997,21 @@ export async function migrateInstance(
   }
 
   // Reserve the target FIRST: from here on, traffic to it blocks instead of
-  // initializing an empty instance. Ownership errors throw here, before
+  // initializing an empty instance. Ownership refusals surface here, before
   // anything was changed, so there is nothing to roll back.
   let begin = await raw.__claydoBeginImport(target.kind, token, secret);
-  let seq = begin.seq;
-  let cursor = begin.cursor;
-  let resumed = begin.resumed;
-  if (resumed && (!oldSeal.sealed || cursor === null)) {
+  if (!begin.ok) throw ownedError(target.kind, options.name, begin.ageMs);
+  if (begin.resumed && (!oldSeal.sealed || begin.cursor === null)) {
     // Not resumable: the old instance was unsealed mid-import (the data may
     // have changed) or the previous run failed verification. Start over.
     await raw.__claydoAbortImport(token, secret);
-    begin = await raw.__claydoBeginImport(target.kind, token, secret);
-    seq = begin.seq;
-    cursor = begin.cursor;
-    resumed = false;
+    const fresh = await raw.__claydoBeginImport(target.kind, token, secret);
+    if (!fresh.ok) throw ownedError(target.kind, options.name, fresh.ageMs);
+    begin = fresh;
   }
+  let seq = begin.seq;
+  let cursor = begin.cursor;
+  const resumed = begin.resumed;
 
   let sealedByUs = false;
   if (!oldSeal.sealed) {
@@ -727,6 +1033,12 @@ export async function migrateInstance(
       );
       chunks += 1;
       cursor = chunk.cursor;
+      options.onProgress?.({
+        chunk: chunks,
+        seq,
+        done: cursor === null,
+        applied: ack.applied,
+      });
       if (cursor === null) {
         // Success. Record the move on the old side (this also silences the
         // old instance's alarm forever).
@@ -820,9 +1132,22 @@ export interface MigratedOptions {
   oldRouteTtlMs?: number;
 }
 
-/** The accessor-like facade that {@link migrated} returns. */
+/**
+ * The accessor-like facade that {@link migrated} returns.
+ *
+ * It deliberately exposes only `get(name)`: `unique()` and `fromId()` have
+ * no migration story (old `newUniqueId()` instances cannot keep their IDs
+ * across namespaces — give them names), and `idFromName()` would leak the
+ * new side's ID while the old side may still be authoritative.
+ */
 export interface MigratedAccessor<T> {
   get(name: string): KindStub<T>;
+  /**
+   * Reports which side currently serves `name`, using (and priming) the
+   * same cached decision the stubs use. For observability, cutover checks,
+   * and progress dashboards.
+   */
+  resolve(name: string): Promise<"new" | "old">;
 }
 
 /**
@@ -831,6 +1156,22 @@ export interface MigratedAccessor<T> {
  * place of the plain accessor while a migration is in progress, then delete
  * it after cutover.
  *
+ * Create the facade once per isolate (module scope, or memoized on first
+ * request) — its route cache lives on the object, so a facade created per
+ * request caches nothing:
+ *
+ * ```ts
+ * let tally: MigratedAccessor<TallyImpl> | undefined;
+ * export default {
+ *   fetch(request, env) {
+ *     tally ??= migrated(env.OLD_TALLY, kinds(env.APP_DO).tally, {
+ *       strategy: "lazy",
+ *     });
+ *     // ...
+ *   },
+ * };
+ * ```
+ *
  * Routes resolve as: new instance live → new; old instance sealed or empty →
  * new; otherwise the strategy decides. A "new" decision is cached for the
  * Worker's lifetime; an "old" decision expires so external migrations are
@@ -838,6 +1179,10 @@ export interface MigratedAccessor<T> {
  * a freshly sealed old instance re-resolve once and retry on the new side.
  * When another worker is migrating the instance right now, the facade waits
  * briefly for it to finish instead of failing.
+ *
+ * The stubs' `id`/`kind` metadata always describe the NEW side, even while
+ * the old instance still serves the traffic — use `resolve(name)` when you
+ * need to know which side is authoritative right now.
  */
 export function migrated<T, NS extends DurableObjectNamespace<any>>(
   oldNamespace: NS,
@@ -1015,5 +1360,5 @@ export function migrated<T, NS extends DurableObjectNamespace<any>>(
     }) as KindStub<T>;
   }
 
-  return { get: facade };
+  return { get: facade, resolve: resolveCached };
 }

@@ -303,6 +303,9 @@ There is no platform way to merge namespaces, so a migration is an
 application-level data copy plus a routing cutover — gradual, per instance,
 and reversible until cutover.
 
+Working example: `examples/migrate-app` is a complete transitional app
+(old bindings, host, driver endpoint, router, tests) — start there.
+
 ### 1. Wrap the old class and redeploy the old Worker
 
 ```ts
@@ -312,10 +315,17 @@ class TallyImpl extends DurableObject<Env> { /* unchanged */ }
 export class Tally extends exportable(TallyImpl) {}
 ```
 
-Behavior is unchanged until an instance is sealed: the seal guards are
-synchronous, so sync methods, internal self-calls, and framework helpers
-keep working. Wrap the finished class: the seal guard covers the wrapped
-class and its ancestors, not methods that later subclasses add.
+Behavior is unchanged until an instance is sealed. The wrapper does not
+rewrite the class's methods or prototype chain (framework base classes such
+as the Agents SDK inspect both); instead it guards `ctx.storage`. While
+sealed: every storage read and write fails with a "sealed" error, `fetch()`
+answers 410 (even when the class never defined a `fetch()`), alarms defer,
+and WebSocket handlers go quiet. The guards are synchronous, so sync
+methods, internal self-calls, and framework helpers keep working while
+unsealed. One caveat: storage references captured inside the wrapped
+class's own constructor (for example `this.db = ctx.storage.sql`) reach the
+real storage — the seal covers `this.ctx.storage` access after
+construction, which is the normal pattern.
 
 ### 2. Enable imports on the host
 
@@ -328,18 +338,48 @@ export class AppDO extends union(
 
 The old class usually becomes the kind implementation as-is.
 
+During the transition, wrangler carries BOTH Durable Object classes, and
+the Worker entry must export both:
+
+```jsonc
+// wrangler.jsonc (transitional)
+{
+  "durable_objects": {
+    "bindings": [
+      { "name": "OLD_TALLY", "class_name": "Tally" },
+      { "name": "APP_DO", "class_name": "AppDO" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Tally", "AppDO"] }
+  ]
+}
+```
+
+```ts
+// index.ts — wrangler resolves class_name against the entry's exports
+export { Tally, AppDO };
+export default { fetch: ... };
+```
+
 ### 3. Move instances
 
 Bulk, from a Worker, cron, or Workflow — you supply the instance names (from
-your own registry; Cloudflare cannot list a namespace's names):
+your own registry; Cloudflare cannot list a namespace's names — a small SQL
+or KV table of names, maintained where you create instances, is enough):
 
 ```ts
-import { migrateInstance } from "claydo/migrate";
+import { migrateInstance, previewInstance } from "claydo/migrate";
+
+// Optional dry run: sizes, alarm, seal state, and blockers. Changes nothing.
+const preview = await previewInstance({ from: env.OLD_TALLY.getByName(name) });
+// preview: { sealed, movedTo?, hasData, kv, rows, alarm, blockers }
 
 const summary = await migrateInstance({
   from: env.OLD_TALLY.getByName(name),
   to: kinds(env.APP_DO).tally,
   name,
+  onProgress: (p) => console.log(`chunk ${p.chunk} (seq ${p.seq})`, p.applied),
 });
 // summary: { skipped, reason?, resumed, chunks, kv, rows, alarm }
 ```
@@ -352,12 +392,21 @@ kind is your responsibility.
 Or lazily, on first touch, through the transitional router:
 
 ```ts
-import { migrated } from "claydo/migrate";
+import { migrated, type MigratedAccessor } from "claydo/migrate";
 
-const tally = migrated(env.OLD_TALLY, kinds(env.APP_DO).tally, {
-  strategy: "lazy",
-});
-await tally.get("user-42").bump(); // migrates on first touch, then serves new
+let tally: MigratedAccessor<TallyImpl> | undefined;
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    // Create the facade ONCE per isolate: its route cache lives on the
+    // object, so a facade built per request caches nothing.
+    tally ??= migrated(env.OLD_TALLY, kinds(env.APP_DO).tally, {
+      strategy: "lazy",
+    });
+    await tally.get("user-42").bump(); // migrates on first touch, serves new
+    // ...
+  },
+};
 ```
 
 Router strategies: `lazy` migrates inline on first touch (fleets of small
@@ -377,6 +426,24 @@ migrations are noticed. Each cache miss costs a few extra RPC round trips,
 so avoid very low TTL values on hot paths. Requests that reach a target
 mid-import receive 503 with a `Retry-After` header.
 
+What the facade does and does not give you:
+
+- It exposes `get(name)` and `resolve(name)` only. `unique()` and
+  `fromId()` have no migration story (old `newUniqueId()` instances cannot
+  keep their IDs across namespaces — give them names, for example
+  `migrated:<oldId>`), and `idFromName()` would leak the new side's ID
+  while the old side may still be authoritative.
+- The stubs' `id` and `kind` metadata always describe the NEW side, even
+  while the old instance still serves the traffic. For observability
+  during the window, ask `await facade.resolve(name)` — it returns
+  `"new"` or `"old"`.
+- Route ALL traffic for migrating names through the facade. One forgotten
+  route, debug script, or cross-kind call that touches the plain accessor
+  mid-migration initializes the target and the driver refuses with:
+  `claydo: both the old instance '<name>' and the new instance
+  '<kind>:<name>' are live. Refusing to migrate. ...` — recover with
+  `wipeTarget()` as the message says, then re-run.
+
 ### 4. Cut over and reclaim the slot
 
 When the old namespace is empty, replace `migrated()` with the plain
@@ -387,9 +454,13 @@ deletes the old namespace — the goal of the exercise.
 
 The copy includes SQLite tables (with rowids, rowid-alias primary keys in
 any column position, indexes, triggers, views, and AUTOINCREMENT
-sequences), KV entries (all user keys, including keys that start with
-`__claydo` — only the library's three exact reserved keys stay behind), and
-the pending alarm.
+sequences), FTS5 full-text tables (self-contained ones copy row by row;
+external-content ones are recreated and rebuilt on the target after their
+content table arrives), KV entries (all user keys, including keys that
+start with `__claydo` — only the library's three exact reserved keys stay
+behind), and the pending alarm. Generated columns (`STORED` and `VIRTUAL`)
+are excluded from the copy and recompute on the target. FTS5 shadow tables
+are never copied; the index rebuilds from the real data.
 
 The order is strict and race-proof:
 
@@ -418,13 +489,84 @@ target is "polluted" and the driver refuses with a both-live error. Wipe
 the polluted target with `wipeTarget(accessor, name)` and re-run — it
 clears storage, alarms, import state, and the in-memory kind pin.
 
-Limits: `WITHOUT ROWID` and virtual tables are not supported (the export
-fails with a clear error and rolls back). Live WebSocket connections do not
-move — sealing closes them with code 1012 and reconnects land on the new
-instance through the router. Old `newUniqueId()` instances cannot keep
-their IDs; give them names (for example `migrated:<oldId>`). When the old
-class lives in another Worker, set the same `secret` on `exportable()`, on
-`union()`, and in the driver options.
+Limits (each fails pre-flight with a clear error, before anything is
+sealed; `previewInstance` reports them under `blockers`):
+
+- `WITHOUT ROWID` tables.
+- Virtual tables other than FTS5, and contentless FTS5 (`content=''`).
+- Tables with a column named `rowid`, `_rowid_`, `oid`, or `__rowid__`
+  (they shadow the rowid the exporter pages by).
+
+Live WebSocket connections do not move — sealing closes them with code
+1012 and reason `claydo: instance migrating; reconnect`; clients should
+watch for that close and re-issue the same request through the router,
+which serves the new side. Old `newUniqueId()` instances cannot keep their
+IDs; give them names (for example `migrated:<oldId>`).
+
+Two operational notes. First, if a driver crashes between the final chunk
+and the move marker, the old instance stays sealed with its alarm
+deferring every 60 seconds (with a `console.warn`) until any re-run of
+`migrateInstance` records the marker — re-runs are always safe, so retry
+after crashes. Second, methods that touch no storage still answer on a
+sealed instance (the seal freezes the data, not the event loop); the
+router's retry logic keys off storage access and `fetch()`, which covers
+real workloads.
+
+### Secrets across Workers
+
+When the old class lives in another Worker, the same secret must be set in
+three places — on the wrapper, on the host, and in every driver call:
+
+```ts
+// Old Worker
+export class Tally extends exportable(TallyImpl, {
+  secret: env.MIGRATION_SECRET,
+}) {}
+
+// New Worker
+export class AppDO extends union(
+  { tally: TallyImpl },
+  { importable: ["tally"], secret: env.MIGRATION_SECRET },
+) {}
+
+// Driver (and migrated() options)
+await migrateInstance({ from, to, name, secret: env.MIGRATION_SECRET });
+```
+
+A mismatch fails with a message that names the side that rejected
+(`exportable() wrapper` or `union() options`).
+
+### Migrating framework classes (Agents SDK, Think, PartyServer)
+
+`exportable()` wraps framework classes too — it does not touch the
+prototype chain their internals inspect, and constructors that call their
+own methods work. Framework-specific notes:
+
+- The host initializes framework kinds on first contact (see the
+  third-party section), so migrated agents answer RPC immediately — no
+  warm-up `fetch()` needed.
+- Think creates a self-contained FTS5 conversation-search table; it
+  migrates with searchability intact.
+- Framework constructors often write schema-version rows on first contact,
+  so a never-used old instance stops looking empty once the driver probes
+  it. Keep your name registry authoritative about which instances really
+  exist instead of relying on the empty-skip.
+- The Agents SDK's `getAgentByName()` and `routeAgentRequest()` need the
+  same workarounds after migration as for any kind (see the third-party
+  section).
+
+### API: `claydo/migrate`
+
+| Export | Purpose |
+| --- | --- |
+| `exportable(Base, { secret? })` | Wraps the old class with seal + export support. |
+| `previewInstance({ from, secret? })` | Dry run: sizes, alarm, seal state, blockers. Changes nothing. |
+| `migrateInstance({ from, to, name, secret?, allowEmpty?, maxRowsPerChunk?, maxBytesPerChunk?, onProgress? })` | Moves one instance; returns a `MigrationSummary`. |
+| `migrated(oldNamespace, accessor, { strategy, secret?, oldRouteTtlMs? })` | Transitional router facade: `get(name)` + `resolve(name)`. |
+| `wipeTarget(accessor, name, secret?)` | Destructive recovery for polluted targets. |
+
+`union(kinds, options)` accepts `{ importable: true | string[] }` to allow
+imports and `{ secret }` for cross-Worker auth.
 
 ## Third-party Durable Object libraries
 
@@ -647,11 +789,12 @@ Tips that apply to your own tests:
 For the library's own suites: `npm test` (library) and
 `npm run test:examples` (the example apps under `examples/`).
 
-The `examples/` folder contains eight complete applications (chat rooms with
-rate limiting, collaborative documents, an alarm scheduler, instance
-management, a Lunora-style live table, a token-bucket rate limiter, a game
-lobby, and a shop with cross-kind checkout), each with tests and a DX audit
-report.
+The `examples/` folder contains twelve complete applications: eight kind
+apps (chat rooms with rate limiting, collaborative documents, an alarm
+scheduler, instance management, a Lunora-style live table, a token-bucket
+rate limiter, a game lobby, and a shop with cross-kind checkout) and four
+migration apps (`migrate-app`, `migrate-fleet`, `migrate-lazy`,
+`migrate-gnarly`), each with tests and a DX audit report.
 
 ## License
 

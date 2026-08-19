@@ -6,6 +6,7 @@ import { exportable } from "../../src/migrate";
 export interface Env {
   APP_DO: DurableObjectNamespace<AppDO>;
   LEGACY: DurableObjectNamespace<LegacyTally>;
+  LEGACY_FW: DurableObjectNamespace<LegacyFramework>;
 }
 
 /** A SQLite-backed counter kind. */
@@ -245,10 +246,111 @@ export class Tally extends DurableObject<Env> {
   async fetch(_request: Request): Promise<Response> {
     return new Response(`tally:${instanceName(this.ctx) ?? "?"}`);
   }
+
+  /** A self-contained FTS5 table (Think-style conversation search). */
+  addDoc(body: string): void {
+    this.ctx.storage.sql.exec(
+      `CREATE VIRTUAL TABLE IF NOT EXISTS docs USING fts5(body)`,
+    );
+    this.ctx.storage.sql.exec(`INSERT INTO docs (body) VALUES (?)`, body);
+  }
+
+  searchDocs(query: string): string[] {
+    return this.ctx.storage.sql
+      .exec<{ body: string }>(`SELECT body FROM docs WHERE docs MATCH ?`, query)
+      .toArray()
+      .map((row) => row.body);
+  }
+
+  /** A table with STORED and VIRTUAL generated columns. */
+  addPriced(name: string, cents: number): void {
+    this.ctx.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS priced (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        cents INTEGER NOT NULL,
+        dollars REAL GENERATED ALWAYS AS (cents / 100.0) STORED,
+        upper_name TEXT GENERATED ALWAYS AS (upper(name)) VIRTUAL
+      )`,
+    );
+    this.ctx.storage.sql.exec(
+      `INSERT INTO priced (name, cents) VALUES (?, ?)`,
+      name,
+      cents,
+    );
+  }
+
+  pricedRows(): { name: string; cents: number; dollars: number; upper_name: string }[] {
+    return this.ctx.storage.sql
+      .exec<{ name: string; cents: number; dollars: number; upper_name: string }>(
+        `SELECT name, cents, dollars, upper_name FROM priced ORDER BY id`,
+      )
+      .toArray();
+  }
+}
+
+/**
+ * Simulates a framework base class (Agents SDK shape): the constructor
+ * calls its own prototype methods, and a subclass constructor inspects the
+ * prototype chain and refuses when one level owns both deprecated-pair
+ * hooks. exportable() must not break either behavior.
+ */
+class FrameworkBase extends DurableObject<Env> {
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    this._setup();
+  }
+
+  _setup(): void {
+    this.ctx.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS fw (k TEXT PRIMARY KEY, v TEXT NOT NULL)`,
+    );
+  }
+
+  onStateChanged(): void {}
+  onStateUpdate(): void {}
+}
+
+export class FrameworkImpl extends FrameworkBase {
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    // Mimic the Agents SDK override detection: no single prototype level
+    // between the instance and the framework base may own both hooks.
+    let proto: object | null = Object.getPrototypeOf(this) as object;
+    while (proto !== null && proto !== FrameworkBase.prototype) {
+      const owns = (name: string) =>
+        Object.prototype.hasOwnProperty.call(proto, name);
+      if (owns("onStateChanged") && owns("onStateUpdate")) {
+        throw new Error(
+          "framework: Cannot override both onStateChanged and onStateUpdate.",
+        );
+      }
+      proto = Object.getPrototypeOf(proto);
+    }
+  }
+
+  setEntry(k: string, v: string): void {
+    this.ctx.storage.sql.exec(
+      `INSERT INTO fw (k, v) VALUES (?, ?)
+       ON CONFLICT(k) DO UPDATE SET v = excluded.v`,
+      k,
+      v,
+    );
+  }
+
+  getEntry(k: string): string | undefined {
+    const rows = this.ctx.storage.sql
+      .exec<{ v: string }>(`SELECT v FROM fw WHERE k = ?`, k)
+      .toArray();
+    return rows[0]?.v;
+  }
 }
 
 /** The old binding's class: the same behavior, plus the export surface. */
 export class LegacyTally extends exportable(Tally) {}
+
+/** A framework-shaped old binding. */
+export class LegacyFramework extends exportable(FrameworkImpl) {}
 
 export class AppDO extends union(
   {
@@ -260,8 +362,9 @@ export class AppDO extends union(
     vault: Vault,
     party: PartyRoom,
     tally: Tally,
+    fw: FrameworkImpl,
   },
-  { importable: ["tally"] },
+  { importable: ["tally", "fw"] },
 ) {}
 
 export default {
