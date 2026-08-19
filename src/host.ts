@@ -267,8 +267,22 @@ export function union<R extends KindRegistry>(
       if (stored === undefined) {
         await this.ctx.storage.put(KIND_STORAGE_KEY, kind);
       }
+      const impl = new Kind(this.ctx, this.env);
+      // Framework classes (PartyServer `Server`, Cloudflare Agents `Agent`,
+      // Think) run their startup hook (`onStart`) only from `fetch()`,
+      // WebSocket events, or their own `setName` RPC — never from a plain
+      // method call. Claydo dispatches RPC directly to methods, so without
+      // this step an Agent kind reached by RPC first would run with
+      // uninitialized internal state. The hook is idempotent; plain kinds
+      // do not define it and skip this entirely.
+      const ensure = (impl as Record<string, unknown>)[
+        "__unsafe_ensureInitialized"
+      ];
+      if (typeof ensure === "function") {
+        await (ensure as (this: object) => unknown).call(impl);
+      }
       this.#kind = kind;
-      this.#impl = new Kind(this.ctx, this.env);
+      this.#impl = impl;
     }
 
     #noKindMessage(hint: string | undefined, allowInit: boolean): string {
@@ -351,6 +365,24 @@ export function union<R extends KindRegistry>(
       if (this.#kind !== undefined) return this.#kind;
       const stored = await this.ctx.storage.get<string>(KIND_STORAGE_KEY);
       return stored ?? this.#kindFromName();
+    }
+
+    /**
+     * PartyServer's `getServerByName()` and the Agents SDK's
+     * `getAgentByName()` call this RPC method on the raw stub. They cannot
+     * work against a claydo host (they address instances without the kind
+     * prefix), so fail with directions instead of the runtime's opaque
+     * "receiver does not implement" error.
+     */
+    async setName(): Promise<never> {
+      throw new Error(
+        "claydo: this namespace is a claydo host. getServerByName() " +
+          "(PartyServer) and getAgentByName() (Agents SDK) are not " +
+          "supported here, because they address instances without the " +
+          "kind prefix. Use kind(ns, '<kind>').get(name) or " +
+          "kinds(ns).<kind>.get(name) instead — see 'Third-party Durable " +
+          "Object libraries' in the claydo README.",
+      );
     }
 
     #checkMigrationAuth(secret: string | undefined): void {

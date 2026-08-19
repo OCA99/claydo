@@ -161,6 +161,11 @@ const name = pickKind() as KindNameOf<typeof env.APP_DO>;
 const accessor = kind(env.APP_DO, name);
 ```
 
+When the kind name is a union of several literals, the accessor's stub is a
+union too, and TypeScript only lets you call methods that exist on every
+member. Narrow the name (or pass a literal such as `"counter" as const`)
+before you call kind-specific methods.
+
 ### Calling kinds from inside a kind
 
 Kinds receive `env`, so cross-kind calls work the same inside a Durable
@@ -226,6 +231,9 @@ When a kind method throws, the stub rethrows an `Error` to the caller with:
 
 What does not survive: the prototype. `instanceof MyError` is `false` after
 the hop — match on `error.name` instead. Non-cloneable fields are dropped.
+For errors your callers must branch on, attach a stable discriminator field
+(for example `error.code = "RATE_LIMITED"`): fields survive the hop, and
+matching on `code` is sturdier than matching on message text.
 
 Errors thrown in `alarm()` and `webSocket*` handlers have no caller to reach.
 The host logs them with `console.error`, including the kind and the instance
@@ -263,6 +271,29 @@ async destroy(): Promise<void> {
 Durable Object instances cannot be deleted, only emptied; any later access
 revives them. Design "delete" flows as `resetStorage()` plus removal of the
 id from wherever you track instances.
+
+`resetStorage()` (like the `deleteAll()` it wraps) also drops every SQLite
+table. The already-running instance stays in memory, so its constructor —
+where `CREATE TABLE IF NOT EXISTS` usually lives — does not run again, and
+the next query fails with `no such table`. Put schema setup in an idempotent
+method and call it from both places:
+
+```ts
+#ensureSchema(): void {
+  this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS items (...)`);
+}
+
+constructor(ctx: DurableObjectState, env: Env) {
+  super(ctx, env);
+  this.#ensureSchema();
+}
+
+async destroy(): Promise<void> {
+  await resetStorage(this.ctx);
+  await this.ctx.storage.deleteAlarm();
+  this.#ensureSchema(); // the instance keeps serving after the wipe
+}
+```
 
 ## Migrating existing bindings
 
@@ -426,9 +457,15 @@ What works, and what to know (verified against `partyserver@0.5`):
 - `this.name` inside the `Server` is the full instance name, including the
   kind prefix (for example `game:match-1`), because PartyServer reads
   `ctx.id.name`. Use `instanceName(this.ctx)` when you need the logical name.
-- `getServerByName()` is **not supported**: it calls a `setName` RPC method
-  on the stub, and the host does not expose arbitrary RPC methods. Use
-  `kinds(env.APP_DO).game.get(name)` instead — it serves the same purpose.
+- The host runs the framework's startup hook automatically. PartyServer and
+  the Agents SDK initialize themselves (`onStart`) from `fetch()` or their
+  own routing helpers; claydo calls the same hook
+  (`__unsafe_ensureInitialized`) when it constructs the kind, so RPC-first
+  access works without a warm-up `fetch()`.
+- `getServerByName()` is **not supported**: it addresses instances without
+  the kind prefix and drives them through a `setName` RPC. The host rejects
+  the call with an error that points you to the replacement:
+  `kinds(env.APP_DO).game.get(name)` — it serves the same purpose.
 - `routePartykitRequest()` routes by URL to a binding and passes the room
   name without a kind prefix, so it reaches unprefixed instances. Route
   manually instead:
@@ -440,6 +477,34 @@ if (match) {
   return kinds(env.APP_DO).game.get(match[2]).fetch(request);
 }
 ```
+
+### Cloudflare Agents SDK and Think
+
+Agents SDK classes (`Agent` from `agents`, `Think` from `@cloudflare/think`)
+are Durable Objects built on PartyServer, and they register as kinds the same
+way. Everything above applies, plus:
+
+- Add `"compatibility_flags": ["nodejs_compat"]` to wrangler — the Agents
+  SDK requires it.
+- Drive the agent through the claydo stub: RPC methods such as `runTurn()`
+  work directly (the host runs the agent's startup hook first, so the
+  session exists). `fetch()` through the stub reaches the agent's own
+  router.
+- `getAgentByName()` is `getServerByName()` and fails the same way, with the
+  same redirect to `kinds(ns).<kind>.get(name)`.
+- `routeAgentRequest()` looks for a binding named after the agent class, not
+  your claydo binding, and addresses instances without the kind prefix.
+  Either route manually (parse `/agents/:agent/:name` and call
+  `kinds(env.APP_DO).<kind>.get(name).fetch(request)`), or keep
+  `routeAgentRequest()` and use kind-prefixed room names in the URL
+  (`/agents/app-do/assistant:alice` reaches the `assistant` kind instance
+  `alice`). Client helpers such as `useAgent` follow the same URL contract.
+- Overloaded methods (Think's `runTurn` has `wait`/`submit`/`stream`
+  overloads) collapse to the last overload on the typed stub — a TypeScript
+  mapped-type limit. Add a small non-overloaded wrapper method on your
+  subclass for the mode you call remotely.
+- Inside the agent, `this.name` is the prefixed instance name
+  (`assistant:alice`). Use `instanceName(this.ctx)` for the logical name.
 
 ## API
 
@@ -496,6 +561,9 @@ because the host reads the persisted kind from storage.
 - **RPC covers methods only.** The stub does not proxy property access.
   Calling a plain property through the stub fails with a message that names
   the property and its type; add a getter method instead.
+- **Overloads collapse.** The typed stub maps each method to a single
+  signature; TypeScript mapped types keep only the last overload. Wrap
+  overloaded methods you call remotely in a non-overloaded method.
 - **Reserved names.** Kind classes must not define methods named `id`,
   `name`, `kind`, or `stub` — `union()` rejects them at startup. Getters with
   those names are fine. Method names starting with `__` are not callable
@@ -511,13 +579,58 @@ because the host reads the persisted kind from storage.
 
 ## Testing
 
-The repository tests run inside the Workers runtime with
-[`@cloudflare/vitest-pool-workers`](https://developers.cloudflare.com/workers/testing/vitest-integration/):
+Tests run inside the Workers runtime with
+[`@cloudflare/vitest-pool-workers`](https://developers.cloudflare.com/workers/testing/vitest-integration/).
+Complete setup for your own app (with `@cloudflare/vitest-pool-workers@0.22`
+and `vitest@4` — note that the older `defineWorkersConfig` import from
+`@cloudflare/vitest-pool-workers/config` no longer exists; the current API
+is a Vite plugin):
 
-```sh
-npm install
-npm test           # library test suite
-npm run test:examples  # the 8 example apps under examples/
+```ts
+// vitest.config.ts
+import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
+import { defineConfig } from "vitest/config";
+
+export default defineConfig({
+  plugins: [cloudflareTest({ wrangler: { configPath: "./wrangler.jsonc" } })],
+});
+```
+
+```ts
+// test/env.d.ts — makes `env` from "cloudflare:test" carry your bindings
+import type { Env as WorkerEnv } from "../src/index";
+
+declare global {
+  namespace Cloudflare {
+    interface Env extends WorkerEnv {}
+  }
+}
+
+export {};
+```
+
+```jsonc
+// tsconfig.json — compilerOptions.types
+{
+  "compilerOptions": {
+    "types": [
+      "@cloudflare/workers-types",
+      "@cloudflare/vitest-pool-workers"
+    ]
+  }
+}
+```
+
+```ts
+// test/app.test.ts
+import { env } from "cloudflare:test";
+import { expect, it } from "vitest";
+import { kinds } from "claydo";
+
+it("increments", async () => {
+  const counter = kinds(env.APP_DO).counter.get("t1");
+  expect(await counter.increment()).toBe(1);
+});
 ```
 
 Tips that apply to your own tests:
@@ -525,8 +638,14 @@ Tips that apply to your own tests:
 - `runDurableObjectAlarm` and `runInDurableObject` from `cloudflare:test`
   expect a raw `DurableObjectStub`. Pass `stub.stub` (the escape hatch) or a
   raw `env.APP_DO.get(...)` stub.
+- The claydo stub proxies your kind's methods only. Introspection such as
+  `stub.storage` or `stub.getAlarm()` is not RPC-reachable — use
+  `runInDurableObject(stub.stub, ...)` or add a helper method to the kind.
 - Isolated storage is per test **file**; tests within one file share DO
   state. Use distinct instance names per test.
+
+For the library's own suites: `npm test` (library) and
+`npm run test:examples` (the example apps under `examples/`).
 
 The `examples/` folder contains eight complete applications (chat rooms with
 rate limiting, collaborative documents, an alarm scheduler, instance

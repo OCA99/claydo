@@ -181,12 +181,12 @@ describe("partyserver ecosystem integration", () => {
     );
   });
 
-  it("getServerByName fails: the host does not expose setName()", async () => {
+  it("getServerByName fails with directions to the kind() helper", async () => {
     const error = await getServerByName(env.APP_DO as any, "chat:gsn-room")
       .then(() => undefined)
       .catch((e: Error) => e);
     expect(error).toBeInstanceOf(Error);
-    // Verbatim message recorded in DX-REPORT.md. (Unchanged after the update.)
-    expect(error!.message).toMatch(/setName/);
+    expect(error!.message).toMatch(/getServerByName/);
+    expect(error!.message).toMatch(/kind\(ns, '<kind>'\)\.get\(name\)/);
   });
 });
