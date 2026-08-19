@@ -316,7 +316,7 @@ describe("E. tiny chunks while spamming facade reads (fixed: readers wait, never
     // The old side carries the move marker and is fully retired.
     expect(await old.__claydoSealed()).toEqual({
       sealed: true,
-      movedTo: app().room.get(NAME).id.toString(),
+      movedTo: `room:${NAME}`,
     });
   });
 });

@@ -106,9 +106,7 @@ describe("first-touch race", () => {
     const seal = await oldBucket("race-two").__claydoSealed();
     console.log("[probe race-two] old seal state after race:", seal);
     expect(seal.sealed).toBe(true);
-    expect(seal.movedTo).toBe(
-      newBuckets().idFromName("race-two").toString(),
-    );
+    expect(seal.movedTo).toBe("bucket:race-two");
     expect(await lazyFacade().get("race-two").remaining()).toBe(46);
   });
 
@@ -134,7 +132,7 @@ describe("first-touch race", () => {
     // The old instance keeps its seal AND its move marker.
     const seal = await oldBucket(name).__claydoSealed();
     expect(seal.sealed).toBe(true);
-    expect(seal.movedTo).toBe(raw.id.toString());
+    expect(seal.movedTo).toBe(`bucket:${name}`);
 
     // A full migrateInstance re-run reports the completed migration
     // instead of manufacturing a conflict.

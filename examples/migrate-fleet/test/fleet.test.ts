@@ -161,9 +161,9 @@ describe("fleet migration: OLD_SESSIONS -> kind 'session'", () => {
       // (the move marker is recorded on the old side after success).
       const message = await messageOf(old(name).record("late", "write"));
       expect(message).toMatch(/is sealed/);
-      expect(message).toMatch(/moved to Durable Object id/);
+      expect(message).toMatch(/moved to 'session:/);
       const seal = await old(name).__claydoSealed();
-      expect(seal.movedTo).toBe(sessions().get(name).id.toString());
+      expect(seal.movedTo).toBe(`session:${name}`);
       // Old fetch answers 410 Gone with the machine-readable sealed header
       // and a generic body (bodies no longer leak the instance identity).
       const gone = await old(name).fetch("https://do/");

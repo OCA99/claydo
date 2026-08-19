@@ -424,11 +424,18 @@ if (url.pathname.startsWith("/admin/migrate/")) {
     from: env.OLD_TALLY.getByName(name),
     to: kinds(env.APP_DO).tally,
     name,
-    onProgress: (p) => console.log(`[migrate ${name}] chunk ${p.chunk}`, p.applied),
+    onProgress: (p) =>
+      console.log(`[migrate ${name}] ${p.phase} chunk ${p.chunk}`, p.applied),
   });
   return Response.json(summary);
 }
 ```
+
+`onProgress` cadence: KV pages first (`phase: "kv"`), then row pages per
+table (`"rows"`), then one closing `"final"` chunk that replays post-DDL
+and verifies totals (it usually adds no rows). `applied` is the target's
+CUMULATIVE totals, not a per-chunk delta — compute deltas yourself for
+progress bars.
 
 The importer replays data as-is; it does not validate that the destination
 kind's class understands the imported schema. Registering the old class as
@@ -530,8 +537,19 @@ The order is strict and race-proof:
    lost — until the migration completes.
 3. **Stream, verify, go live.** Chunks apply idempotently; totals are
    verified; the kind pins only after the final chunk.
-4. **Record the move.** The old instance remembers where it moved and
-   deletes its alarm. Only now does a re-run report `{ skipped: true }`.
+4. **Record the move.** The old instance remembers where it moved (as the
+   target's `<kind>:<name>` reference — sealed errors and previews report
+   something you can paste into `kinds(ns).<kind>.get(name)`) and deletes
+   its alarm. Only now does a re-run report `{ skipped: true }`.
+
+Concurrent drivers on the same instance: the loser of the reservation race
+gets a thrown error (`claydo: another migration driver owns the import on
+instance '<kind>:<name>' (last progress Nms ago). It is not stale yet;
+retry later.`) — expect it in bulk runners and retry that name later.
+
+After a successful migration the OLD instance still holds its full data
+copy (only sealed); the old namespace keeps billing for that storage until
+you ship the `deleted_classes` migration at cutover.
 
 On failure, the partial import is discarded and the old instance is
 unsealed — unless another driver owns the migration, in which case nothing
@@ -574,12 +592,54 @@ Operational notes:
   a `ping()` that never reads storage keeps answering from a sealed old
   instance until the route TTL expires. Make keepalives read something,
   or accept up to `oldRouteTtlMs` of routing lag for them.
-- Expect some benign exception noise in logs during the sealed window: a
-  request that raced the seal fails once before the router retries it on
-  the new side, and framework background bookkeeping (the Agents SDK's
-  alarm scheduler) logs sealed-storage errors until cutover. These do not
-  indicate data loss; the migration outcome is what the
-  `MigrationSummary` says.
+- Expect some benign exception noise in logs, concentrated on specific
+  paths: `lazy` first-touch migrations are quiet, but a `manual`/`drain`
+  facade holding a cached "old" route logs one sealed-error exception per
+  instance when its retry lands (the call still succeeds), and framework
+  background bookkeeping (the Agents SDK's alarm scheduler) logs
+  sealed-storage errors until cutover. None of this indicates data loss;
+  the migration outcome is what the `MigrationSummary` says.
+
+### Auditing a fleet
+
+`resolve()` answers "where would traffic go", which is not the same as
+"was this migrated": names that never existed (typos, stale registry
+rows) resolve `"new"` because an empty old side routes to the kind. For a
+cutover audit, discriminate with the migration markers, which live on the
+raw stubs (the claydo stub does not proxy `__`-prefixed methods):
+
+```ts
+for (const name of registry) {
+  const seal = await env.OLD_TALLY.getByName(name).__claydoSealed();
+  // On the host, use the PREFIXED name — getByName(name) without the
+  // prefix reaches a different instance.
+  const status = await env.APP_DO
+    .getByName(`tally:${name}`)
+    .__claydoImportStatus();
+  const state = seal.movedTo !== undefined && status.kind !== undefined
+    ? "migrated"
+    : (await previewInstance({ from: env.OLD_TALLY.getByName(name) })).hasData
+      ? "pending"
+      : "absent";
+}
+```
+
+### Rolling back
+
+Until cutover, a completed migration can be reversed, but treat it as an
+exceptional operation, not a routine one — prefer forward-only:
+
+1. Stop traffic to the name (the facade must not serve during the swap).
+2. `__claydoUnseal()` the old instance (its data copy is still complete).
+3. `wipeTarget(accessor, name)` to clear the new side.
+4. Redeploy (or restart) the Workers that hold `migrated()` facades: a
+   facade caches "new" decisions for the isolate's lifetime, and a stale
+   "new" route would serve the freshly wiped, EMPTY target — repolluting
+   it on first touch and then failing every request with the both-live
+   error until you wipe again.
+
+Anything written to the new side after the migration is lost by the wipe;
+reconcile first if the new side took writes.
 
 ### Secrets across Workers
 
@@ -636,6 +696,21 @@ own methods work. Framework-specific notes:
 - The Agents SDK's `getAgentByName()` and `routeAgentRequest()` need the
   same workarounds after migration as for any kind (see the third-party
   section).
+
+Think, end to end — the complete path stitches three sections together:
+
+1. Kind setup: the Think snippet in "Cloudflare Agents SDK and Think"
+   (`ask()` shim, `nodejs_compat`, routing rules).
+2. Old side: wrap the standalone Think class with `exportable()`; seed and
+   spot-check old instances through `fetch()` (old-side RPC needs the
+   warm-up above).
+3. Move: `previewInstance` → `migrateInstance` (or the lazy router). The
+   conversation transcript, FTS5 search, alarms, and scheduled state all
+   move; the migrated kind answers RPC turns immediately.
+4. Testing: the Testing section's vitest setup, plus small helper methods
+   on your subclass (a `transcript()` reading `getMessages()`, a search
+   wrapper over `session.search()`) so tests can verify state through the
+   stub.
 
 ### API: `claydo/migrate`
 

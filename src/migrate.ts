@@ -152,7 +152,11 @@ interface ExportLimits {
 /** What {@link previewInstance} reports, without sealing anything. */
 export interface MigrationPreview {
   sealed: boolean;
-  /** Where the instance moved, when the migration already completed. */
+  /**
+   * Where the instance moved, when the migration already completed — the
+   * target's `<kind>:<name>` reference, usable with
+   * `kinds(ns).<kind>.get(name)`.
+   */
   movedTo?: string;
   /** True when the instance holds any rows or KV entries. */
   hasData: boolean;
@@ -395,11 +399,34 @@ export function exportable<I extends object>(
       const { ctx } = holderOf(this);
       // Schema alone does not count: constructors commonly run
       // `CREATE TABLE IF NOT EXISTS`. Only rows and KV entries count.
-      for (const table of this.#userTables().tables) {
-        const row = ctx.storage.sql
-          .exec(`SELECT 1 FROM ${quoteIdent(table.name)} LIMIT 1`)
-          .toArray();
-        if (row.length > 0) return true;
+      //
+      // This probe must NEVER fail on blocker tables (WITHOUT ROWID,
+      // virtual modules): routing (`migrated()`) and dry runs rely on it,
+      // and an instance the exporter cannot move must keep serving from
+      // the old side. Blockers are enforced by export/migrate only —
+      // here, rows in a blocker table simply count as data.
+      const all = ctx.storage.sql
+        .exec<{ name: string; sql: string }>(
+          `SELECT name, sql FROM sqlite_master
+           WHERE type = 'table' AND sql IS NOT NULL
+             AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'
+             AND name NOT LIKE '\\_cf\\_%' ESCAPE '\\'
+           ORDER BY name`,
+        )
+        .toArray();
+      const shadows = this.#shadowTables(all);
+      for (const row of all) {
+        if (shadows.has(row.name)) continue;
+        try {
+          const probe = ctx.storage.sql
+            .exec(`SELECT 1 FROM ${quoteIdent(row.name)} LIMIT 1`)
+            .toArray();
+          if (probe.length > 0) return true;
+        } catch {
+          // A table that cannot even be probed (for example contentless
+          // FTS5) is treated as data, so the old side stays authoritative.
+          return true;
+        }
       }
       let after: string | undefined;
       for (;;) {
@@ -432,7 +459,8 @@ export function exportable<I extends object>(
       return {
         sealed: holder.sealed !== null,
         movedTo: holder.sealed?.movedTo,
-        hasData: kv > 0 || Object.values(rows).some((n) => n > 0),
+        // The conservative probe, so rows in blocker tables count too.
+        hasData: await this.__claydoHasData(secret),
         kv,
         rows,
         alarm: await holder.ctx.storage.getAlarm(),
@@ -790,7 +818,7 @@ function sealMessage(ctx: DurableObjectState, seal: SealRecord): string {
   const moved =
     seal.movedTo === undefined
       ? " A migration is in progress."
-      : ` It moved to Durable Object id ${seal.movedTo}; route traffic through the claydo binding.`;
+      : ` It moved to '${seal.movedTo}'; route traffic through the claydo binding.`;
   return `claydo: instance '${identityOf(ctx)}' is sealed.${moved}`;
 }
 
@@ -838,12 +866,22 @@ export interface ExportableOldStub {
   ): Promise<ExportChunk>;
 }
 
-/** Progress of one running {@link migrateInstance} call. */
+/**
+ * Progress of one running {@link migrateInstance} call.
+ *
+ * Cadence: KV pages stream first (`phase: "kv"`), then row pages per table
+ * (`phase: "rows"`), then one closing chunk (`phase: "final"`) that replays
+ * indexes/triggers/views, restores sequences, and verifies totals — it
+ * usually adds no new rows. `applied` is CUMULATIVE (the target's running
+ * totals), not a per-chunk delta.
+ */
 export interface MigrationProgress {
   /** Chunks applied by this run so far (1-based). */
   chunk: number;
   /** The sequence number of the chunk that was just applied. */
   seq: number;
+  /** What the applied chunk carried. */
+  phase: "kv" | "rows" | "final";
   /** True when this was the final chunk. */
   done: boolean;
   /** Cumulative applied counts on the target. */
@@ -952,28 +990,32 @@ export async function migrateInstance(
     maxBytes: options.maxBytesPerChunk,
   };
   const token = crypto.randomUUID();
-  const targetId = target.id.toString();
+  // The operator-facing reference of the target. Recorded as the old
+  // instance's move marker, so seal errors and previews name something a
+  // human can paste into kinds(ns).<kind>.get(name).
+  const targetRef = `${target.kind}:${options.name}`;
 
   const status = await raw.__claydoImportStatus(secret);
   const oldSeal = await old.__claydoSealed(secret);
+  const stats = await old.__claydoStats(secret);
 
   if (status.kind !== undefined) {
     if (oldSeal.sealed) {
-      if (oldSeal.movedTo !== targetId && oldSeal.movedTo !== undefined) {
+      if (oldSeal.movedTo !== targetRef && oldSeal.movedTo !== undefined) {
         throw new Error(
-          `claydo: the old instance '${options.name}' moved to a different ` +
-            `Durable Object (${oldSeal.movedTo}), but the target ` +
+          `claydo: the old instance '${options.name}' moved to ` +
+            `'${oldSeal.movedTo}', but the target ` +
             `'${target.kind}:${options.name}' is also live. Check your ` +
             `migration mapping.`,
         );
       }
       if (oldSeal.movedTo === undefined) {
         // Crash after finalize, before the move marker: record it now.
-        await old.__claydoSeal(secret, targetId);
+        await old.__claydoSeal(secret, targetRef);
       }
       return skippedSummary("already migrated");
     }
-    if (!(await old.__claydoHasData(secret))) {
+    if (!stats.hasData) {
       return skippedSummary("old instance is empty and the target is live");
     }
     throw new Error(
@@ -986,14 +1028,19 @@ export async function migrateInstance(
     );
   }
 
+  // Pre-flight: refuse blocker tables BEFORE reserving or sealing, so both
+  // sides stay untouched. (An already-sealed old instance skips this and
+  // fails during export instead, with the usual rollback.)
+  if (!oldSeal.sealed && stats.blockers.length > 0) {
+    throw new Error(`claydo: ${stats.blockers.join(" Also: ")}`);
+  }
+
   // Skip empty instances before touching anything, so a stale registry
   // entry cannot fabricate a sealed, empty instance pair.
-  if (!oldSeal.sealed && !options.allowEmpty) {
-    if (!(await old.__claydoHasData(secret))) {
-      return skippedSummary(
-        "old instance has no data (pass allowEmpty to migrate schema-only instances)",
-      );
-    }
+  if (!oldSeal.sealed && !options.allowEmpty && !stats.hasData) {
+    return skippedSummary(
+      "old instance has no data (pass allowEmpty to migrate schema-only instances)",
+    );
   }
 
   // Reserve the target FIRST: from here on, traffic to it blocks instead of
@@ -1036,13 +1083,19 @@ export async function migrateInstance(
       options.onProgress?.({
         chunk: chunks,
         seq,
+        phase:
+          chunk.rows !== undefined
+            ? "rows"
+            : chunk.kv !== undefined
+              ? "kv"
+              : "final",
         done: cursor === null,
         applied: ack.applied,
       });
       if (cursor === null) {
         // Success. Record the move on the old side (this also silences the
         // old instance's alarm forever).
-        await old.__claydoSeal(secret, targetId);
+        await old.__claydoSeal(secret, targetRef);
         return {
           skipped: false,
           reason: undefined,
@@ -1066,7 +1119,7 @@ export async function migrateInstance(
     }
     if (targetLive) {
       try {
-        await old.__claydoSeal(secret, targetId);
+        await old.__claydoSeal(secret, targetRef);
       } catch {
         // The move marker is best effort here.
       }

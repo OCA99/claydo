@@ -132,8 +132,9 @@ describe("migrateInstance", () => {
     const movedTally = tally().get("m4");
     expect(await movedTally.total()).toBe(5);
     expect(await movedTally.getNote("color")).toBe("blue");
-    // The move marker was recorded on the old side.
-    expect((await old.__claydoSealed()).movedTo).toBe(raw.id.toString());
+    // The move marker was recorded on the old side, as an operator-usable
+    // <kind>:<name> reference.
+    expect((await old.__claydoSealed()).movedTo).toBe("tally:m4");
   });
 
   it("blocks traffic on the target while an import is in progress", async () => {
@@ -537,8 +538,53 @@ describe("previewInstance and progress", () => {
     });
     expect(progress.length).toBe(summary.chunks);
     expect(progress.at(-1)!.done).toBe(true);
+    expect(progress.at(-1)!.phase).toBe("final");
     expect(progress.at(-1)!.applied.rows["counts"]).toBe(9);
     expect(progress.slice(0, -1).every((update) => !update.done)).toBe(true);
+    expect(progress.some((update) => update.phase === "rows")).toBe(true);
+  });
+});
+
+describe("blocker tables and routing", () => {
+  it("routes and resolves blocker instances instead of failing", async () => {
+    const old = legacy("b1");
+    await old.bump("x");
+    await runInDurableObject(old, async (_instance, state) => {
+      state.storage.sql.exec(
+        `CREATE TABLE pins (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID`,
+      );
+      state.storage.sql.exec(`INSERT INTO pins VALUES ('a', 'b')`);
+    });
+    const accessor = migrated(env.LEGACY, tally(), { strategy: "drain" });
+    // The facade must keep serving an instance the exporter cannot move:
+    // blockers are enforced by export/migrate, never by routing.
+    expect(await accessor.resolve("b1")).toBe("old");
+    expect(await accessor.get("b1").bump("x")).toBe(2);
+    // The bulk driver still refuses pre-flight, without sealing anything.
+    await expectRejects(
+      () => migrateInstance({ from: old, to: tally(), name: "b1" }),
+      /WITHOUT ROWID/,
+    );
+    expect((await old.__claydoSealed()).sealed).toBe(false);
+    expect(await accessor.get("b1").total()).toBe(2);
+  });
+
+  it("counts rows in blocker-only tables as data", async () => {
+    const old = legacy("b2");
+    // The ONLY data lives in a table the exporter cannot move. Routing
+    // must still treat the old side as authoritative.
+    await runInDurableObject(old, async (_instance, state) => {
+      state.storage.sql.exec(
+        `CREATE TABLE pins (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID`,
+      );
+      state.storage.sql.exec(`INSERT INTO pins VALUES ('a', 'b')`);
+    });
+    expect(await old.__claydoHasData()).toBe(true);
+    const preview = await previewInstance({ from: old });
+    expect(preview.hasData).toBe(true);
+    expect(preview.blockers.length).toBe(1);
+    const accessor = migrated(env.LEGACY, tally(), { strategy: "lazy" });
+    expect(await accessor.resolve("b2")).toBe("old");
   });
 });
 

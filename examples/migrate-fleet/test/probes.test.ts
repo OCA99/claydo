@@ -96,7 +96,7 @@ describe("crash and resume (with import ownership)", () => {
       lang: "de",
     });
     // The move marker was recorded on the old side after success.
-    expect((await old(name).__claydoSealed()).movedTo).toBe(raw.id.toString());
+    expect((await old(name).__claydoSealed()).movedTo).toBe(`session:${name}`);
   });
 
   it("restarts from scratch when the old instance was unsealed mid-crash (torn snapshot)", async () => {
@@ -177,7 +177,7 @@ describe("duplicate concurrent drivers for the same instance", () => {
     // marker recorded — the loser did not unseal it.
     const seal = await old(name).__claydoSealed();
     expect(seal.sealed).toBe(true);
-    expect(seal.movedTo).toBe(sessions().get(name).id.toString());
+    expect(seal.movedTo).toBe(`session:${name}`);
 
     // And a re-run is a clean idempotent skip, not a "both live" refusal.
     const rerun = await migrateInstance({ from: old(name), to: sessions(), name });
@@ -508,6 +508,6 @@ describe("traffic racing a migration of the same name", () => {
     });
     const seal = await old(name).__claydoSealed();
     expect(seal.sealed).toBe(true);
-    expect(seal.movedTo).toBe(sessions().get(name).id.toString());
+    expect(seal.movedTo).toBe(`session:${name}`);
   });
 });
