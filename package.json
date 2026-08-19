@@ -7,6 +7,10 @@
     "type": "git",
     "url": "git+https://github.com/FermatResearch/GenericDurableObjects.git"
   },
+  "homepage": "https://github.com/FermatResearch/GenericDurableObjects#readme",
+  "bugs": {
+    "url": "https://github.com/FermatResearch/GenericDurableObjects/issues"
+  },
   "keywords": [
     "cloudflare",
     "workers",
