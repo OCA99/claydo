@@ -1,10 +1,11 @@
 /**
  * Alarm-transfer semantics and the documented WITHOUT ROWID / virtual-table
- * limits, including the state after a failed migration (rollback) and
- * recovery by dropping the offending table.
+ * limits, including the state after a failed migration and recovery by
+ * dropping the offending table.
  *
- * Assertions marked `BUG:` document observed data loss verbatim; see
- * ../DX-REPORT.md.
+ * POST-FIX VERSION: the sealed-alarm data-loss finding is fixed (alarms now
+ * defer themselves through the sealed window), and unsupported-table errors
+ * surface as a pre-flight check before anything is sealed or reserved.
  */
 import { env, runDurableObjectAlarm } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
@@ -14,6 +15,20 @@ import { migrateInstance, type ExportChunk } from "../../../src/migrate";
 const gnarly = () => kind(env.APP_DO, "gnarly");
 const old = (name: string) =>
   env.OLD_GNARLY.get(env.OLD_GNARLY.idFromName(name));
+
+/** Asserts a rejection without leaving an unhandled-rejection report. */
+async function expectRejects(
+  run: () => Promise<unknown>,
+  pattern: RegExp,
+): Promise<void> {
+  try {
+    await run();
+  } catch (error) {
+    expect(String(error)).toMatch(pattern);
+    return;
+  }
+  expect.unreachable(`expected rejection matching ${pattern}`);
+}
 
 describe("5. alarms", () => {
   it("preserves a near-future alarm timestamp exactly, and it fires on the new side", async () => {
@@ -36,6 +51,10 @@ describe("5. alarms", () => {
     expect(probe.scheduled).toBe(ts);
     expect(probe.firedAt).toBeNull();
 
+    // The old instance's alarm is gone (deleted when the move marker was
+    // recorded), so it can never fire there again.
+    expect(await runDurableObjectAlarm(source)).toBe(false);
+
     // Forcing the alarm runs the kind's handler on the new side.
     const ran = await runDurableObjectAlarm(
       env.APP_DO.get(env.APP_DO.idFromName("gnarly:alarm-soon")),
@@ -51,8 +70,8 @@ describe("5. alarms", () => {
 
     // workerd runs an overdue alarm immediately. Wait for it so the test is
     // deterministic — in production this race is real: the alarm either
-    // fires pre-seal on the old side or is swallowed by the seal (see the
-    // next test for the swallowed case).
+    // fires pre-seal on the old side (this test) or lands in the sealed
+    // window, where it now defers itself (next test).
     let fired: number | null = null;
     for (let i = 0; i < 40 && fired === null; i++) {
       await new Promise((resolve) => setTimeout(resolve, 50));
@@ -73,22 +92,20 @@ describe("5. alarms", () => {
     expect(probe.firedAt).toBe(fired);
   });
 
-  it("BUG: an alarm that elapses while the instance is sealed is silently lost", async () => {
+  it("FIXED: an alarm that fires while sealed defers itself and survives the migration", async () => {
     const source = old("alarm-sealed");
     await source.kvPut("marker", "data");
-    const ts = Date.now() + 700;
-    await source.armAlarm(ts);
+    const armedAt = Date.now();
+    await source.armAlarm(armedAt + 1);
     await source.__claydoSeal();
 
-    // The alarm elapses during the (simulated slow) migration window. The
-    // sealed wrapper turns alarm() into a no-op that RETURNS SUCCESSFULLY,
-    // so the runtime deletes the alarm instead of retrying it.
-    await new Promise((resolve) => setTimeout(resolve, 1500));
+    // The alarm fires during the sealed window. Previously the sealed
+    // no-op returned success and the runtime deleted the alarm (silent
+    // loss). Now it DEFERS itself: re-arms at now + 60s with a
+    // console.warn, so the export still captures it.
+    expect(await runDurableObjectAlarm(source)).toBe(true);
 
-    // Walk the export to the final chunk: the alarm is exported as null.
-    // (Papercut: the ExportChunk return type collapses to `never` over the
-    // RPC stub typing, because ExportChunk.kv holds `unknown` values, so
-    // the casts below are required.)
+    // Walk the export to the final chunk: the deferred alarm is captured.
     let chunk = (await source.__claydoExport(undefined, null)) as ExportChunk;
     while (chunk.cursor !== null) {
       chunk = (await source.__claydoExport(
@@ -96,32 +113,58 @@ describe("5. alarms", () => {
         chunk.cursor,
       )) as ExportChunk;
     }
-    expect(chunk.alarm).toBeNull(); // BUG: pending work vanished
+    expect(typeof chunk.alarm).toBe("number");
+    const deferred = chunk.alarm as number;
+    expect(deferred).toBeGreaterThan(armedAt + 50_000);
+    expect(deferred).toBeLessThan(armedAt + 70_000);
 
-    // Even after rollback (unseal), the alarm is gone and never fired.
-    await source.__claydoUnseal();
-    const probe = await source.alarmProbe();
-    expect(probe.scheduled).toBeNull();
+    // Complete the migration (the instance is already sealed; the driver
+    // resumes ownership).
+    const summary = await migrateInstance({
+      from: source,
+      to: gnarly(),
+      name: "alarm-sealed",
+    });
+    expect(summary.alarm).toBe(deferred);
+
+    // The new side holds the deferred alarm and its handler fires there.
+    const moved = gnarly().get("alarm-sealed");
+    const probe = await moved.alarmProbe();
+    expect(probe.scheduled).toBe(deferred);
     expect(probe.firedAt).toBeNull();
+    expect(
+      await runDurableObjectAlarm(
+        env.APP_DO.get(env.APP_DO.idFromName("gnarly:alarm-sealed")),
+      ),
+    ).toBe(true);
+    expect((await moved.alarmProbe()).firedAt).not.toBeNull();
+
+    // The old instance's deferred alarm was deleted when the move marker
+    // was recorded: nothing left to fire on the old side.
+    expect(await runDurableObjectAlarm(source)).toBe(false);
+    const seal = await source.__claydoSealed();
+    expect(seal.sealed).toBe(true);
+    expect(seal.movedTo).toBeDefined();
   });
 });
 
 describe("6. WITHOUT ROWID and virtual tables", () => {
-  it("WITHOUT ROWID: fails with a clear error, rolls back cleanly, and migrates after dropping the table", async () => {
+  it("WITHOUT ROWID: fails pre-flight with a clear error, leaves both sides untouched, and migrates after dropping the table", async () => {
     const source = old("worid");
     await source.seedWithoutRowid();
     const before = await source.fingerprintAll();
 
-    await expect(
-      migrateInstance({ from: source, to: gnarly(), name: "worid" }),
-    ).rejects.toThrow(
-      "claydo: migration of 'worid' to kind 'gnarly' failed and was rolled " +
-        "back (old instance unsealed): claydo: table 'wor_t' is WITHOUT " +
-        "ROWID, which the exporter does not support yet. Copy this table " +
-        "with custom code, or recreate it with a rowid.",
+    // The unsupported table is now detected by the driver's pre-flight
+    // hasData probe, BEFORE anything is sealed or reserved — so the raw
+    // exporter error surfaces (no rollback wrapper, because there is
+    // nothing to roll back).
+    await expectRejects(
+      () => migrateInstance({ from: source, to: gnarly(), name: "worid" }),
+      /^Error: claydo: table 'wor_t' is WITHOUT ROWID, which the exporter does not support yet\. Copy this table with custom code, or recreate it with a rowid\.$/,
     );
 
-    // Rollback state: the old instance is unsealed and untouched...
+    // Nothing was touched: the old instance was never sealed and is
+    // bit-identical...
     expect(await source.__claydoSealed()).toEqual({ sealed: false });
     const afterFailure = await source.fingerprintAll();
     expect(afterFailure).toEqual(before);
@@ -145,18 +188,14 @@ describe("6. WITHOUT ROWID and virtual tables", () => {
     expect(after.tables["keep_t"]).toEqual(before.tables["keep_t"]);
   });
 
-  it("virtual table (fts5 exists in DO SQLite): fails with a clear error and migrates after dropping it", async () => {
+  it("virtual table (fts5 exists in DO SQLite): fails pre-flight with a clear error and migrates after dropping it", async () => {
     const source = old("virt");
     // fts5 IS available in Durable Object SQLite.
     expect(await source.seedVirtual()).toBe("ok");
 
-    await expect(
-      migrateInstance({ from: source, to: gnarly(), name: "virt" }),
-    ).rejects.toThrow(
-      "claydo: migration of 'virt' to kind 'gnarly' failed and was rolled " +
-        "back (old instance unsealed): claydo: table 'fts_docs' is a " +
-        "virtual table, which the exporter does not support. Drop it " +
-        "before migrating or copy it with custom code.",
+    await expectRejects(
+      () => migrateInstance({ from: source, to: gnarly(), name: "virt" }),
+      /^Error: claydo: table 'fts_docs' is a virtual table, which the exporter does not support\. Drop it before migrating or copy it with custom code\.$/,
     );
     expect(await source.__claydoSealed()).toEqual({ sealed: false });
 

@@ -1,15 +1,18 @@
 /**
- * Adversarial probes against claydo/migrate: crash-resume, torn snapshots,
- * duplicate concurrent drivers, secrets, import gating, wrong-kind targets,
- * ghost instances, and traffic racing a migration.
+ * Adversarial probes against claydo/migrate (post-hardening): crash-resume
+ * with import ownership, torn snapshots, duplicate concurrent drivers,
+ * secrets, import gating, wrong-kind targets, ghost instances, router
+ * behavior mid-import, stale router fetch, and traffic racing a migration —
+ * including the wipeTarget() recovery path.
  *
  * Each probe asserts the OBSERVED behavior so the suite stays green; the
- * judgments live in DX-REPORT.md.
+ * judgments live in DX-REPORT.md (sections 3 and 6).
  */
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { kinds } from "../../../src/index";
-import { migrated, migrateInstance } from "../../../src/migrate";
+import { migrated, migrateInstance, wipeTarget } from "../../../src/migrate";
+import { IMPORT_STATE_KEY, type ImportState } from "../../../src/migrate-wire";
 
 const sessions = () => kinds(env.APP_DO).session;
 const secureSessions = () => kinds(env.SECURE_DO).session;
@@ -44,17 +47,41 @@ async function messageOf(promise: Promise<unknown>): Promise<string> {
   }
 }
 
-describe("crash and resume", () => {
-  it("resumes from the last applied chunk after a driver crash", async () => {
+/** Backdates the target's import state so it counts as stale (crashed). */
+async function backdateImport(fullName: string): Promise<void> {
+  await runInDurableObject(rawHost(fullName), async (_instance, state) => {
+    const s = (await state.storage.get(IMPORT_STATE_KEY)) as ImportState;
+    s.updatedAtMs = Date.now() - 60_000;
+    await state.storage.put(IMPORT_STATE_KEY, s);
+  });
+}
+
+describe("crash and resume (with import ownership)", () => {
+  it("a fresh crashed import is owned: a new driver fails fast without touching anything", async () => {
     const name = "p-resume";
     await seed(name);
     const before = await old(name).history();
-    // Simulate a crashed driver: seal, transfer exactly one chunk, stop.
+    // Simulate a crashed driver: seal, reserve, transfer one chunk, stop.
     await old(name).__claydoSeal();
+    const raw = rawHost(`session:${name}`);
+    await raw.__claydoBeginImport("session", "crashed-driver");
     const first = await old(name).__claydoExport(undefined, null, { maxRows: 1 });
-    const raw = sessions().get(name).stub as any;
-    await raw.__claydoImport("session", first, 1);
+    await raw.__claydoImport("session", first, 1, "crashed-driver");
 
+    // A second driver arriving while the import is fresh must not steal it.
+    const message = await messageOf(
+      migrateInstance({ from: old(name), to: sessions(), name }),
+    );
+    expect(message).toMatch(
+      /another migration driver owns the import on instance 'session:p-resume' \(last progress \d+ms ago\)\. It is not stale yet; retry later\./,
+    );
+    // Nothing was rolled back: the old side is still sealed and the partial
+    // import is still in place for the owner (or a later adopter).
+    expect((await old(name).__claydoSealed()).sealed).toBe(true);
+    expect((await raw.__claydoImportStatus()).importing).toBeDefined();
+
+    // Once the crashed import goes stale, the next run adopts and resumes.
+    await backdateImport(`session:${name}`);
     const summary = await migrateInstance({
       from: old(name),
       to: sessions(),
@@ -68,15 +95,18 @@ describe("crash and resume", () => {
       color: "blue",
       lang: "de",
     });
+    // The move marker was recorded on the old side after success.
+    expect((await old(name).__claydoSealed()).movedTo).toBe(raw.id.toString());
   });
 
   it("restarts from scratch when the old instance was unsealed mid-crash (torn snapshot)", async () => {
     const name = "p-torn";
     await seed(name);
     await old(name).__claydoSeal();
+    const raw = rawHost(`session:${name}`);
+    await raw.__claydoBeginImport("session", "crashed-driver");
     const first = await old(name).__claydoExport(undefined, null, { maxRows: 1 });
-    const raw = sessions().get(name).stub as any;
-    await raw.__claydoImport("session", first, 1);
+    await raw.__claydoImport("session", first, 1, "crashed-driver");
 
     // An operator unseals the old instance and traffic mutates it. The
     // partial import on the target is now a torn snapshot.
@@ -84,6 +114,8 @@ describe("crash and resume", () => {
     await old(name).record("post-crash", "mutation");
     await old(name).setPref("color", "red"); // overwrite a kv already copied
 
+    // Make the crashed import adoptable, then re-run.
+    await backdateImport(`session:${name}`);
     const summary = await migrateInstance({
       from: old(name),
       to: sessions(),
@@ -106,7 +138,7 @@ describe("crash and resume", () => {
 });
 
 describe("duplicate concurrent drivers for the same instance", () => {
-  it("one driver wins with correct data, but the loser's rollback unseals the old instance (split-brain)", async () => {
+  it("the loser fails fast at reservation; the seal and the completed migration are untouched", async () => {
     const name = "p-race";
     await seed(name);
     const run = () =>
@@ -118,17 +150,21 @@ describe("duplicate concurrent drivers for the same instance", () => {
       });
     const results = await Promise.allSettled([run(), run()]);
 
-    // Exactly one driver wins; per-chunk seq dedup keeps the data correct.
+    // Exactly one driver wins; the loser is rejected at reservation, before
+    // it sealed or wrote anything — no rollback text, no unseal stomping.
     const fulfilled = results.filter((r) => r.status === "fulfilled");
     const rejected = results.filter((r) => r.status === "rejected");
     expect(fulfilled).toHaveLength(1);
     expect(rejected).toHaveLength(1);
-    expect((rejected[0]!.reason as Error).message).toMatch(
-      /failed and was rolled back \(old instance unsealed\)/,
+    const loser = (rejected[0]!.reason as Error).message;
+    expect(loser).toMatch(
+      /another migration driver owns the import on instance 'session:p-race' \(last progress \d+ms ago\)\. It is not stale yet; retry later\./,
     );
-    expect((rejected[0]!.reason as Error).message).toMatch(
-      /is already live as kind 'session'\. Imports only target untouched instances/,
-    );
+    expect(loser).not.toMatch(/rolled back/);
+
+    const winner = (fulfilled[0] as PromiseFulfilledResult<any>).value;
+    expect(winner.skipped).toBe(false);
+    expect(winner.rows["events"]).toBe(3);
 
     // The new instance holds correct, non-duplicated data.
     expect(await sessions().get(name).eventCount()).toBe(3);
@@ -137,22 +173,16 @@ describe("duplicate concurrent drivers for the same instance", () => {
       lang: "de",
     });
 
-    // THE BUG (see DX-REPORT.md): the losing driver's rollback unsealed the
-    // old instance even though the migration actually completed. Both sides
-    // are now live, and a re-run refuses instead of skipping.
-    expect((await old(name).__claydoSealed()).sealed).toBe(false);
-    const rerun = await messageOf(
-      migrateInstance({ from: old(name), to: sessions(), name }),
-    );
-    expect(rerun).toMatch(
-      /both the old instance 'p-race' and the new instance 'session:p-race' are live\. Refusing to migrate/,
-    );
+    // FIXED (old issue 2): the old instance STAYS sealed, with the move
+    // marker recorded — the loser did not unseal it.
+    const seal = await old(name).__claydoSealed();
+    expect(seal.sealed).toBe(true);
+    expect(seal.movedTo).toBe(sessions().get(name).id.toString());
 
-    // Manual remediation (safe here because old data equals new data):
-    // re-seal the old instance by hand, after which re-runs skip again.
-    await old(name).__claydoSeal();
-    const fixed = await migrateInstance({ from: old(name), to: sessions(), name });
-    expect(fixed.skipped).toBe(true);
+    // And a re-run is a clean idempotent skip, not a "both live" refusal.
+    const rerun = await migrateInstance({ from: old(name), to: sessions(), name });
+    expect(rerun.skipped).toBe(true);
+    expect(rerun.reason).toBe("already migrated");
   });
 });
 
@@ -244,7 +274,7 @@ describe("secrets", () => {
 });
 
 describe("import gating and wrong targets", () => {
-  it("refuses to import into a kind that is not importable, and rolls back", async () => {
+  it("refuses at reservation for a non-importable kind, before anything is touched", async () => {
     const name = "p-gate";
     await seed(name);
     const message = await messageOf(
@@ -254,53 +284,83 @@ describe("import gating and wrong targets", () => {
         name,
       }),
     );
-    expect(message).toMatch(/imports are not enabled for kind 'audit'/);
-    expect(message).toMatch(/Pass \{ importable: true \} or \{ importable: \["audit"\] \} to union\(\)/);
-    expect(message).toMatch(/rolled back \(old instance unsealed\)/);
-    // Rollback proof: the old instance is unsealed and serves writes again.
+    // The gating error now fires at __claydoBeginImport, before the old
+    // instance is sealed — so there is no rollback and the error is raw.
+    expect(message).toBe(
+      `claydo: imports are not enabled for kind 'audit'. Pass { importable: true } or { importable: ["audit"] } to union().`,
+    );
+    expect(message).not.toMatch(/rolled back/);
+    // Nothing was touched on either side: old never sealed, target has no
+    // reservation.
     expect((await old(name).__claydoSealed()).sealed).toBe(false);
-    expect(await old(name).record("after-rollback", "x")).toBe(4);
+    expect(await old(name).record("after-refusal", "x")).toBe(4);
+    const status = await rawHost(`audit:${name}`).__claydoImportStatus();
+    expect(status.kind).toBeUndefined();
+    expect(status.importing).toBeUndefined();
   });
 
-  it("refuses an import whose declared kind contradicts the target name prefix", async () => {
+  it("refuses a reservation whose declared kind contradicts the target name prefix", async () => {
+    const target = rawHost("audit:mismatch");
+    const message = await messageOf(
+      target.__claydoBeginImport("session", "probe-token"),
+    );
+    expect(message).toMatch(
+      /the target name 'audit:mismatch' implies kind 'audit', but the import declares kind 'session'/,
+    );
+  });
+
+  it("refuses import chunks that were not preceded by a reservation", async () => {
     const name = "p-name";
     await seed(name);
     await old(name).__claydoSeal();
     const chunk = await old(name).__claydoExport(undefined, null);
-    // Hand-deliver a 'session' import into an instance named 'audit:mismatch'.
-    const target = rawHost("audit:mismatch");
+    const target = rawHost("session:p-name-unreserved");
     const message = await messageOf(
-      target.__claydoImport("session", chunk, 1),
+      target.__claydoImport("session", chunk, 1, "probe-token"),
     );
     expect(message).toMatch(
-      /the target name 'audit:mismatch' implies kind 'audit', but the import declares kind 'session'/,
+      /no import is reserved on instance 'session:p-name-unreserved'\. Call __claydoBeginImport first \(migrateInstance does this automatically\)\./,
     );
     await old(name).__claydoUnseal();
   });
 });
 
 describe("ghost instances (never existed, no data)", () => {
-  it("fabricates an empty instance instead of skipping (see DX-REPORT.md)", async () => {
+  it("skips with a reason and touches nothing; allowEmpty opts into schema-only migration", async () => {
     const name = "p-ghost";
     const summary = await migrateInstance({
       from: old(name),
       to: sessions(),
       name,
     });
-    // Observed behavior: the migration "succeeds" with skipped:false. It
-    // materializes the never-existing old instance (the constructor's
-    // CREATE TABLEs run), seals it forever, copies the empty schema, and
-    // pins the kind on an empty new instance.
+    // FIXED (old issue 4): no fabrication. Skipped with an explicit reason,
+    // nothing sealed, nothing created on the target.
     expect(summary).toStrictEqual({
-      skipped: false,
+      skipped: true,
+      reason:
+        "old instance has no data (pass allowEmpty to migrate schema-only instances)",
       resumed: false,
-      chunks: 1,
+      chunks: 0,
       kv: 0,
-      // Zero-row tables are omitted, so `rows` is indistinguishable from
-      // "nothing was copied".
       rows: {},
-      alarm: null,
+      alarm: undefined,
     });
+    expect((await old(name).__claydoSealed()).sealed).toBe(false);
+    const status = await rawHost(`session:${name}`).__claydoImportStatus();
+    expect(status.kind).toBeUndefined();
+    expect(status.importing).toBeUndefined();
+
+    // The documented opt-in migrates the schema-only instance.
+    const forced = await migrateInstance({
+      from: old(name),
+      to: sessions(),
+      name,
+      allowEmpty: true,
+    });
+    expect(forced.skipped).toBe(false);
+    expect(forced.chunks).toBe(1);
+    // Zero-row tables are reported with zero counts (issue 8, fixed).
+    expect(forced.rows).toStrictEqual({ events: 0, tags: 0 });
     const seal = await old(name).__claydoSealed();
     expect(seal.sealed).toBe(true);
     expect(seal.movedTo).toBeDefined();
@@ -309,76 +369,79 @@ describe("ghost instances (never existed, no data)", () => {
 });
 
 describe("router behavior while an import is in progress", () => {
-  it("routes to the new side and surfaces the import-blocked error", async () => {
+  it("direct traffic blocks; the router waits for the migration and then serves the new side", async () => {
     const name = "p-midimport";
     await seed(name);
     await old(name).__claydoSeal();
+    const raw = rawHost(`session:${name}`);
+    await raw.__claydoBeginImport("session", "crashed-driver");
     const first = await old(name).__claydoExport(undefined, null, { maxRows: 1 });
-    const raw = sessions().get(name).stub as any;
-    await raw.__claydoImport("session", first, 1);
+    await raw.__claydoImport("session", first, 1, "crashed-driver");
 
-    // The router sees the old side sealed and routes "new", but the new
-    // side blocks traffic mid-import. Callers get an error, not a wait.
+    // Direct kind access is blocked mid-import; fetch() answers 400 (still
+    // not a retryable 503 — issue 9, unchanged).
+    const direct = await messageOf(sessions().get(name).history());
+    expect(direct).toMatch(
+      /is importing kind 'session'\. Traffic is blocked until the migration completes or is aborted/,
+    );
+    const response = await sessions().get(name).fetch("https://do/");
+    expect(response.status).toBe(503);
+    expect(response.headers.get("retry-after")).toBe("2");
+    expect(await response.text()).toMatch(/is importing kind 'session'/);
+
+    // The router no longer surfaces the error: it polls until the migration
+    // finishes. Complete the (stale) migration concurrently and let a
+    // router call ride through the window.
+    await backdateImport(`session:${name}`);
     const facade = migrated(env.OLD_SESSIONS, sessions(), {
       strategy: "manual",
       oldRouteTtlMs: 0,
     });
-    const viaRouter = await messageOf(facade.get(name).history());
-    expect(viaRouter).toMatch(
-      /is importing kind 'session'\. Traffic is blocked until the migration completes or is aborted/,
-    );
-    // Direct kind access fails the same way; fetch() answers 400.
-    const direct = await messageOf(sessions().get(name).history());
-    expect(direct).toMatch(/is importing kind 'session'/);
-    const response = await sessions().get(name).fetch("https://do/");
-    expect(response.status).toBe(400);
-    expect(await response.text()).toMatch(/is importing kind 'session'/);
-
-    // Finish the migration; the router then serves the new side.
-    const summary = await migrateInstance({
-      from: old(name),
-      to: sessions(),
-      name,
-      maxRowsPerChunk: 1,
-    });
+    const [viaRouter, summary] = await Promise.all([
+      facade.get(name).history(),
+      migrateInstance({
+        from: old(name),
+        to: sessions(),
+        name,
+        maxRowsPerChunk: 1,
+      }),
+    ]);
     expect(summary.resumed).toBe(true);
+    expect(viaRouter).toHaveLength(3);
     expect(await facade.get(name).eventCount()).toBe(3);
   });
 });
 
 describe("router fetch() with a stale cached old-route", () => {
-  it("RPC retries on the new side, but fetch() returns the old 410 to the caller", async () => {
+  it("fetch() retries on the new side after the marked 410 (no more stale 410s)", async () => {
     const name = "p-router-fetch";
     await seed(name);
     const facade = migrated(env.OLD_SESSIONS, sessions(), {
       strategy: "manual",
       oldRouteTtlMs: 60_000,
     });
-    // Prime the cache with an "old" route.
-    expect(await facade.get(name).eventCount()).toBe(3);
+    // Prime the cache with an "old" route; the body carries the raw
+    // unprefixed name, proving the old side served it.
+    const primed = await facade.get(name).fetch("https://do/");
+    expect(primed.status).toBe(200);
+    expect(await primed.text()).toContain(`raw=${name} `);
     // An external driver migrates while the route is cached.
     await migrateInstance({ from: old(name), to: sessions(), name });
 
-    // fetch() through the router: no seal-retry, the caller gets a 410 whose
-    // body tells them to "route traffic through the claydo binding" — which
-    // is exactly what they are doing.
+    // FIXED (old issue 5): fetch() through the router detects the
+    // SEALED_HEADER 410 from the old side, re-resolves, and retries on the
+    // new side — the caller sees a 200 from the kind instance.
     const response = await facade.get(name).fetch("https://do/");
-    expect(response.status).toBe(410);
-    expect(await response.text()).toMatch(
-      /is sealed\. It moved to Durable Object id .*; route traffic through the claydo binding\./,
-    );
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain(`raw=session:${name} `);
 
-    // The RPC path on the same facade heals the route (seal-retry), after
-    // which fetch() works again.
+    // RPC on the same facade works too.
     expect(await facade.get(name).eventCount()).toBe(3);
-    const healed = await facade.get(name).fetch("https://do/");
-    expect(healed.status).toBe(200);
-    expect(await healed.text()).toContain(`raw=session:${name} `);
   });
 });
 
 describe("traffic racing a migration of the same name", () => {
-  it("traffic pins an EMPTY instance, the migration bricks, and there is no recovery path", async () => {
+  it("a pre-reservation read can still pollute the target, but the driver refuses recoverably and wipeTarget() unbricks it", async () => {
     const name = "p-traffic";
     await seed(name);
     const [migration, traffic] = await Promise.allSettled([
@@ -391,42 +454,54 @@ describe("traffic racing a migration of the same name", () => {
       sessions().get(name).history(),
     ]);
 
-    // The plain-accessor read wins the race: it initializes the target and
-    // answers with an EMPTY history — a silently wrong answer for a session
-    // that has 3 events on the old side.
+    // The plain-accessor read that lands BEFORE the driver's reservation
+    // still initializes the target and answers with an EMPTY history — the
+    // pollution window is narrower but not gone (see DX-REPORT.md § 6).
     expect(traffic.status).toBe("fulfilled");
     expect((traffic as PromiseFulfilledResult<unknown>).value).toStrictEqual([]);
 
-    // The migration loses and rolls back (old side stays usable — good).
+    // The migration refuses at reservation, BEFORE sealing the old side:
+    // no rollback text, and the old instance was never frozen.
     expect(migration.status).toBe("rejected");
     const reason = (migration as PromiseRejectedResult).reason as Error;
     expect(reason.message).toMatch(
       /is live as kind 'session'\. Imports only target untouched instances/,
     );
+    expect(reason.message).not.toMatch(/rolled back/);
     expect((await old(name).__claydoSealed()).sealed).toBe(false);
     expect(await old(name).eventCount()).toBe(3);
 
-    // But now the instance is BRICKED: the new side is pinned and empty, so
-    // every re-run refuses. The message's first suggestion ("seal the old
-    // one") would silently destroy all 3 events here.
+    // The re-run refusal now leads with the correct remediation for this
+    // exact situation, naming wipeTarget().
     const rerun = await messageOf(
       migrateInstance({ from: old(name), to: sessions(), name }),
     );
-    expect(rerun).toMatch(
-      /both the old instance 'p-traffic' and the new instance 'session:p-traffic' are live\. Refusing to migrate\. If the new instance is the source of truth, seal the old one; otherwise wipe the new instance before migrating\./,
+    expect(rerun).toBe(
+      "claydo: both the old instance 'p-traffic' and the new instance " +
+        "'session:p-traffic' are live. Refusing to migrate. If racing " +
+        "traffic polluted the new instance (it has no real data), wipe it " +
+        "with wipeTarget() from claydo/migrate and re-run. If the new " +
+        "instance is the source of truth, seal the old one with " +
+        "__claydoSeal() — its data will NOT be copied.",
     );
 
-    // "Wipe the new instance": there is no public API for that. Even the
-    // test-only escape hatch (deleteAll inside the DO) does not help,
-    // because the host caches the kind and the live impl in memory — only
-    // eviction or ctx.abort() would clear it.
-    const rawStub = env.APP_DO.get(env.APP_DO.idFromName(`session:${name}`));
-    await runInDurableObject(rawStub, async (_instance, state) => {
-      await state.storage.deleteAll();
+    // FIXED (old issue 1's recovery half): wipeTarget() clears storage AND
+    // the in-memory kind pin, so the re-run succeeds end-to-end.
+    await wipeTarget(sessions(), name);
+    const summary = await migrateInstance({
+      from: old(name),
+      to: sessions(),
+      name,
     });
-    const afterWipe = await messageOf(
-      migrateInstance({ from: old(name), to: sessions(), name }),
-    );
-    expect(afterWipe).toMatch(/both the old instance .* are live/);
+    expect(summary.skipped).toBe(false);
+    expect(summary.rows["events"]).toBe(3);
+    expect(await sessions().get(name).history()).toHaveLength(3);
+    expect(await sessions().get(name).listPrefs()).toStrictEqual({
+      color: "blue",
+      lang: "de",
+    });
+    const seal = await old(name).__claydoSealed();
+    expect(seal.sealed).toBe(true);
+    expect(seal.movedTo).toBe(sessions().get(name).id.toString());
   });
 });

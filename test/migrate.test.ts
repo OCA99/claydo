@@ -144,7 +144,8 @@ describe("migrateInstance", () => {
       /is importing kind 'tally'/,
     );
     const response = await tally().get("m5").fetch("https://do/");
-    expect(response.status).toBe(400);
+    expect(response.status).toBe(503);
+    expect(response.headers.get("retry-after")).toBe("2");
 
     // The owner can abort; a fresh migration then succeeds.
     expect(await raw.__claydoAbortImport("t-m5")).toBe(true);

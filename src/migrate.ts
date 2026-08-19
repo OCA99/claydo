@@ -194,6 +194,13 @@ export function exportable<I extends object>(
               }
               return original.apply(this, args);
             };
+          } else if (key === "webSocketClose" || key === "webSocketError") {
+            // Sealing closes the instance's own sockets, which fires these
+            // handlers; a throw here would only produce log noise.
+            wrapper = function (this: Exportable, ...args: unknown[]) {
+              if (this.#sealed) return;
+              return original.apply(this, args);
+            };
           } else {
             wrapper = function (this: Exportable, ...args: unknown[]) {
               const seal = this.#sealed;

@@ -11,7 +11,12 @@
 import { env, runDurableObjectAlarm, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { kinds } from "../../../src/index";
-import { migrated, migrateInstance, type MigrationSummary } from "../../../src/migrate";
+import {
+  migrated,
+  migrateInstance,
+  SEALED_HEADER,
+  type MigrationSummary,
+} from "../../../src/migrate";
 import type { SessionEvent } from "../worker";
 
 const sessions = () => kinds(env.APP_DO).session;
@@ -58,7 +63,8 @@ const summaries = new Map<string, MigrationSummary>();
  * `expect(...).rejects` for calls on the raw OLD stub: seal-guard rejections
  * arrive as native RPC rejections, and `expect().rejects` on those leaves an
  * unhandled rejection behind that fails the whole vitest run (see
- * DX-REPORT.md; the library's own test suite trips over this too).
+ * DX-REPORT.md issue 3; the repo now ships the same pattern as
+ * `expectRejects` in test/migrate.test.ts).
  */
 async function messageOf(promise: Promise<unknown>): Promise<string> {
   try {
@@ -151,15 +157,20 @@ describe("fleet migration: OLD_SESSIONS -> kind 'session'", () => {
 
   it("cutover: every old instance is sealed, every new instance is live", async () => {
     for (const name of FLEET) {
-      // Old RPC fails with the seal error, and names where traffic moved.
+      // Old RPC fails with the seal error, and names where traffic moved
+      // (the move marker is recorded on the old side after success).
       const message = await messageOf(old(name).record("late", "write"));
       expect(message).toMatch(/is sealed/);
       expect(message).toMatch(/moved to Durable Object id/);
-      // Old fetch answers 410 Gone.
+      const seal = await old(name).__claydoSealed();
+      expect(seal.movedTo).toBe(sessions().get(name).id.toString());
+      // Old fetch answers 410 Gone with the machine-readable sealed header
+      // and a generic body (bodies no longer leak the instance identity).
       const gone = await old(name).fetch("https://do/");
       expect(gone.status).toBe(410);
-      expect(await gone.text()).toMatch(
-        new RegExp(`instance '${name}' is sealed`),
+      expect(gone.headers.get(SEALED_HEADER)).toBe("1");
+      expect(await gone.text()).toBe(
+        "claydo: this instance is sealed (migrating or migrated). Reconnect through the current endpoint.",
       );
       // New side serves reads and writes.
       expect(await sessions().get(name).eventCount()).toBeGreaterThan(0);
@@ -187,6 +198,7 @@ describe("fleet migration: OLD_SESSIONS -> kind 'session'", () => {
       });
       expect(again).toStrictEqual({
         skipped: true,
+        reason: "already migrated",
         resumed: false,
         chunks: 0,
         kv: 0,
@@ -223,6 +235,8 @@ describe("summary truthfulness", () => {
       maxRowsPerChunk: 2,
     });
 
+    expect(summary.skipped).toBe(false);
+    expect(summary.reason).toBeUndefined();
     expect(summary.rows).toStrictEqual({ events: 5, tags: 3 });
     expect(summary.kv).toBe(3);
     expect(summary.alarm).toBe(alarmAt);
@@ -231,6 +245,8 @@ describe("summary truthfulness", () => {
     // pages (2, 1); chunk 7 = final (post DDL, sequences, alarm, totals).
     expect(summary.chunks).toBe(7);
 
+    // The old instance's alarm was deleted when the move was recorded.
+    expect(await runDurableObjectAlarm(old(name))).toBe(false);
     // The alarm was re-armed on the new instance and fires the kind's alarm().
     const ran = await runDurableObjectAlarm(
       env.APP_DO.get(env.APP_DO.idFromName(`session:${name}`)),

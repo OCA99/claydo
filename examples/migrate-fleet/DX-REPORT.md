@@ -430,3 +430,162 @@ target first; re-check status before unsealing; check `__claydoHasData` before
 sealing). With those plus a green `npm test` (issue 3), this would be an
 8.5–9: the hard part — a correct, resumable, verifiable copy protocol — is
 already done.
+
+## 6. Post-fix verification
+
+Re-audited after the hardening pass (target reservation, import ownership,
+move markers, empty-instance skip, `wipeTarget()`, synchronous seal guards,
+router fetch retry). The suite was updated to assert the new behavior with
+the same precision — now **25 tests, all green** (`set -o pipefail; npx
+vitest run --config examples/migrate-fleet/vitest.config.ts` exits 0;
+`tsc --noEmit` clean). All quoted errors below are verbatim from the
+re-verification runs.
+
+### Issue 1 (blocker — traffic pollution, bricked target, no recovery): **fixed in substance, window narrowed but not zero**
+
+- **Reservation works.** With an import reserved (`__claydoBeginImport`),
+  target traffic no longer initializes an empty instance; it fails with
+  `claydo: instance 'session:p-midimport' is importing kind 'session'. Traffic is blocked until the migration completes or is aborted.`
+  and the `migrated()` router no longer surfaces that error — it polls until
+  the migration finishes and then serves the new side (verified by running a
+  router read concurrently with the completing migration).
+- **Recovery exists and works end-to-end.** After a polluted target, the
+  refusal now leads with the correct remediation:
+
+  ```
+  claydo: both the old instance 'p-traffic' and the new instance 'session:p-traffic' are live. Refusing to migrate. If racing traffic polluted the new instance (it has no real data), wipe it with wipeTarget() from claydo/migrate and re-run. If the new instance is the source of truth, seal the old one with __claydoSeal() — its data will NOT be copied.
+  ```
+
+  The dangerous option is now last, is explicit about the consequence ("its
+  data will NOT be copied"), and `wipeTarget()` genuinely unbricks: my test
+  wipes and re-migrates successfully, byte-checked — the in-memory kind pin
+  that previously survived a storage wipe is cleared too.
+- **The driver no longer makes things worse.** In the same race, the
+  migration now refuses at reservation, *before* sealing the old side — the
+  old instance stays unsealed and fully intact (previously it was sealed,
+  then blindly unsealed by the rollback).
+- **Residual:** a plain-accessor read that lands in the window *before* the
+  driver's reservation still pins an empty instance and still answers with a
+  silently wrong `[]` (my race test reproduces this deterministically). It
+  is now recoverable and loudly refused on the next driver run, and callers
+  that follow the README and route through `migrated()` are not exposed
+  (the router routes "old" until the old side seals, which now happens after
+  reservation). Downgraded from blocker to a documented minor sharp edge.
+
+### Issue 2 (major — duplicate drivers unseal after completion): **fixed**
+
+The loser now fails fast at reservation, before touching anything:
+
+```
+claydo: another migration driver owns the import on instance 'session:p-race' (last progress 2ms ago). It is not stale yet; retry later.
+```
+
+Verified: exactly one winner with correct, non-duplicated data; the old
+instance **stays sealed** with the move marker recorded
+(`movedTo` = the target's Durable Object id); no "rolled back" path runs;
+and the re-run returns `{ skipped: true, reason: "already migrated" }`
+instead of the previous "both live" refusal. The crashed-driver story is
+also coherent now: a fresh import is owned (same fail-fast error), and a
+backdated (~30 s stale) import is adopted and resumed (`resumed: true`,
+byte-identical data) — the torn-snapshot restart still works on top of
+adoption.
+
+### Issue 3 (major — repo `npm test` exits 1): **fixed**
+
+Unmodified repo checkout: `npx vitest run` → 46 tests passed, exit 0, zero
+vitest unhandled errors. The repo tests now use a try/catch `expectRejects`
+helper instead of `expect(...).rejects` for raw-RPC seal throws; my suite
+keeps the equivalent `messageOf` pattern.
+
+### Issue 4 (major — ghost fabrication): **fixed**
+
+Migrating a never-existing name now returns
+
+```
+{"skipped":true,"reason":"old instance has no data (pass allowEmpty to migrate schema-only instances)","resumed":false,"chunks":0,"kv":0,"rows":{},"alarm":undefined}
+```
+
+with **nothing** sealed or created on either side (old unsealed, target has
+no kind and no import state — both asserted). The documented `allowEmpty:
+true` opt-in performs the schema-only migration when you actually want one.
+
+### Issue 5 (major — router fetch() stale 410s): **fixed**
+
+With a cached "old" route and an externally completed migration, the facade
+`fetch()` now detects the marked 410 (`x-claydo-sealed: 1`, exported as
+`SEALED_HEADER`), re-resolves, and retries: the caller receives a 200 served
+by the kind instance (body confirms `raw=session:p-router-fetch`). No stale
+410 window remains.
+
+### Issue 6 (minor — context-free secret errors): **unchanged**
+
+All four secret failure scenarios still produce the identical, bare
+`claydo: invalid migration secret.` — no instance name, no side attribution,
+no driver context wrapper.
+
+### Issue 7 (minor — one-sided secrets silently accepted): **unchanged**
+
+Old-side-only and host-side-only secret configurations still silently accept
+the extra/ignored secret. The README still does not call this out.
+
+### Issue 8 (minor — `summary.rows` omits zero-row tables): **unchanged**
+
+An `allowEmpty` migration of a schema-only instance reports `rows: {}`
+instead of `{ events: 0, tags: 0 }`; fleet members with zero tags still omit
+the `tags` key (my tests still need the `?? 0` workaround).
+
+### Issue 9 (minor — mid-import fetch answers 400): **unchanged**
+
+The target's `fetch()` during an import still answers **400** with the
+"is importing kind" text rather than a retryable 503. Practical exposure is
+smaller now because the router waits out migrations instead of surfacing the
+error, but direct-fetch callers still see a non-retryable status.
+
+### Issue 10 (nit — README/API gaps): **improved**
+
+The migration walkthrough now documents the reservation ordering, ownership
+and staleness, the sealed-fetch header, WebSocket close 1012, alarm
+deferral, the empty-instance skip with `allowEmpty`, and the `wipeTarget()`
+recovery path — the operational story is genuinely documented now. Still
+missing: the API section documents `union(kinds)` without the
+`importable`/`secret` options bag, `oldRouteTtlMs` and the
+`MigrationSummary` shape appear nowhere in the README, and the Testing
+section does not mention the seal-rejection assertion pitfall (the
+`expectRejects` pattern lives only in the repo's test code).
+
+### Issue 11 (nit — "uncaught exception" log spam): **unchanged**
+
+Every handled seal/ownership rejection over raw RPC still emits a
+workerd-side `uncaught exception; source = Uncaught (in promise)` line with
+a full stack (12 in my fully green run). Cosmetic, but at fleet scale it is
+real log noise.
+
+### New behavior verified along the way
+
+Beyond my original issues, the re-audit confirmed: the old side is sealed
+*without* a move marker during the copy ("A migration is in progress.") and
+re-sealed *with* it only after success ("It moved to Durable Object id …"),
+at which point the old instance's pending alarm is deleted
+(`runDurableObjectAlarm` on the old side returns `false` post-migration,
+while the transferred alarm fires on the new side); import chunks without a
+prior reservation are refused
+(`claydo: no import is reserved on instance 'session:p-name-unreserved'. Call __claydoBeginImport first (migrateInstance does this automatically).`);
+and the wrong-kind name check now fires at reservation time, before any
+state is written.
+
+### Updated verdict
+
+**Score: 8.5 / 10** (up from 6.5).
+
+Every major and blocking finding is fixed or defused: duplicate drivers are
+safe, ghosts are skipped, the router heals fetch traffic, the repo's CI
+signal is trustworthy, and — most importantly — the failure states that used
+to be unrecoverable dead ends now come with a working, documented recovery
+tool whose error messages point the right way. The copy engine was already
+production-grade; the operational envelope now mostly is too. I would trust
+this to migrate production data, with two provisos: route all transitional
+traffic through `migrated()` (the pre-reservation pollution window still
+exists for plain-accessor callers, though it is now loud and recoverable),
+and budget for the remaining paper cuts — context-free secret errors,
+zero-row omission in summaries, and the 400-instead-of-503 mid-import
+status — none of which threatens data.

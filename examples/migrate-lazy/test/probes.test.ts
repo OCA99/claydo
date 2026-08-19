@@ -1,17 +1,23 @@
 /**
- * Adversarial probes against the transitional router. Each test forces a
- * failure mode a production fleet would eventually hit, captures the errors
- * a caller sees verbatim (logged with a [probe] prefix), and asserts the
- * resulting invariants so the suite stays green.
+ * Adversarial probes against the transitional router, updated for the
+ * hardened library. Each probe that used to document a failure mode now
+ * PROVES the fix, with the new behavior asserted as precisely as the old
+ * one was — races resolve exactly-once with no split, wipeTarget() recovers
+ * a polluted target end-to-end, fetch/WebSocket retries absorb the sealed
+ * 410, sync self-calls survive `exportable()`. Verbatim evidence is logged
+ * with a [probe] prefix.
  */
-import { env } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { kind } from "../../../src/index";
 import {
   migrateInstance,
   migrated,
+  wipeTarget,
+  SEALED_HEADER,
   type ExportChunk,
 } from "../../../src/migrate";
+import type { ImportState } from "../../../src/migrate-wire";
 import type { TakeResult } from "../worker";
 
 const newBuckets = () => kind(env.LIMITER_DO, "bucket");
@@ -28,6 +34,21 @@ const lazyFacade = () =>
 
 function messageOf(reason: unknown): string {
   return reason instanceof Error ? reason.message : String(reason);
+}
+
+/** Asserts a rejection without leaving an unhandled-rejection report. */
+async function expectRejects(
+  run: () => Promise<unknown>,
+  pattern: RegExp,
+): Promise<string> {
+  try {
+    await run();
+  } catch (error) {
+    const message = messageOf(error);
+    expect(message).toMatch(pattern);
+    return message;
+  }
+  expect.unreachable(`expected rejection matching ${pattern}`);
 }
 
 describe("first-touch race", () => {
@@ -49,7 +70,7 @@ describe("first-touch race", () => {
     expect((await oldBucket("race-same").__claydoSealed()).sealed).toBe(true);
   });
 
-  it("two facades (two Workers): losers may unseal the old instance and split the fleet", async () => {
+  it("two facades (two Workers): ALL callers succeed, exactly-once, no split", async () => {
     await oldBucket("race-two").configure(50, 0);
     const facadeA = lazyFacade();
     const facadeB = lazyFacade();
@@ -60,37 +81,38 @@ describe("first-touch race", () => {
       facadeA.get("race-two").take(1),
       facadeB.get("race-two").take(1),
     ]);
-    const rejected = outcomes.filter((o) => o.status === "rejected");
-    const fulfilled = outcomes.filter((o) => o.status === "fulfilled");
-    for (const loss of rejected) {
-      console.log("[probe race-two] loser error:", messageOf(loss.reason));
-    }
     console.log(
-      `[probe race-two] fulfilled=${fulfilled.length} rejected=${rejected.length}`,
-      fulfilled.map((o) => (o as PromiseFulfilledResult<TakeResult>).value),
+      "[probe race-two] outcomes:",
+      outcomes.map((o) =>
+        o.status === "fulfilled" ? o.value : messageOf(o.reason),
+      ),
     );
 
-    // The winner always lands the data on the new side.
-    expect(await rawNew("bucket", "race-two").__claydoKind()).toBe("bucket");
-    expect(fulfilled.length).toBeGreaterThanOrEqual(1);
+    // FIXED (was blocker #1): losers used to reject and UNSEAL the old
+    // instance, splitting the fleet. Now they wait for the winner: every
+    // caller succeeds and each take applied exactly once.
+    expect(outcomes.every((o) => o.status === "fulfilled")).toBe(true);
+    const values = outcomes.map(
+      (o) => (o as PromiseFulfilledResult<TakeResult>).value,
+    );
+    expect(values.every((v) => v.allowed)).toBe(true);
+    expect(new Set(values.map((v) => v.remaining))).toEqual(
+      new Set([46, 47, 48, 49]),
+    );
+    expect(await newBuckets().get("race-two").remaining()).toBe(46);
 
-    // The dangerous part: if a loser's rollback ran after the winner
-    // finished, it UNSEALED the old instance — old live with data + new
-    // live = the split the library itself warns about.
+    // The old instance ends sealed WITH the move marker — no rollback
+    // unseal, no both-live split, and fresh facades route cleanly.
     const seal = await oldBucket("race-two").__claydoSealed();
     console.log("[probe race-two] old seal state after race:", seal);
-    if (!seal.sealed) {
-      const fresh = lazyFacade();
-      await expect(fresh.get("race-two").remaining()).rejects.toThrow(
-        /both the old instance/,
-      );
-      console.log(
-        "[probe race-two] fleet is split: fresh facades now fail with the both-live error",
-      );
-    }
+    expect(seal.sealed).toBe(true);
+    expect(seal.movedTo).toBe(
+      newBuckets().idFromName("race-two").toString(),
+    );
+    expect(await lazyFacade().get("race-two").remaining()).toBe(46);
   });
 
-  it("deterministic loser replay: the rollback unseal creates a both-live split", async () => {
+  it("deterministic loser replay: reservation fails fast, nothing is rolled back", async () => {
     const name = "race-loser";
     await oldBucket(name).configure(10, 0);
     const raw = rawNew("bucket", name);
@@ -99,105 +121,125 @@ describe("first-touch race", () => {
     expect((await raw.__claydoImportStatus()).kind).toBeUndefined();
     // ...then the winner completed the whole migration...
     await migrateInstance({ from: oldBucket(name), to: newBuckets(), name });
-    // ...and the loser proceeds exactly as migrateInstance's loop would:
-    await oldBucket(name).__claydoSeal();
-    const chunk = await oldBucket(name).__claydoExport(undefined, null);
-    let loserError = "";
-    try {
-      await raw.__claydoImport("bucket", chunk, 1);
-    } catch (error) {
-      loserError = messageOf(error);
-    }
-    console.log("[probe race-loser] loser import error:", loserError);
-    expect(loserError).toMatch(/is already live as kind 'bucket'/);
+    // ...and the loser now tries to reserve the target. FIXED: it fails
+    // fast at reservation, BEFORE sealing/exporting/importing anything, so
+    // its rollback path (which used to unseal the old instance) never runs.
+    const loserError = await expectRejects(
+      () => raw.__claydoBeginImport("bucket", "loser-token"),
+      /is already live as kind 'bucket'/,
+    );
+    console.log("[probe race-loser] loser reservation error:", loserError);
+    expect(loserError).toMatch(/wipe it with wipeTarget\(\)/);
 
-    // migrateInstance's catch block now "rolls back": abort (a no-op here)
-    // and UNSEAL the old instance — even though the winner already cut over.
-    expect(await raw.__claydoAbortImport()).toBe(false);
-    await oldBucket(name).__claydoUnseal();
+    // The old instance keeps its seal AND its move marker.
+    const seal = await oldBucket(name).__claydoSealed();
+    expect(seal.sealed).toBe(true);
+    expect(seal.movedTo).toBe(raw.id.toString());
 
-    // Result: old unsealed with data, new live. Every fresh route fails.
-    const facade = lazyFacade();
-    let splitError = "";
-    try {
-      await facade.get(name).remaining();
-    } catch (error) {
-      splitError = messageOf(error);
-    }
-    console.log("[probe race-loser] router error after split:", splitError);
-    expect(splitError).toMatch(/both the old instance/);
+    // A full migrateInstance re-run reports the completed migration
+    // instead of manufacturing a conflict.
+    const again = await migrateInstance({
+      from: oldBucket(name),
+      to: newBuckets(),
+      name,
+    });
+    expect(again.skipped).toBe(true);
+    expect(again.reason).toBe("already migrated");
+
+    // Routing is intact — no both-live split, data preserved.
+    expect(await lazyFacade().get(name).remaining()).toBe(10);
   });
 
-  it("interleaved drivers hit the out-of-order seq guard", async () => {
+  it("the seq protocol is ownership-guarded: wrong token, out-of-order, foreign abort all fail", async () => {
     const name = "seq-gap";
     const old = oldSession(name);
     for (let i = 0; i < 6; i++) await old.setValue(`k${i}`, `v${i}`);
     await old.__claydoSeal();
-    const first = await old.__claydoExport(undefined, null, { maxBytes: 16 });
     const raw = rawNew("session", name);
-    await raw.__claydoImport("session", first, 1);
+    await raw.__claydoBeginImport("session", "driver-a");
+    // PAPERCUT (still present): the RPC type of __claydoExport collapses to
+    // `never` (the wire type contains `unknown`), so a cast is needed.
+    const first = (await old.__claydoExport(undefined, null, {
+      maxBytes: 16,
+    })) as ExportChunk;
+    await raw.__claydoImport("session", first, 1, "driver-a");
 
-    let seqError = "";
-    try {
-      await raw.__claydoImport("session", first, 3);
-    } catch (error) {
-      seqError = messageOf(error);
-    }
-    console.log("[probe seq-gap] out-of-order error:", seqError);
-    expect(seqError).toMatch(/expected seq 2, got 3/);
-    expect(seqError).toMatch(/Another migration driver may be running/);
+    // A second driver's chunk is rejected on ownership, not applied.
+    const foreign = await expectRejects(
+      () => raw.__claydoImport("session", first, 2, "driver-b"),
+      /owned by another migration driver/,
+    );
+    console.log("[probe seq-gap] foreign-token error:", foreign);
+
+    // The owner still cannot skip ahead.
+    const gap = await expectRejects(
+      () => raw.__claydoImport("session", first, 3, "driver-a"),
+      /expected seq 2, got 3/,
+    );
+    console.log("[probe seq-gap] out-of-order error:", gap);
+
+    // And a foreign driver cannot abort the owner's import.
+    const abort = await expectRejects(
+      () => raw.__claydoAbortImport("driver-b"),
+      /cannot abort an import owned by another migration driver/,
+    );
+    console.log("[probe seq-gap] foreign-abort error:", abort);
+    expect(abort).toMatch(/Use wipeTarget\(\) to force/);
   });
 });
 
 describe("traffic during a slow migration", () => {
-  it("callers are hard-failed until the import completes", async () => {
+  it("facade callers WAIT for the in-flight migration and succeed; direct target traffic still blocks", async () => {
     const name = "slow-1";
     const old = oldSession(name);
     for (let i = 0; i < 8; i++) await old.setValue(`key${i}`, `value${i}`);
 
-    // A slow driver: sealed the old instance, applied one tiny chunk, stalled.
+    // A slow driver: sealed, reserved, applied one tiny chunk, stalled.
     await old.__claydoSeal();
-    // PAPERCUT: the RPC type of __claydoExport collapses to `never` (the
-    // wire type contains `unknown`), so the chunk needs a cast to be usable.
+    const raw = rawNew("session", name);
+    await raw.__claydoBeginImport("session", "stalled-driver");
     const first = (await old.__claydoExport(undefined, null, {
       maxBytes: 16,
     })) as ExportChunk;
     expect(first.cursor).not.toBeNull(); // genuinely mid-import
-    const raw = rawNew("session", name);
-    await raw.__claydoImport("session", first, 1);
+    await raw.__claydoImport("session", first, 1, "stalled-driver");
 
-    // A production caller through the facade, RPC:
+    // DIRECT traffic to the reserved target still hard-fails (this is the
+    // reservation doing its job — racing traffic cannot pollute the target):
+    const direct = await expectRejects(
+      () => newSessions().get(name).getValue("key0"),
+      /is importing kind 'session'/,
+    );
+    console.log("[probe slow-import] direct RPC error:", direct);
+    const response = await newSessions().get(name).fetch("https://do/");
+    console.log(
+      `[probe slow-import] direct fetch -> ${response.status}: ${await response.text()}`,
+    );
+    expect(response.status).toBe(503);
+    expect(response.headers.get("retry-after")).toBe("2");
+
+    // IMPROVED (was issue #9): a facade caller no longer fails — it polls
+    // the import status and succeeds once the driver finishes. Start the
+    // call first, then let the "stalled" driver resume concurrently.
     const facade = migrated(env.OLD_SESSIONS, newSessions(), {
       strategy: "drain",
     });
-    let blockedError = "";
-    try {
-      await facade.get(name).getValue("key0");
-    } catch (error) {
-      blockedError = messageOf(error);
-    }
-    console.log("[probe slow-import] RPC error:", blockedError);
-    expect(blockedError).toMatch(/is importing kind 'session'/);
-    expect(blockedError).toMatch(/blocked until the migration completes/);
-
-    // And fetch():
-    const response = await facade.get(name).fetch("https://do/");
-    const body = await response.text();
-    console.log(
-      `[probe slow-import] fetch -> ${response.status}: ${body}`,
-    );
-    expect(response.status).toBe(400);
-    expect(body).toMatch(/is importing kind 'session'/);
-
-    // The driver resumes and completes; the same facade recovers on its own
-    // (the "new" decision was already cached during the outage).
+    const waiting = facade.get(name).getValue("key0");
+    // The stalled import is owned and fresh; backdate it so a new driver
+    // run may adopt it (same pattern as the library's own test suite).
+    await runInDurableObject(raw, async (_instance, state) => {
+      const s = (await state.storage.get("__claydo:import")) as ImportState;
+      s.updatedAtMs = Date.now() - 60_000;
+      await state.storage.put("__claydo:import", s);
+    });
     const summary = await migrateInstance({
       from: old,
       to: newSessions(),
       name,
     });
     expect(summary.resumed).toBe(true);
-    expect(await facade.get(name).getValue("key0")).toBe("value0");
+    expect(await waiting).toBe("value0"); // the caller never saw an error
+    expect(await facade.get(name).getValue("key7")).toBe("value7");
   });
 });
 
@@ -205,51 +247,56 @@ describe("both-live conflict and its suggested recoveries", () => {
   async function forceSplit(name: string): Promise<string> {
     await oldBucket(name).configure(10, 0); // old has data, unsealed
     await newBuckets().get(name).configure(5, 0); // new initialized directly
-    const facade = lazyFacade();
-    let error = "";
-    try {
-      await facade.get(name).remaining();
-    } catch (e) {
-      error = messageOf(e);
-    }
-    expect(error).toMatch(/both the old instance/);
-    return error;
+    return expectRejects(
+      () => lazyFacade().get(name).remaining(),
+      /both the old instance/,
+    );
   }
 
-  it('suggested recovery "wipe the new one" does not work while the instance is resident', async () => {
+  it("wipeTarget() recovers a polluted target end-to-end (fixes issue #2)", async () => {
     const name = "split-wipe";
     const error = await forceSplit(name);
     console.log("[probe both-live] router error:", error);
+    // The error now names an executable recovery:
+    expect(error).toMatch(/wipe the polluted new instance with wipeTarget\(\)/);
 
-    // The error says: "seal the old instance, or wipe the new one". Try the
-    // wipe. The only wipe a kind can perform is storage.deleteAll() (the
-    // library's resetStorage would keep the kind pinned on purpose).
+    // Raw deleteAll from inside the kind is still NOT a recovery — the
+    // in-memory kind pin survives it (unchanged, but now irrelevant):
     await newBuckets().get(name).nuke();
+    const still = await expectRejects(
+      () => lazyFacade().get(name).remaining(),
+      /both the old instance/,
+    );
+    console.log("[probe both-live] after raw deleteAll:", still);
 
-    // Still split: the host caches the kind in memory, so the wiped
-    // instance keeps reporting itself live until it is evicted.
-    let stillSplit = "";
-    try {
-      await lazyFacade().get(name).remaining();
-    } catch (e) {
-      stillSplit = messageOf(e);
-    }
-    console.log("[probe both-live] after deleteAll on new:", stillSplit);
-    expect(stillSplit).toMatch(/both the old instance/);
+    // The library's recovery: wipeTarget clears storage AND the memory pin.
+    await wipeTarget(newBuckets(), name);
+
+    // Routing recovers, and the lazy facade migrates the OLD data — the 10
+    // tokens survive; nothing is stranded.
+    expect(await lazyFacade().get(name).remaining()).toBe(10);
+    expect((await oldBucket(name).__claydoSealed()).sealed).toBe(true);
+    expect(await newBuckets().get(name).remaining()).toBe(10);
   });
 
-  it('suggested recovery "seal the old instance" works but silently strands the old data', async () => {
+  it('the "seal the old side" path now warns that old data is not copied', async () => {
     const name = "split-seal";
     await forceSplit(name);
 
-    await oldBucket(name).__claydoSeal();
+    // The driver-side both-live error carries the explicit warning:
+    const driverError = await expectRejects(
+      () =>
+        migrateInstance({ from: oldBucket(name), to: newBuckets(), name }),
+      /both the old instance .* are live/,
+    );
+    console.log("[probe both-live] driver error:", driverError);
+    expect(driverError).toMatch(/its data will NOT be copied/);
 
-    // Routing recovers...
-    const facade = lazyFacade();
-    expect(await facade.get(name).remaining()).toBe(5);
-    // ...but the old instance's 10-token state is stranded behind the seal,
-    // and nothing migrated it. The error message never mentioned this.
-    await expect(oldBucket(name).remaining()).rejects.toThrow(/is sealed/);
+    // Choosing new-as-source-of-truth still works and still strands the
+    // old data — but now the operator was told beforehand.
+    await oldBucket(name).__claydoSeal();
+    expect(await lazyFacade().get(name).remaining()).toBe(5);
+    await expectRejects(() => oldBucket(name).remaining(), /is sealed/);
   });
 });
 
@@ -273,7 +320,7 @@ describe("cache staleness after an external migration", () => {
     expect(await newBuckets().get(name).remaining()).toBe(7);
   });
 
-  it("fetch() through a stale facade leaks the raw 410 — no retry", async () => {
+  it("fetch() through a stale facade now retries too — no raw 410 (fixes issue #3)", async () => {
     const name = "stale-fetch";
     await oldBucket(name).configure(10, 0);
 
@@ -286,19 +333,26 @@ describe("cache staleness after an external migration", () => {
 
     await migrateInstance({ from: oldBucket(name), to: newBuckets(), name });
 
+    // FIXED: the facade detects the marked 410, re-resolves, and replays
+    // the request on the new side. The caller sees a clean 200.
     const after = await facade.get(name).fetch("https://do/");
-    const body = await after.text();
-    console.log(`[probe stale-fetch] fetch -> ${after.status}: ${body}`);
-    expect(after.status).toBe(410);
-    expect(body).toMatch(/is sealed/);
+    expect(after.status).toBe(200);
+    expect(await after.json()).toEqual({ remaining: 10 });
 
-    // An RPC call on the same facade repairs the cache (its retry path
-    // re-resolves), after which fetch() works again — fetch never heals
-    // itself.
-    expect(await facade.get(name).remaining()).toBe(10);
-    const healed = await facade.get(name).fetch("https://do/");
-    expect(healed.status).toBe(200);
-    expect(await healed.json()).toEqual({ remaining: 10 });
+    // What the facade absorbed: the raw old binding answers a 410 tagged
+    // with the sealed header and a generic, id-free body.
+    const raw410 = await oldBucket(name).fetch("https://do/");
+    const body = await raw410.text();
+    console.log(
+      `[probe stale-fetch] raw old binding -> ${raw410.status} ` +
+        `(${SEALED_HEADER}: ${raw410.headers.get(SEALED_HEADER)}): ${body}`,
+    );
+    expect(raw410.status).toBe(410);
+    expect(raw410.headers.get(SEALED_HEADER)).toBe("1");
+    expect(body).toBe(
+      "claydo: this instance is sealed (migrating or migrated). " +
+        "Reconnect through the current endpoint.",
+    );
   });
 });
 
@@ -322,63 +376,62 @@ describe("websockets through the facade", () => {
     });
   }
 
-  it("upgrades to an old-routed instance connect, but exportable() corrupts sync self-calls", async () => {
+  it("old-routed upgrades work AND sync self-calls stay intact (fixes issue #4)", async () => {
     await oldBucket("ws-old").configure(10, 0);
     const facade = migrated(env.OLD_BUCKETS, newBuckets(), {
       strategy: "manual",
     });
     const response = await wsThrough(facade, "ws-old");
-    expect(response.status).toBe(101); // the upgrade itself works
+    expect(response.status).toBe(101);
 
     const reply = await takeOverWs(response.webSocket!);
     console.log("[probe ws-old] reply from the OLD (exportable) class:", reply);
-    // BUG CAPTURED: the handler runs `JSON.stringify(this.take(1))`. On the
-    // unwrapped class that is {"allowed":true,"remaining":9}. But the
-    // exportable() seal guard replaced take() with an ASYNC wrapper, so the
-    // handler stringified a pending Promise:
-    expect(reply).toBe("{}");
+    // FIXED: the handler runs `JSON.stringify(this.take(1))`. The seal
+    // guards are synchronous now, so the internal self-call returns the
+    // real value instead of a pending Promise ("{}" in the old library).
+    expect(reply).toBe('{"allowed":true,"remaining":9}');
     response.webSocket!.close();
-    // The take itself still landed on the OLD instance, asynchronously:
     expect(await oldBucket("ws-old").remaining()).toBe(9);
   });
 
-  it("upgrades to a freshly sealed instance return a raw 410; reconnects fail until the cache expires", async () => {
+  it("sealing closes live sockets with 1012, and reconnects through the STALE facade land on the new side", async () => {
     const name = "ws-sealed";
     await oldBucket(name).configure(10, 0);
     const facade = migrated(env.OLD_BUCKETS, newBuckets(), {
       strategy: "manual",
       oldRouteTtlMs: 3_600_000,
     });
-    expect(await facade.get(name).remaining()).toBe(10); // cache "old"
 
+    // A client is connected through the facade to the OLD instance.
+    const first = await wsThrough(facade, name);
+    expect(first.status).toBe(101);
+    const ws = first.webSocket!;
+    ws.accept();
+    const closed = new Promise<{ code: number; reason: string }>((resolve) =>
+      ws.addEventListener("close", (event) =>
+        resolve({ code: event.code, reason: event.reason }),
+      ),
+    );
+
+    // An external driver migrates the instance while the socket is open.
     await migrateInstance({ from: oldBucket(name), to: newBuckets(), name });
 
-    // The client tries to (re)connect: no WebSocket, just a 410 body.
-    const attempt = await wsThrough(facade, name);
-    const body = await attempt.text();
-    console.log(`[probe ws-sealed] upgrade -> ${attempt.status}: ${body}`);
-    expect(attempt.status).toBe(410);
-    expect(attempt.webSocket).toBeNull();
-    expect(body).toMatch(/is sealed/);
+    // FIXED (was: sockets silently useless + reconnects 410 for the TTL):
+    // the seal actively closes the socket with a reconnect signal...
+    const close = await closed;
+    console.log("[probe ws-sealed] client close event:", close);
+    expect(close.code).toBe(1012);
+    expect(close.reason).toBe("claydo: instance migrating; reconnect");
 
-    // An immediate reconnect through the same facade: still 410, because
-    // the "old" decision is cached for another hour.
+    // ...and the reconnect through the SAME stale facade absorbs the 410
+    // and lands on the migrated instance, data carried over.
     const reconnect = await wsThrough(facade, name);
-    expect(reconnect.status).toBe(410);
-
-    // Only a facade whose cache expired (simulated with a fresh one)
-    // reaches the migrated instance — with the data carried over. On the
-    // NEW side the kind class is unwrapped, so the reply is intact.
-    const freshFacade = migrated(env.OLD_BUCKETS, newBuckets(), {
-      strategy: "manual",
-    });
-    const ok = await wsThrough(freshFacade, name);
-    expect(ok.status).toBe(101);
-    const reply = await takeOverWs(ok.webSocket!);
+    expect(reconnect.status).toBe(101);
+    const reply = await takeOverWs(reconnect.webSocket!);
     expect(JSON.parse(reply) as TakeResult).toEqual({
       allowed: true,
       remaining: 9,
     });
-    ok.webSocket!.close();
+    reconnect.webSocket!.close();
   });
 });

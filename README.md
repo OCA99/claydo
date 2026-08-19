@@ -310,7 +310,13 @@ const summary = await migrateInstance({
   to: kinds(env.APP_DO).tally,
   name,
 });
+// summary: { skipped, reason?, resumed, chunks, kv, rows, alarm }
 ```
+
+The importer replays data as-is; it does not validate that the destination
+kind's class understands the imported schema. Registering the old class as
+the kind (as above) guarantees compatibility. Mapping data into a different
+kind is your responsibility.
 
 Or lazily, on first touch, through the transitional router:
 
@@ -333,6 +339,12 @@ The router notices migrations quickly: RPC calls and `fetch()` requests
 re-resolve the route once and retry on the new side, concurrent lazy first
 touches migrate exactly once, and when another worker is migrating an
 instance the facade waits briefly for it to finish instead of failing.
+
+Route decisions cache per facade: "new" decisions are final, "old"
+decisions expire after `oldRouteTtlMs` (default 30000 ms) so external
+migrations are noticed. Each cache miss costs a few extra RPC round trips,
+so avoid very low TTL values on hot paths. Requests that reach a target
+mid-import receive 503 with a `Retry-After` header.
 
 ### 4. Cut over and reclaim the slot
 

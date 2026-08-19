@@ -15,6 +15,11 @@ npx tsc -p examples/migrate-gnarly/tsconfig.json                   # typecheck
 Tests marked `BUG:` intentionally assert the observed **broken** behavior,
 so they will start failing when the library is fixed.
 
+> **Update:** the library has since been hardened; the former `BUG:` tests
+> are now `FIXED:` tests asserting correct behavior. Sections 1–5 are the
+> original audit, kept as the historical record. See
+> [§6 Post-fix verification](#6-post-fix-verification) for the re-audit.
+
 ## 1. What I built
 
 One "kitchen sink" class, `GnarlyImpl` (`worker.ts`), used both as the OLD
@@ -242,3 +247,138 @@ the work the library should be doing for me.
 **Score: 5/10.** Would not run against production data unaudited today;
 would happily re-score 8+ once Issues 1–4 land, because everything else
 held up under real abuse.
+
+## 6. Post-fix verification
+
+Re-audited after the hardening pass. Same gauntlet, same fingerprints; the
+four `BUG:` tests were flipped to `FIXED:` assertions with the same rigor
+(exact expected values, checksum + storage-class equality). Result:
+**13/13 tests green, exit code 0**, `tsc` clean.
+
+### Issue-by-issue status
+
+**Issue 1 (alias-PK column position) — FIXED.**
+`ExportChunk.rows` gained a `rowid` field (`"__rowid__"` or the alias
+column's name), and the importer maps columns by it instead of assuming
+column 0. My `alias_second (label TEXT, id INTEGER PRIMARY KEY)` table now
+arrives byte-exact:
+
+```
+before: [[1,"alpha",1],[2,"beta",2],[3,"gamma",3]]
+after:  [[1,"alpha",1],[2,"beta",2],[3,"gamma",3]]   (was [[1,null,1],...])
+```
+
+Full fingerprint equality (ordered-row checksum **and** `typeof()` storage
+classes). The root suite gained the regression test "preserves rowid-alias
+tables whose primary key is not the first column".
+
+**Issue 2 (`__claydo*` user KV keys) — FIXED.**
+The filter is now the exact reserved-key set (`__claydo:sealed`,
+`__claydo:kind`, `__claydo:import`; see `RESERVED_STORAGE_KEYS` in
+`migrate-wire.ts`). All **199 of 199** seeded keys migrate
+(`summary.kv === 199`, previously 197); on the new side
+`__claydonote === "user data that merely looks library-ish"` and
+`__claydo_config` deep-equals its source. The old/new KV fingerprints
+(key list + deterministic value digests) are identical. The shadow-instance
+corollary is fixed too: `__claydoHasData()` now returns `true` for an
+instance whose only data is `__claydonly`, and its migration transfers
+`kv: 1` instead of stranding the data.
+
+**Issue 3 (alarms elapsing while sealed) — FIXED.**
+An alarm firing on a sealed instance (without a move marker) now **defers
+itself** to `now + 60s` with a `console.warn`, instead of returning success
+and letting the runtime delete it. Verified end to end: forced the alarm
+during the sealed window (`runDurableObjectAlarm → true`), the final export
+chunk captured the deferred timestamp (observed ~60s after arming, within
+my asserted 50–70s window), `summary.alarm` carried it, the new side
+scheduled it exactly, and the handler fired there. After the move marker is
+recorded, the old instance's alarm is deleted
+(`runDurableObjectAlarm(old) → false`), so it can never double-fire.
+
+**Issue 4 (sqlite_sequence duplicates / id reuse) — FIXED.**
+The importer now does DELETE-then-INSERT on `sqlite_sequence` ("no unique
+constraint, so replace by hand"). After migrating the table with
+`max(id)=7, seq=10`:
+
+```
+sqlite_sequence: [["autoinc_t",10]]        (was [["autoinc_t",7],["autoinc_t",10]])
+next insert id:  11                         (was 8 — a recycled deleted id)
+```
+
+**Issue 5 (ExportChunk collapses to `never` over RPC stubs) — UNCHANGED,
+documented workaround.** My manual export walk still needs
+`as ExportChunk` casts on the raw stub; the sanctioned pattern is to type
+manual old-stub code as the exported `ExportableOldStub` interface rather
+than `DurableObjectStub<OldClass>`.
+
+**Issue 6 (uncaught-exception log noise for handled export failures) —
+UNCHANGED (inherent).** Old-side throws still cross raw RPC, so workerd
+still prints, verbatim:
+
+```
+uncaught exception; source = Uncaught (in promise); stack = Error: claydo: table 'wor_t' is WITHOUT ROWID, which the exporter does not support yet. ...
+```
+
+The repo's tests (and now mine) use a try/catch `expectRejects` helper so
+vitest at least reports no unhandled errors.
+
+**Issue 7 (`summary.rows` omits zero-row tables) — UNCHANGED** (`base_notes`
+still absent from the summary while export totals include it). Offset by a
+real improvement: `MigrationSummary.reason` now says *why* a run was
+skipped (e.g. `"already migrated"`, `"old instance has no data (pass
+allowEmpty to migrate schema-only instances)"`).
+
+**Issue 8 (alarm semantics under-documented / racy) — IMPROVED.** The
+past-alarm race is now safe on both branches: fires pre-seal (effects
+migrate as data) or defers through the sealed window (Issue 3 fix). The
+`max(alarm, now + 1s)` import clamp is unchanged; near-future timestamps
+still transfer to the millisecond.
+
+### Behavior changes worth knowing (not regressions)
+
+- **Unsupported tables now fail pre-flight.** The driver's `hasData` probe
+  walks the table list before sealing or reserving anything, so WITHOUT
+  ROWID / virtual-table errors surface as the **raw** exporter message
+  (no "was rolled back" wrapper — there is nothing to roll back). Verified:
+  old instance never sealed, fingerprint bit-identical, target status `{}`,
+  and drop-then-retry migrates cleanly. Strictly better than the old
+  seal→fail→unseal churn, but anyone matching on the wrapped error string
+  must update.
+- **Empty instances are skipped by default.** Schema-only migration now
+  requires `allowEmpty: true`; without it the run returns
+  `skipped: true` with the reason quoted above and touches nothing (no
+  sealed husks from stale registry entries). With the flag, DDL-only
+  migration works exactly as before (1 chunk, `ghost_table` + `ghost_idx`
+  arrive).
+- **Imports are reserved and owned.** `__claydoBeginImport(kind, token)`
+  blocks target traffic from reservation on, concurrent drivers fail fast
+  ("another migration driver owns the import"), and stale imports (>30s
+  without progress) are adopted. My manual-chunk probes had to adopt the
+  new protocol; `migrateInstance` callers are unaffected.
+- Sealed `fetch()` is now a generic 410 with an `x-claydo-sealed: 1` header,
+  and `wipeTarget()` provides a sanctioned recovery for polluted targets.
+
+### Regression sweep
+
+The full gauntlet re-passed unchanged: non-UTF8 blobs, rowids `-5` and
+`2^40`, 100 KB unicode/control-char text, REAL-in-no-affinity-column storage
+classes, NULL vs. empty string vs. empty blob, Date/Map/ArrayBuffer/nested
+KV values across pages, triggers suppressed during copy (audit table exact),
+partial-index WHERE preserved, UNIQUE enforced, views live, and the
+2000-row run: **41 chunks, ~130 ms**, fingerprints identical.
+
+### Post-fix verdict
+
+All four data-fidelity findings are genuinely fixed — not patched around —
+and each is locked in by a regression test in the root suite as well as
+this gauntlet. The remaining flaws are cosmetic (log noise, a typing
+papercut, a summary-shape nit). My one structural reservation stands:
+verification is still count-based rather than content-checksum-based, so a
+future fidelity bug of the Issue-1 shape would again pass silently — the
+fingerprinting this audit did belongs in the library. The migration flow
+itself got *safer* than what I audited (reservation before seal, ownership
+tokens, stale adoption, pre-flight checks, wipeTarget recovery).
+
+**Score: 8.5/10.** Yes — I would now trust it with production data, with
+the standard precaution the design already encourages: keep the sealed old
+instances around until you have spot-checked the new side.

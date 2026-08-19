@@ -98,6 +98,28 @@ function attach(response: Response): SocketProbe {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** Asserts a rejection without leaving an unhandled-rejection report. */
+async function expectRejects(
+  run: () => Promise<unknown>,
+  pattern: RegExp,
+): Promise<void> {
+  try {
+    await run();
+  } catch (error) {
+    expect(String(error)).toMatch(pattern);
+    return;
+  }
+  expect.unreachable(`expected rejection matching ${pattern}`);
+}
+
+/** Polls until the probe has a close event, or times out. */
+async function waitForClose(probe: SocketProbe, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (probe.closes.length === 0 && Date.now() < deadline) {
+    await sleep(50);
+  }
+}
+
 async function wsViaWorker(path: string): Promise<Response> {
   return SELF.fetch(`https://gameco.example${path}`, {
     headers: { Upgrade: "websocket" },
@@ -206,7 +228,7 @@ describe("GameCo consolidation journey", () => {
     liveSocket = alice;
   });
 
-  it("2b. migrating the room mid-session: the old socket goes silently dead", async () => {
+  it("2b. migrating the room mid-session: sealing closes the socket with 1012 (post-fix)", async () => {
     const summary = await migrateInstance({
       from: oldRoom(ROOM),
       to: app().room,
@@ -215,54 +237,32 @@ describe("GameCo consolidation journey", () => {
     expect(summary.skipped).toBe(false);
     expect(summary.rows["messages"]).toBe(3);
 
-    // The client-side socket is still OPEN — nobody told the client anything.
-    expect(liveSocket.ws.readyState).toBe(WebSocket.READY_STATE_OPEN);
+    // POST-FIX: the seal closes hibernatable WebSockets, so the client gets
+    // a real close event it can react to (previously: silently dead).
+    await waitForClose(liveSocket);
+    expect(liveSocket.closes).toEqual([
+      {
+        code: 1012,
+        reason: "claydo: instance migrating; reconnect",
+        wasClean: true,
+      },
+    ]);
+    expect(liveSocket.ws.readyState).toBe(WebSocket.READY_STATE_CLOSED);
+    expect(liveSocket.buffered()).toBe(0);
 
-    // A message sent on the old socket reaches the sealed instance, where
-    // the seal guard throws inside webSocketMessage. Observe the client.
-    liveSocket.ws.send("hello? is this thing on?");
-    await sleep(1_000);
-    expect(liveSocket.buffered()).toBe(0); // no broadcast, no error reply
-    // Fate observed on first run: no close frame, no error event — the
-    // socket looks healthy from the client and is silently dead.
-    expect(liveSocket.closes).toEqual([]);
-    expect(liveSocket.errors).toEqual([]);
-    expect(liveSocket.ws.readyState).toBe(WebSocket.READY_STATE_OPEN);
-
-    // The lost message is NOT in the migrated history.
+    // History arrived complete on the new side.
     expect((await app().room.get(ROOM).history()).length).toBe(3);
   });
 
-  it("2c. reconnecting through the facade immediately after migration is a 410, not a new session", async () => {
+  it("2c. reconnecting through the facade immediately after migration succeeds (410 retried internally)", async () => {
     // The worker's facade cached the "old" route for this room (ttl 60 s).
-    // WebSocket reconnects go through the facade's fetch() path, which has
-    // no seal-retry — the client gets a 410 with a claydo-internal message.
-    const retry = await wsViaWorker(`/rooms/${ROOM}/ws?_pk=alice`);
-    expect(retry.status).toBe(410);
-    const text = await retry.text();
-    expect(text).toMatch(/instance 'lobby' is sealed/);
-    expect(text).toMatch(/moved to Durable Object id/);
-  });
-
-  it("2d. an RPC call through the facade heals the route; then reconnect works and history survived", async () => {
-    // RPC calls DO have seal-retry: this call re-resolves to the new side
-    // and pins the facade route to "new".
-    const history = await SELF.fetch(
-      `https://gameco.example/rooms/${ROOM}/history`,
-    );
-    expect(history.status).toBe(200);
-    const rows = await history.json<RoomMessage[]>();
-    expect(rows.map((m) => m.body)).toEqual([
-      "welcome to the lobby",
-      "gg wp",
-      "anyone up for a match?",
-    ]);
-
-    // Now the same reconnect succeeds (the RPC healed the cached route).
+    // POST-FIX: the facade's fetch() path sees the old instance's marked
+    // 410 (x-claydo-sealed) and retries the upgrade on the new side, so the
+    // reconnect lands a 101 with no client-visible error and no TTL wait.
     const alice = attach(await wsViaWorker(`/rooms/${ROOM}/ws?_pk=alice`));
     alice.ws.send("back online");
-    // Note the client-visible change: the broadcast payload's room field is
-    // now the prefixed host name.
+    // Note the client-visible change that remains: the broadcast payload's
+    // room field is now the prefixed host name.
     expect(await alice.next()).toEqual({
       room: "room:lobby",
       sender: "alice",
@@ -272,6 +272,32 @@ describe("GameCo consolidation journey", () => {
 
     const after = await app().room.get(ROOM).history();
     expect(after.length).toBe(4);
+  });
+
+  it("2d. history flows through the facade; the sealed 410 is generic and marked, with no DO-id leak", async () => {
+    const history = await SELF.fetch(
+      `https://gameco.example/rooms/${ROOM}/history`,
+    );
+    expect(history.status).toBe(200);
+    const rows = await history.json<RoomMessage[]>();
+    expect(rows.map((m) => m.body)).toEqual([
+      "welcome to the lobby",
+      "gg wp",
+      "anyone up for a match?",
+      "back online",
+    ]);
+
+    // A direct hit on the sealed old instance (a client with a stale URL):
+    // POST-FIX the body is generic — no internal DO id — and the response
+    // carries the x-claydo-sealed marker routers retry on.
+    const gone = await oldRoom(ROOM).fetch("https://old.gameco/rooms/lobby");
+    expect(gone.status).toBe(410);
+    expect(gone.headers.get("x-claydo-sealed")).toBe("1");
+    const text = await gone.text();
+    expect(text).toBe(
+      "claydo: this instance is sealed (migrating or migrated). Reconnect through the current endpoint.",
+    );
+    expect(text).not.toMatch(/Durable Object id/);
   });
 
   // -------------------------------------------------------------------------
@@ -331,14 +357,15 @@ describe("GameCo consolidation journey", () => {
       expect(summary.rows["moves"]).toBe(1);
     }
 
-    // Idempotency: the driver re-run is a no-op.
+    // Idempotency: the driver re-run is a no-op, and (post-fix) the skip
+    // carries an explicit reason backed by the move marker on the old side.
     const again = await SELF.fetch(
       `https://gameco.example/admin/migrate-match/${matches[0]!.oldId}`,
       { method: "POST" },
     );
-    expect(await again.json<{ skipped: boolean }>()).toMatchObject({
-      skipped: true,
-    });
+    expect(
+      await again.json<{ skipped: boolean; reason?: string }>(),
+    ).toMatchObject({ skipped: true, reason: "already migrated" });
 
     const registry = await SELF.fetch("https://gameco.example/admin/registry");
     const listed = await registry.json<{ oldId: string; migrated: boolean }[]>();
@@ -373,7 +400,7 @@ describe("GameCo consolidation journey", () => {
 
   it("4d. the old sealed match rejects RPC; the documented 410 story needs a fetch() the class never had", async () => {
     const old = oldMatch(matches[0]!.oldId);
-    await expect(old.state()).rejects.toThrow(/is sealed/);
+    await expectRejects(() => old.state(), /is sealed/);
     // MatchImpl never defined fetch(), and exportable() only wraps methods
     // that exist — so there is no sealed-410 response here, just a runtime
     // type error. (Rooms DO get the 410, see journey step 2c.)
@@ -403,17 +430,17 @@ describe("GameCo consolidation journey", () => {
     expect(state.turnDeadline).toBe(timeoutDeadline);
   });
 
-  it("5b. the OLD instance still has its alarm scheduled; it fires as a warning no-op", async () => {
+  it("5b. the OLD instance's alarm was deleted when the move was recorded (post-fix)", async () => {
     const old = oldMatch(timeoutMatchId);
-    // The seal does not delete the old alarm — it is still pending and will
-    // wake the sealed instance once, for nothing.
-    expect(await runDurableObjectAlarm(old)).toBe(true);
+    // POST-FIX: recording the move marker deletes the old alarm, so the
+    // sealed husk never wakes again (previously: armed forever, no-op fires).
+    expect(await runDurableObjectAlarm(old)).toBe(false);
     const oldFired = await runInDurableObject(old, async (instance) =>
       (instance as unknown as { ctx: DurableObjectState }).ctx.storage.get<number>(
         "timeout-fired-at",
       ),
     );
-    expect(oldFired).toBeUndefined(); // the no-op guard held
+    expect(oldFired).toBeUndefined();
   });
 
   // -------------------------------------------------------------------------

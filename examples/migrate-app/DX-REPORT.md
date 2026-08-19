@@ -9,9 +9,13 @@ partyserver 0.5.10); every quoted error is verbatim from those runs.
 Run it: from the repository root,
 
 ```sh
-npx vitest run --config examples/migrate-app/vitest.config.ts   # 24 tests, all green
+npx vitest run --config examples/migrate-app/vitest.config.ts   # 26 tests, all green
 npx tsc -p examples/migrate-app/tsconfig.json                   # clean
 ```
+
+> Sections 1–5 are the original audit, preserved as written. The module was
+> subsequently hardened; section 6 re-verifies every numbered issue against
+> the new behavior and updates the verdict.
 
 ## 1. What I built
 
@@ -419,6 +423,193 @@ the WebSocket story pull it down. Fix issue 1 (make the target claim atomic
 with the seal) and issue 3 (stop async-ifying sync methods), add a
 close-before-seal hook, and this is an easy 8+ that I'd happily bet a
 production migration on.
+
+---
+
+## 6. Post-fix verification
+
+The hardened module was re-audited with the same app. Every test below was
+re-run for real (26 tests, 3 consecutive green runs, `tsc` clean); every
+quoted string is verbatim from those runs. Where the old suite asserted a
+bug, it now asserts the fix at the same precision — nothing was weakened.
+
+### Issue-by-issue
+
+**Issue 1 (blocker: seal-window race → silent data loss) — FIXED, with one
+residual corner.** The driver now reserves the target *before* touching the
+old instance, and reads in the window block instead of initializing:
+
+> `claydo: instance 'room:race-window' is importing kind 'room'. Traffic is
+> blocked until the migration completes or is aborted.`
+
+My deterministic repro (reserve, then read through the accessor) can no
+longer pin an empty instance, and the read-spam probe (suite E, 1-row
+chunks, 12 facade reads at `oldRouteTtlMs: 0` during the copy) now returns
+the complete 30-row history on **every** read — the facade waits out the
+import instead of erroring or wedging. `{ skipped: true }` as a lie is gone:
+a target polluted before migration makes the driver refuse loudly (see
+issue 2), and the skip reason now requires the explicit move marker
+(`reason: "already migrated"`, asserted in journey 4a). **Residual** (new
+test, suite B3): `__claydoSeal()` is public — an operator who seals by hand
+*without* the driver leaves the old pre-fix hole open: a facade read still
+pins an empty target and the driver then reports
+`{ skipped: true, reason: "already migrated" }` while the data sits sealed.
+The driver can no longer create this state itself, and `wipeTarget()` +
+re-run now recovers it, so I downgrade this from blocker to **minor** — but
+the seal docs should warn that manual seals belong *after* a
+`__claydoBeginImport` reservation.
+
+**Issue 2 (no recovery API) — FIXED.** `wipeTarget(accessor, name)` un-wedges
+a polluted target completely — storage, alarm, import state, and the
+in-memory kind pin. Verified twice: after the both-live refusal
+(the error itself now names the tool:
+
+> `claydo: both the old instance 'polluted' and the new instance
+> 'room:polluted' are live. Refusing to migrate. If racing traffic polluted
+> the new instance (it has no real data), wipe it with wipeTarget() from
+> claydo/migrate and re-run. …`
+
+) and after the manual-seal shadow. In both cases the re-run migrated all
+rows byte-exact. No more `ctx.abort()` surgery; error message and recovery
+tool finally point at each other. The `__claydoReset` confirmation argument
+(exact `kind:name`) is a nice guard against fat-fingering a destructive call.
+
+**Issue 3 (`exportable()` broke sync methods while unsealed) — FIXED.** The
+guards are now synchronous and the seal state loads in the constructor via
+`blockConcurrencyWhile`. Re-verified specifically against partyserver
+(suite A): `connectionCount()` — a plain `for (const c of
+this.getConnections())` over the hibernating-connection iterator — works
+under the mixin while unsealed, correctly reports a live hibernating
+WebSocket (`1`), and throws the seal message only once sealed. The README
+now also documents the guarantee ("the seal guards are synchronous, so sync
+methods, internal self-calls, and framework helpers keep working") and the
+repo's own suite pins it with a sync self-call test.
+
+**Issue 4 (WebSocket story) — FIXED.** All three sub-complaints:
+
+1. *Silently dead sockets*: sealing now closes hibernatable WebSockets. The
+   mid-session client in journey 2b observes exactly
+   `{ code: 1012, reason: "claydo: instance migrating; reconnect",
+   wasClean: true }` and `readyState` goes to `CLOSED`. Real reconnect logic
+   fires.
+2. *410 with a DO-id leak*: the sealed body is now the generic
+   `claydo: this instance is sealed (migrating or migrated). Reconnect
+   through the current endpoint.` — asserted to contain no Durable Object
+   id — plus the machine-readable `x-claydo-sealed: 1` header.
+3. *No fetch retry / TTL wait*: the facade's `fetch()` path retries on the
+   marker header. Journey 2c reconnects **immediately** after the migration
+   (route still cached "old", ttl 60 s) and gets a 101 on the new instance
+   with history intact. The connect → migrate → 1012 → reconnect → history
+   journey is now exactly what the README claims.
+
+   New nit found while verifying: the seal's own close triggers the old
+   instance's `webSocketClose` handler, which the seal guard then throws on —
+   every sealed socket produces one server-side uncaught exception
+   (`claydo: instance 'lobby' is sealed. A migration is in progress.` at the
+   guard wrapper). Harmless but noisy; `webSocketClose`/`webSocketError`
+   should be exempt from (or no-op under) the guard, since the library
+   itself invokes them at seal time.
+
+**Issue 5 (rowid alias not in first column) — FIXED.** `ExportChunk.rows`
+now carries the alias name (`rowid: "seq"` for our `turn_log`) and suite D
+migrates the hostile table byte-exact:
+`[{ at: 1000, seq: 1, note: "opening" }, { at: 2000, seq: 2, note: "midgame" }]`
+arrives identical, `summary.rows.turn_log === 2`, no constraint error, no
+rollback. The repo test matrix gained the same shape. (Tiny observation:
+empty tables are absent from `summary.rows` rather than reported as `0` —
+totals verification still covers them.)
+
+**Issue 6 (wrong-kind import succeeds silently) — UNCHANGED, by explicit
+decision.** Suite C still imports a chat room into the match kind without a
+whisper and serves a ghost match. The changelog frames shape validation as
+the app's responsibility; the name-prefix guard did move earlier (it now
+fires at reservation time, before anything is sealed — a real improvement
+for rollback hygiene). But the README still does not *state* the stance —
+nothing in "What moves, and the guarantees" says "nothing checks that the
+imported schema matches the target kind; the name prefix is the only
+guard". If it's a documented non-goal, document it; one honest sentence
+would finish this.
+
+**Issue 7 (unique-id ergonomics) — UNCHANGED.** Still one README sentence
+(`migrated:<oldId>`), still no exported name helper, still no way to give
+`migrated()` an `idFromString` resolver — our worker keeps its hand-rolled
+registry routing. It works; it's still all on the user.
+
+**Issue 8 (old alarm armed forever) — FIXED.** Recording the move marker
+deletes the old alarm: journey 5b now asserts
+`runDurableObjectAlarm(old) === false`. Better still, alarms that fire
+*during* the sealed window are deferred (+60 s), not swallowed, so a
+mid-migration alarm survives into the copy (pinned by the repo's own m7b
+test).
+
+**Issue 9 (`this.name` data compatibility) — UNCHANGED.** Journey 3 still
+shows pre-migration rows under `room = "lobby"` and post-migration rows
+under `room = "room:lobby"`, the client-visible payload change, and the
+stale `__ps_name`. Still no "data written under the old identity" checklist
+in the README's migration section. This remains the trap I'd expect real
+partyserver teams to hit first.
+
+**Issue 10 (sealed 410 needs a `fetch()` the class never had) — UNCHANGED.**
+`stub.fetch()` on the RPC-only sealed match still throws
+`TypeError: OldMatch exported by /workspace/examples/migrate-app/worker.ts
+does not define a `fetch()` method`, and the README still says sealed
+"`fetch()` answers 410" unconditionally.
+
+**Issue 11 (hard errors during the import window) — IMPROVED.** The facade
+now absorbs the window entirely: `migrated()` waits for an in-progress
+import (suite E saw zero errors across 12 reads during a 30-chunk copy).
+Direct accessor traffic still gets the hard error / a 400 with no
+`Retry-After`, so operators bypassing the facade still see a downtime
+window presented as a client error — half-fixed, and the half that matters
+(client-facing routes) is the fixed half.
+
+**Issue 12 (unhandled-rejection noise) — IMPROVED.** Adopting the repo's
+try/catch `expectRejects` pattern removed every vitest-level "Unhandled
+Rejection" from this suite — the "Unhandled Errors" section is simply gone
+from the output. workerd-level `uncaught exception` log lines remain for
+DO-side seal throws (including the new webSocketClose-at-seal one, see
+issue 4), so the output is quieter but not silent.
+
+**Issue 13 (`migrated()` hoisting) and Issue 14 (`{ get }`-only facade) —
+UNCHANGED.** Both remain as described; both remain nits.
+
+### Cutover guidance, updated
+
+The rehearsal (journey 6a/6b) still passes on plain accessors, and the new
+semantics make the risky step *materially safer*:
+
+- The pre-deletion sweep now has a reliable per-instance receipt: after a
+  successful migration the old side reports
+  `{ sealed: true, movedTo: "<target DO id>" }` (asserted in suite E), and
+  the move marker is written only after verification. Sweep the registry
+  for `movedTo !== undefined` instead of my previous
+  "`__claydoHasData() === false` or import-completed" heuristic.
+- Never-used names no longer become sealed husks: the driver skips them
+  unsealed with `reason: "old instance has no data …"`, so a stale registry
+  entry cannot make the sweep lie.
+- The remaining human risks are unchanged: `deleted_classes` is
+  irreversible, there is still no namespace listing (an incomplete registry
+  still means unlisted instances die), and a *manually* sealed instance
+  without a move marker (issue 1's residual corner) would sweep as
+  "not migrated" — which is the correct, loud outcome.
+
+### Verdict, updated
+
+**Would I run this consolidation at my company now? Yes.** The blocker is
+gone at its root (reservation-first ordering, not a patch on the symptom),
+the recovery tool exists and is named in the very error that requires it,
+the wrapper is honest about being invisible, and the WebSocket story a
+client experiences — 1012 close, reconnect, full history — now matches the
+README sentence for sentence. My whole top-5 list is fixed; what remains is
+ergonomics (unique IDs), one documented-non-goal I'd still like one honest
+README sentence for (wrong-shape), a residual manual-seal corner, and noise.
+
+**Score: 8.5 / 10** (was 6). The engine was always an 8.5; the coordination
+layer now deserves it too. The remaining half-points: the wrong-shape
+silence (issue 6) still needs at least a README sentence, unique-id fleets
+still route by hand (issue 7), the `this.name` data-compat trap is still
+undocumented (issue 9), and the seal-close `webSocketClose` uncaught is new
+noise. None of those would stop me from shipping this migration.
 
 ---
 

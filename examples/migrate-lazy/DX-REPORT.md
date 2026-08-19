@@ -379,3 +379,166 @@ production-shaped and the recovery is folklore.
 held back by a real concurrency hazard in the flagship lazy path, a
 router blind spot for fetch/WS, and a README that stops documenting exactly
 where the hard questions start.
+
+## 6. Post-fix verification
+
+Re-audit against the hardened library. The suite was updated to assert the
+new behavior with the same precision as the old (no weakened assertions),
+re-run green (18/18, exit code 0), and re-typechecked clean. Crucially, the
+`onUnhandledError` filter was **removed** from `vitest.config.ts` and the
+suite stays green without it. All evidence below is verbatim from this run.
+
+### Issue 1 (blocker, racing lazy routers split the fleet) — FIXED
+
+The same two-facade race that previously split the fleet now succeeds for
+**every** caller with exactly-once semantics:
+
+```
+[probe race-two] outcomes: [
+  { allowed: true, remaining: 49 },
+  { allowed: true, remaining: 47 },
+  { allowed: true, remaining: 48 },
+  { allowed: true, remaining: 46 }
+]
+```
+
+All four callers across two facades fulfilled (losers now wait for the
+winner via status polling instead of failing), each `take(1)` applied
+exactly once (remaining = {46, 47, 48, 49}), and the old instance ends
+sealed **with the move marker** — the rollback-unseal is gone. The
+deterministic loser replay confirms the mechanism: the loser now fails at
+*reservation*, before touching anything:
+
+```
+claydo: instance 'bucket:race-loser' is already live as kind 'bucket'. Imports only target untouched instances. If racing traffic polluted this instance, wipe it with wipeTarget() from claydo/migrate.
+```
+
+Nothing was rolled back (seal + `movedTo` intact), a `migrateInstance`
+re-run reports `{ skipped: true, reason: "already migrated" }`, and fresh
+facades route cleanly with the data preserved. The seq protocol is now also
+ownership-guarded end to end — a foreign driver's chunk, a seq gap, and a
+foreign abort each fail with precise errors ("this import is owned by
+another migration driver", "expected seq 2, got 3", "cannot abort an import
+owned by another migration driver ... Use wipeTarget() to force.").
+
+One residual nit: the facade's wait-for-winner regex matches "owns the
+import" / "is importing kind" but not the "is already live as kind" text,
+so a loser whose reservation lands *after* the winner fully completes (a
+much narrower window than before) still surfaces that error to one caller
+instead of waiting; the next call self-heals via the status check. Fail-fast
+and corruption-free, but not zero-error.
+
+### Issue 2 (both-live recovery impossible) — FIXED
+
+The router's both-live error now names an executable recovery:
+
+```
+claydo: both the old instance 'split-wipe' and the new instance 'bucket:split-wipe' are live. Fix the split before routing traffic: wipe the polluted new instance with wipeTarget() and migrate, or seal the old one if the new instance is the source of truth.
+```
+
+I executed it end-to-end: raw `deleteAll()` from inside the kind still
+leaves the split (the in-memory pin survives — unchanged, but now
+irrelevant), while `wipeTarget(accessor, name)` cleared storage *and* the
+memory pin; the next lazy call migrated the OLD data and the 10 tokens
+survived intact. The driver-side error also gained the honesty I asked for:
+
+```
+... If the new instance is the source of truth, seal the old one with __claydoSeal() — its data will NOT be copied.
+```
+
+The seal-old path still strands the old data, but the operator is now told
+beforehand. The `wipeTarget` design is careful (requires `importable`, and a
+confirm-id echo of the exact instance name).
+
+### Issue 3 (fetch/WS leak raw 410s for the TTL) — FIXED
+
+With a 1-hour `oldRouteTtlMs` and an external migration, `fetch()` through
+the stale facade now returns a clean 200 with the migrated data — the
+marked 410 (`x-claydo-sealed: 1`, generic body "claydo: this instance is
+sealed (migrating or migrated). Reconnect through the current endpoint.")
+is absorbed and the request replayed on the new side. The WebSocket story is
+now real end to end: sealing actively closed my live socket with
+
+```
+{ code: 1012, reason: 'claydo: instance migrating; reconnect' }
+```
+
+and the reconnect through the *same stale facade* upgraded (101) against the
+migrated instance with the data carried over
+(`{"allowed":true,"remaining":9}`).
+
+### Issue 4 (exportable() corrupts sync self-calls) — FIXED
+
+The exact repro that returned `"{}"` now returns
+`{"allowed":true,"remaining":9}` verbatim: the seal guards are synchronous
+(seal state preloads under `blockConcurrencyWhile`), so
+`JSON.stringify(this.take(1))` inside the wrapped class behaves exactly as
+the unwrapped class. The README's "behavior is unchanged until sealed" claim
+is true now.
+
+### Issue 5 (unhandled rejection leak) — FIXED
+
+The `onUnhandledError` filter is deleted from the example's vitest config
+and the suite passes with exit code 0, including the tests that force
+failed route resolutions. The route cache's promise chain has a rejection
+handler in source.
+
+### Issues 6–13 — status
+
+- **6 (facade `.id`/`.stub` describe the NEW instance while routing old):
+  unchanged.** The metadata test still passes asserting the misleading
+  values.
+- **7 (`MigratedAccessor` has only `get()`): unchanged.** Still no
+  `idFromName` passthrough.
+- **8 (route-probe cost / `oldRouteTtlMs` undocumented): unchanged.**
+  Re-measured identically: 10 calls at TTL 0 →
+  `{"__claydoSealed":10,"__claydoHasData":10}` plus 10 host status calls (3
+  extra RPCs per call); default TTL → one probe pair total. `oldRouteTtlMs`
+  still appears nowhere in the README.
+- **9 (blocked callers during a slow import): improved.** The big win:
+  facade callers now *wait* for an in-flight migration and succeed — my
+  stalled-import probe's caller got its value with no error once the driver
+  resumed. Direct-to-target traffic still hard-fails with the same message
+  ("Traffic is blocked until the migration completes or is aborted." — now
+  at least `ImportStatus.importing.ageMs` exists for tooling), still as
+  HTTP 400 rather than 503, and the facade's 15 s wait deadline and 250 ms
+  poll interval are hardcoded.
+- **10 (drain cutover story): unchanged.** The README's migration section
+  improved a lot (the four-step race-proof guarantee list and the recovery
+  paragraph are excellent), but drain instances that never expire and the
+  "how do I know the namespace is empty" question remain undocumented.
+- **11 (`__claydoKind()` reports the name-prefix kind for untouched
+  instances): unchanged.**
+- **12 (`__claydo*` RPC types collapse to `never`): unchanged.** The
+  `as ExportChunk` cast is still required (the wire type still contains
+  `unknown`).
+- **13 (server-side "uncaught exception" logs for handled errors):
+  unchanged** as runtime noise (every handled seal-retry and ownership
+  rejection still prints an `uncaught exception` line in the workerd
+  output), but it no longer fails vitest suites now that issue 5 is fixed.
+- The API reference section of the README still omits the migrate module
+  entirely (`exportable`, `migrateInstance`, `migrated`, `wipeTarget`,
+  `SEALED_HEADER` have no reference entries).
+
+### Post-fix verdict
+
+Every issue I rated major or blocker is fixed, and fixed the way I would
+have wanted: ownership at reservation time rather than cleanup-time
+heuristics, a real recovery API instead of a better apology, retry parity
+across RPC/fetch/WS, and sync guards that make the wrapper honest. The
+hardening also added things I didn't ask for but immediately benefited
+from: reservation blocks racing traffic *before* it can pollute a target,
+empty instances are skipped with a reason instead of sealed into husks, and
+the move marker plus 410 header make the sealed state machine legible. What
+remains is genuinely minor: metadata honesty, accessor parity, probe-cost
+documentation, and log noise.
+
+**Would I route production traffic through `migrated()` now?** Yes —
+including the lazy strategy and fetch/WebSocket traffic during the
+transition. I would still monitor for the both-live error and keep
+`wipeTarget` in the runbook.
+
+**Post-fix score: 8.5/10** (up from 6/10). The remaining deductions are the
+undocumented router cost model and options, the misleading facade metadata,
+and the residual one-caller error window in the lazy race — none of which
+threaten data.

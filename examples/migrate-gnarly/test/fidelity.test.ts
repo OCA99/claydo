@@ -4,9 +4,10 @@
  * ordered-row checksums, SQLite storage-class signatures, KV key lists and
  * value digests).
  *
- * Some tests assert BUGGY behavior on purpose, with `BUG:` comments — they
- * document data-loss findings verbatim (see ../DX-REPORT.md). If a library
- * fix lands, those assertions are supposed to start failing.
+ * POST-FIX VERSION: the original audit found four data-fidelity bugs
+ * (asserted verbatim as `BUG:` tests); the library has since been hardened
+ * and every former `BUG:` test now asserts the FIXED behavior with the same
+ * rigor. See ../DX-REPORT.md §6 for the before/after evidence.
  */
 import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
@@ -17,8 +18,22 @@ const gnarly = () => kind(env.APP_DO, "gnarly");
 const old = (name: string) =>
   env.OLD_GNARLY.get(env.OLD_GNARLY.idFromName(name));
 
+/** Asserts a rejection without leaving an unhandled-rejection report. */
+async function expectRejects(
+  run: () => Promise<unknown>,
+  pattern: RegExp,
+): Promise<void> {
+  try {
+    await run();
+  } catch (error) {
+    expect(String(error)).toMatch(pattern);
+    return;
+  }
+  expect.unreachable(`expected rejection matching ${pattern}`);
+}
+
 describe("1. AUTOINCREMENT sequence restore", () => {
-  it("BUG: reuses deleted top ids after migration (sqlite_sequence is duplicated)", async () => {
+  it("FIXED: deleted top ids are not reused; sqlite_sequence has one exact row", async () => {
     const source = old("autoinc");
     // 10 rows inserted, ids 8..10 deleted: max(id)=7 but the sequence must
     // stay at 10 so the next insert gets 11, never a recycled 8.
@@ -33,23 +48,22 @@ describe("1. AUTOINCREMENT sequence restore", () => {
     expect(summary.rows["autoinc_t"]).toBe(7);
 
     const moved = gnarly().get("autoinc");
-    // BUG: the import's `INSERT OR REPLACE INTO sqlite_sequence` never
-    // conflicts (sqlite_sequence has no unique constraint), so the table
-    // ends up with TWO rows for autoinc_t: the seq=7 row created by the
-    // explicit-rowid inserts during the copy, plus the restored seq=10.
+    // The importer now does DELETE-then-INSERT on sqlite_sequence, so the
+    // restored sequence is a single exact row (previously it was duplicated
+    // as [7, 10] and SQLite read the wrong one).
     const seq = await moved.runSql(
       `SELECT name, seq FROM sqlite_sequence ORDER BY seq`,
     );
-    expect(seq.rows).toEqual([
-      ["autoinc_t", 7],
-      ["autoinc_t", 10],
-    ]);
+    expect(seq.rows).toEqual([["autoinc_t", 10]]);
 
-    // BUG (data corruption): SQLite reads the first row (seq=7), so the
-    // next insert REUSES id 8 — an id that the old instance had already
-    // issued and deleted. Correct behavior would issue id 11.
+    // AUTOINCREMENT semantics hold across the migration: the next insert
+    // gets a NEVER-issued id (11), not the recycled 8 of the old bug.
     const nextId = await moved.insertAutoinc("post-migration");
-    expect(nextId).toBe(8); // MUST be 11 for AUTOINCREMENT semantics.
+    expect(nextId).toBe(11);
+    const afterSeq = await moved.runSql(
+      `SELECT name, seq FROM sqlite_sequence ORDER BY seq`,
+    );
+    expect(afterSeq.rows).toEqual([["autoinc_t", 11]]);
   });
 });
 
@@ -67,10 +81,10 @@ describe("2. rowid alias + indexes + trigger + view", () => {
       maxRowsPerChunk: 2,
       maxBytesPerChunk: 1024,
     });
-    // Nit: zero-row tables (base_notes) are missing from summary.rows,
-    // although the exporter's verification totals do include them.
+    // Zero-row tables (base_notes) are reported with zero counts.
     expect(summary.rows).toEqual({
       audit_log: 7,
+      base_notes: 0,
       people: 7,
     });
     expect(summary.chunks).toBeGreaterThan(5); // forced many chunks
@@ -97,9 +111,10 @@ describe("2. rowid alias + indexes + trigger + view", () => {
     expect(String(indexes.rows[1]![1])).toContain("WHERE score > 100.0");
 
     // The UNIQUE index enforces: duplicate email fails on the new side.
-    await expect(
-      moved.insertPerson("dup", "p3@example.com", 1),
-    ).rejects.toThrow(/UNIQUE constraint failed/);
+    await expectRejects(
+      () => moved.insertPerson("dup", "p3@example.com", 1),
+      /UNIQUE constraint failed/,
+    );
 
     // The trigger DOES fire for new inserts after migration.
     const newId = await moved.insertPerson("newcomer", "new@example.com", 150.5);
@@ -123,9 +138,10 @@ describe("2. rowid alias + indexes + trigger + view", () => {
     ]);
   });
 
-  it("BUG: silently NULLs other columns when the INTEGER PRIMARY KEY is not the first column", async () => {
+  it("FIXED: rowid alias in second column position migrates byte-exact", async () => {
     const source = old("alias2");
     await source.seedAliasSecond();
+    const before = await source.fingerprintAll();
     const beforeRows = await source.runSql(
       `SELECT rowid, label, id FROM alias_second ORDER BY rowid`,
     );
@@ -135,8 +151,6 @@ describe("2. rowid alias + indexes + trigger + view", () => {
       [3, "gamma", 3],
     ]);
 
-    // BUG: the migration reports SUCCESS (row counts match, verification
-    // passes) ...
     const summary = await migrateInstance({
       from: source,
       to: gnarly(),
@@ -145,34 +159,28 @@ describe("2. rowid alias + indexes + trigger + view", () => {
     expect(summary.skipped).toBe(false);
     expect(summary.rows["alias_second"]).toBe(3);
 
-    // ... but every `label` value was silently replaced with NULL. The
-    // importer assumes column 0 of the exported row is the rowid; for a
-    // rowid-alias table it builds
-    //   INSERT INTO alias_second (rowid, "id") VALUES (?, ?)
-    // binding label to rowid and id to "id" (the same column, last write
-    // wins), and never assigns `label` at all.
+    // The wire format now carries `rows.rowid` (the alias column name, or
+    // "__rowid__"), and the importer maps columns by that instead of
+    // assuming column 0 is the rowid. Previously `label` was silently
+    // NULLed here while verification passed.
     const moved = gnarly().get("alias2");
     const afterRows = await moved.runSql(
       `SELECT rowid, label, id FROM alias_second ORDER BY rowid`,
     );
     expect(afterRows.rows).toEqual([
-      [1, null, 1], // MUST be [1, "alpha", 1]
-      [2, null, 2],
-      [3, null, 3],
+      [1, "alpha", 1],
+      [2, "beta", 2],
+      [3, "gamma", 3],
     ]);
+    // Full fingerprint equality: checksum over ordered rows AND storage
+    // classes.
+    const after = await moved.fingerprintAll();
+    expect(after.tables["alias_second"]).toEqual(before.tables["alias_second"]);
 
-    // Recovery is possible only because the sealed old instance still holds
-    // the intact data — nothing in the migration flags the corruption.
-    expect((await source.__claydoSealed()).sealed).toBe(true);
-    await source.__claydoUnseal();
-    const intact = await source.runSql(
-      `SELECT label, id FROM alias_second ORDER BY id`,
-    );
-    expect(intact.rows).toEqual([
-      ["alpha", 1],
-      ["beta", 2],
-      ["gamma", 3],
-    ]);
+    // The old side is sealed with a move marker (recorded after success).
+    const seal = await source.__claydoSealed();
+    expect(seal.sealed).toBe(true);
+    expect(seal.movedTo).toBeDefined();
   });
 });
 
@@ -231,10 +239,12 @@ describe("3. hostile scalar values and wild rowids", () => {
 });
 
 describe("4. hostile KV entries", () => {
-  it("round-trips 197 keys across pages — but BUG: silently drops user keys starting with __claydo", async () => {
+  it("FIXED: all 199 keys migrate, including user keys starting with __claydo", async () => {
     const source = old("kvtrap");
     const seeded = await source.seedKv();
     expect(seeded.count).toBe(199); // includes the two __claydo* trap keys
+    const before = await source.fingerprintAll();
+    expect(before.kv.count).toBe(199);
 
     const summary = await migrateInstance({
       from: source,
@@ -242,21 +252,29 @@ describe("4. hostile KV entries", () => {
       name: "kvtrap",
       maxBytesPerChunk: 4096, // force many KV pages
     });
-    // BUG (silent data loss): only 197 of 199 keys moved. The exporter
-    // filters every key that starts with "__claydo" as library-internal,
-    // and the verification total applies the same filter, so the loss of
-    // the user keys "__claydonote" and "__claydo_config" passes totals
-    // verification without any error or warning.
-    expect(summary.kv).toBe(197);
+    // Only the three EXACT reserved keys (__claydo:sealed, __claydo:kind,
+    // __claydo:import) are excluded now; user keys that merely start with
+    // "__claydo" migrate and count. Previously 197 of 199 moved and the
+    // count-filter symmetry hid the loss.
+    expect(summary.kv).toBe(199);
     expect(summary.chunks).toBeGreaterThan(5);
 
     const moved = gnarly().get("kvtrap");
-    expect(await moved.kvGet("__claydonote")).toBeUndefined(); // LOST
-    expect(await moved.kvGet("__claydo_config")).toBeUndefined(); // LOST
-    // The sealed old instance still holds the only copy of those two keys.
+    expect(await moved.kvGet("__claydonote")).toBe(
+      "user data that merely looks library-ish",
+    );
+    expect(await moved.kvGet("__claydo_config")).toEqual({
+      important: true,
+      version: 7,
+    });
 
-    // Everything else round-tripped exactly, including value shapes that
-    // exercise structured clone.
+    // Full KV fingerprint equality (keys + deterministic value digests).
+    const after = await moved.fingerprintAll();
+    expect(after.kv.count).toBe(199);
+    expect(after.kv.keys).toEqual(before.kv.keys);
+    expect(after.kv.checksum).toBe(before.kv.checksum);
+
+    // Structured-clone value shapes round-tripped exactly.
     expect(await moved.kvDigest("buffer")).toBe("bin:00fffe800107");
     expect(await moved.kvGet("colon:in:key:v2")).toBe("colons everywhere");
     expect(await moved.kvGet("uni:😀:ключ:キー")).toBe("unicode key");
@@ -279,60 +297,79 @@ describe("4. hostile KV entries", () => {
       nested: { arr: [42, 84, null], even: true },
     });
 
-    // Key inventory: exactly the 197 non-trap keys arrived (plus the
-    // library's own "__claydo:kind" marker on the new side).
+    // Key inventory: all 199 user keys plus the library's own
+    // "__claydo:kind" marker on the new side, and nothing else.
     const keys = await moved.kvKeys();
-    expect(keys.length).toBe(198);
+    expect(keys.length).toBe(200);
     expect(keys.filter((k) => k.startsWith("__claydo"))).toEqual([
       "__claydo:kind",
+      "__claydo_config",
+      "__claydonote",
     ]);
   });
 
-  it("BUG: an instance whose ONLY data is __claydo-prefixed user keys is treated as empty and loses everything", async () => {
+  it("FIXED: an instance whose ONLY data is __claydo-prefixed user keys migrates fully", async () => {
     const source = old("kvshadow");
     await source.kvPut("__claydonly", "the only data this instance has");
 
-    // BUG: __claydoHasData() reports false although user data exists. The
-    // lazy `migrated()` router uses this to decide "nothing to migrate",
-    // so it would route to the fresh new instance and strand this data.
-    expect(await source.__claydoHasData()).toBe(false);
+    // hasData now recognizes user keys that start with __claydo (previously
+    // false, which made the lazy router strand this data forever).
+    expect(await source.__claydoHasData()).toBe(true);
 
-    // An explicit migration also transfers nothing and still "succeeds".
     const summary = await migrateInstance({
       from: source,
       to: gnarly(),
       name: "kvshadow",
     });
     expect(summary.skipped).toBe(false);
-    expect(summary.kv).toBe(0);
+    expect(summary.kv).toBe(1);
     const moved = gnarly().get("kvshadow");
-    expect(await moved.kvGet("__claydonly")).toBeUndefined(); // LOST
+    expect(await moved.kvGet("__claydonly")).toBe(
+      "the only data this instance has",
+    );
   });
 });
 
 describe("7. schema-only instance (zero rows, zero KV)", () => {
-  it("moves DDL (tables and indexes) even with no data, and reports hasData=false", async () => {
+  it("is skipped by default, and moves DDL with allowEmpty: true", async () => {
     const source = old("schemaonly");
     await source.pingCheck(); // force construction (constructor DDL only)
     expect(await source.seedSchemaOnly()).toEqual(["ghost_table", "ghost_idx"]);
 
-    // Schema alone does not count as data.
+    // Schema alone does not count as data (documented behavior, unchanged).
     expect(await source.__claydoHasData()).toBe(false);
 
-    // An explicit migration still runs (only re-runs are skipped).
-    const summary = await migrateInstance({
+    // NEW BEHAVIOR: empty instances are skipped by default so stale
+    // registry entries cannot fabricate sealed husks. Nothing is touched.
+    const skipped = await migrateInstance({
       from: source,
       to: gnarly(),
       name: "schemaonly",
     });
-    expect(summary).toEqual({
-      skipped: false,
-      resumed: false,
-      chunks: 1,
-      kv: 0,
-      rows: {},
-      alarm: null,
+    expect(skipped.skipped).toBe(true);
+    expect(skipped.reason).toBe(
+      "old instance has no data (pass allowEmpty to migrate schema-only instances)",
+    );
+    expect((await source.__claydoSealed()).sealed).toBe(false);
+    const status = await (
+      gnarly().get("schemaonly").stub as unknown as {
+        __claydoImportStatus(): Promise<{ kind?: string; importing?: unknown }>;
+      }
+    ).__claydoImportStatus();
+    expect(status).toEqual({});
+
+    // Explicit schema-only migration with the new flag.
+    const summary = await migrateInstance({
+      from: source,
+      to: gnarly(),
+      name: "schemaonly",
+      allowEmpty: true,
     });
+    expect(summary.skipped).toBe(false);
+    expect(summary.chunks).toBe(1);
+    expect(summary.kv).toBe(0);
+    expect(summary.rows).toEqual({ base_notes: 0, ghost_table: 0 });
+    expect(summary.alarm).toBeNull();
 
     const moved = gnarly().get("schemaonly");
     const master = await moved.runSql(
@@ -371,6 +408,7 @@ describe("8. big run: 2000 rows, maxRowsPerChunk 50", () => {
     expect(summary.rows).toEqual({
       big_a: 1000,
       big_b: 600,
+      base_notes: 0,
       big_c: 400,
     });
     // 20 + 12 + 8 row chunks (the first one also carries the DDL) plus the

@@ -1,17 +1,20 @@
 /**
- * Adversarial probes against claydo/migrate, run on the GameCo worker:
+ * Adversarial probes against claydo/migrate, run on the GameCo worker —
+ * updated for the hardened module. Each suite notes what changed since the
+ * original audit (see DX-REPORT.md sections 3 and 6):
  *
- *  A. exportable() vs partyserver's synchronous helpers (pre-seal behavior).
- *  B. The seal window: a facade read between seal and first import chunk.
- *  C. Wrong-shape migration: a room's data imported into the match kind.
- *  D. A rowid-alias column that is not the first declared column.
- *  E. Tiny chunks while spamming facade reads.
- *  F. A WebSocket message racing the migration (Promise.all).
+ *  A. exportable() vs partyserver's synchronous helpers  → FIXED (sync guards)
+ *  B. The seal window / polluted targets                  → FIXED (reserve-first
+ *     + wipeTarget), with one residual manual-seal corner probed explicitly.
+ *  C. Wrong-shape migration                               → unchanged by design
+ *  D. Rowid-alias column not in first position            → FIXED (byte-exact)
+ *  E. Tiny chunks while spamming facade reads             → FIXED (reads wait)
+ *  F. A WebSocket message racing the migration            → improved (1012 close)
  */
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { kinds } from "../../../src/index";
-import { migrateInstance, migrated } from "../../../src/migrate";
+import { migrateInstance, migrated, wipeTarget } from "../../../src/migrate";
 
 const app = () => kinds(env.APP_DO);
 
@@ -21,79 +24,160 @@ function oldRoom(name: string) {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-describe("A. exportable() wrapper vs partyserver sync helpers", () => {
-  it("connectionCount() works as a kind but explodes under exportable() — before any seal", async () => {
-    // As a claydo kind: fine.
+/** Asserts a rejection without leaving an unhandled-rejection report. */
+async function expectRejects(
+  run: () => Promise<unknown>,
+  pattern: RegExp,
+): Promise<void> {
+  try {
+    await run();
+  } catch (error) {
+    expect(String(error)).toMatch(pattern);
+    return;
+  }
+  expect.unreachable(`expected rejection matching ${pattern}`);
+}
+
+describe("A. exportable() wrapper vs partyserver sync helpers (fixed: sync guards)", () => {
+  it("getConnections() iteration works under the mixin while unsealed; sealed guards still throw", async () => {
+    // As a claydo kind: fine (was already fine).
     expect(await app().room.get("sync-probe").connectionCount()).toBe(0);
 
-    // On the old binding, the same class wrapped with exportable(): the
-    // seal guard replaced getConnections() with an async wrapper, so the
-    // for..of inside connectionCount() iterates a Promise.
+    // On the old binding under exportable(): POST-FIX the guards are
+    // synchronous, so partyserver's sync helpers work unchanged.
+    // (Pre-fix this threw "TypeError: this.getConnections is not a function
+    // or its return value is not iterable".)
     const old = oldRoom("sync-probe-old");
-    await old.post("system", "hello"); // instance is alive and NOT sealed
-    await expect(old.connectionCount()).rejects.toThrow(/is not iterable|Symbol\.iterator/);
+    await old.post("system", "hello");
+    expect(await old.connectionCount()).toBe(0);
+
+    // With a live hibernating WebSocket the count is real — the mixin does
+    // not disturb partyserver's HibernatingConnectionIterator.
+    const response = await old.fetch(
+      "https://old.gameco/rooms/sync-probe-old?_pk=pat",
+      { headers: { Upgrade: "websocket" } },
+    );
+    expect(response.status).toBe(101);
+    const ws = response.webSocket!;
+    const closes: { code: number; reason: string }[] = [];
+    ws.addEventListener("close", (event) => {
+      closes.push({ code: event.code, reason: event.reason });
+    });
+    ws.accept();
+    expect(await old.connectionCount()).toBe(1);
+
+    // Sealing: RPC guards throw, and the live socket is closed with 1012.
+    await old.__claydoSeal();
+    await expectRejects(() => old.connectionCount(), /is sealed/);
+    const deadline = Date.now() + 2_000;
+    while (closes.length === 0 && Date.now() < deadline) await sleep(50);
+    expect(closes).toEqual([
+      { code: 1012, reason: "claydo: instance migrating; reconnect" },
+    ]);
+
+    // Unseal: sync helpers work again; the seal-closed socket is gone.
+    await old.__claydoUnseal();
+    expect(await old.connectionCount()).toBe(0);
   });
 });
 
-describe("B. the seal window: read-through-facade between seal and first chunk", () => {
-  it("a facade read on a sealed-but-not-yet-imported room initializes an empty instance and wedges the migration", async () => {
+describe("B. the seal window and polluted targets (fixed: reserve-first + wipeTarget)", () => {
+  it("a reserved target blocks reads instead of initializing an empty instance", async () => {
     const NAME = "race-window";
     const old = oldRoom(NAME);
     await old.post("system", "message one");
     await old.post("system", "message two");
 
-    // The driver crashes right after sealing (or a reader simply wins the
-    // race between __claydoSeal() and the first __claydoImport()).
-    await old.__claydoSeal();
+    // The driver reserves the target BEFORE touching the old instance.
+    // Simulate exactly that moment with the raw host API:
+    const raw = app().room.get(NAME).stub as unknown as {
+      __claydoBeginImport(kind: string, token: string): Promise<unknown>;
+      __claydoAbortImport(token: string): Promise<boolean>;
+    };
+    await raw.__claydoBeginImport("room", "audit-token");
 
-    const facade = migrated(env.OLD_ROOMS, app().room, { strategy: "manual" });
+    // POST-FIX: a read in this window can no longer pin an empty instance —
+    // it blocks loudly. (Pre-fix: get() initialized an empty room and the
+    // driver later reported { skipped: true } — silent data loss.)
+    await expectRejects(
+      () => app().room.get(NAME).history(),
+      /is importing kind 'room'\. Traffic is blocked until the migration completes or is aborted/,
+    );
+    const blocked = await app().room.get(NAME).fetch("https://do/");
+    expect(blocked.status).toBe(503);
+    expect(blocked.headers.get("retry-after")).toBe("2");
 
-    // The facade sees "old is sealed" and routes to the new side — which
-    // has no data yet. get() initializes it, pinning the kind on an EMPTY
-    // instance. The reader is served an empty history.
-    expect(await facade.get(NAME).history()).toEqual([]);
-
-    // Observed: the driver now reports SUCCESS. Target-has-kind plus
-    // old-is-sealed is indistinguishable from a completed migration, so
-    // migrateInstance() returns { skipped: true }. Two messages are
-    // silently stranded behind the seal — the worst possible outcome.
+    // The owner releases the reservation; a normal migration then succeeds
+    // with every row intact.
+    expect(await raw.__claydoAbortImport("audit-token")).toBe(true);
     const summary = await migrateInstance({
       from: old,
       to: app().room,
       name: NAME,
     });
-    expect(summary).toMatchObject({ skipped: true, chunks: 0, rows: {} });
+    expect(summary.skipped).toBe(false);
+    expect(summary.rows["messages"]).toBe(2);
+    expect((await app().room.get(NAME).history()).length).toBe(2);
+  });
 
-    // Every caller now sees an empty room; the old data is unreachable
-    // (the old instance stays sealed and rejects all traffic).
-    expect(await facade.get(NAME).history()).toEqual([]);
-    expect(await old.__claydoSealed()).toMatchObject({ sealed: true });
-    await expect(old.history()).rejects.toThrow(/is sealed/);
+  it("a target polluted BEFORE the migration makes the driver refuse loudly, and wipeTarget() recovers", async () => {
+    const NAME = "polluted";
+    const old = oldRoom(NAME);
+    await old.post("system", "real data one");
+    await old.post("system", "real data two");
+    // Racing traffic touched the target name before any migration started.
+    await app().room.get(NAME).post("intruder", "i live here now");
 
-    // Remediation is entirely on the user, with no library API. Wiping the
-    // new instance's storage is NOT enough: the host keeps the kind pinned
-    // in memory, and the driver still reports "nothing to do".
-    await runInDurableObject(
-      env.APP_DO.get(env.APP_DO.idFromName(`room:${NAME}`)),
-      async (instance) =>
-        (instance as unknown as { ctx: DurableObjectState }).ctx.storage.deleteAll(),
+    // POST-FIX: no { skipped: true } lie — the driver refuses with a loud
+    // error that names the recovery tool.
+    await expectRejects(
+      () => migrateInstance({ from: old, to: app().room, name: NAME }),
+      /both the old instance 'polluted' and the new instance 'room:polluted' are live.*wipe it with wipeTarget\(\)/s,
     );
-    const afterWipe = await migrateInstance({
+    // Nothing was sealed: the old instance still serves traffic.
+    expect((await old.__claydoSealed()).sealed).toBe(false);
+
+    // The advertised recovery path actually works (no ctx.abort() surgery:
+    // wipeTarget clears storage, alarm, import state, AND the in-memory pin).
+    await wipeTarget(app().room, NAME);
+    const summary = await migrateInstance({
       from: old,
       to: app().room,
       name: NAME,
     });
-    expect(afterWipe.skipped).toBe(true); // still lying
+    expect(summary.skipped).toBe(false);
+    expect(summary.rows["messages"]).toBe(2);
+    const history = await app().room.get(NAME).history();
+    expect(history.map((m) => m.body)).toEqual([
+      "real data one",
+      "real data two",
+    ]);
+  });
 
-    // Only after the instance is ALSO evicted from memory (ctx.abort())
-    // does the migration finally run.
-    await runInDurableObject(
-      env.APP_DO.get(env.APP_DO.idFromName(`room:${NAME}`)),
-      async (instance) =>
-        (instance as unknown as { ctx: DurableObjectState }).ctx.abort(),
-    ).catch(() => {
-      // abort() intentionally kills the call.
+  it("RESIDUAL: a manually sealed (never-reserved) old instance can still be shadowed by a reader", async () => {
+    // The reserve-first driver closes ITS window, but __claydoSeal() is a
+    // public API: if an operator seals by hand without reserving the
+    // target, a facade read still initializes an empty instance and the
+    // driver still reports success. Narrower than the original bug (the
+    // driver can no longer create this state), but the corner exists.
+    const NAME = "manual-seal-hole";
+    const old = oldRoom(NAME);
+    await old.post("system", "stranded one");
+    await old.post("system", "stranded two");
+    await old.__claydoSeal(); // by hand, no reservation
+
+    const facade = migrated(env.OLD_ROOMS, app().room, { strategy: "manual" });
+    expect(await facade.get(NAME).history()).toEqual([]); // empty pin
+
+    const summary = await migrateInstance({
+      from: old,
+      to: app().room,
+      name: NAME,
     });
+    expect(summary).toMatchObject({ skipped: true, reason: "already migrated" });
+
+    // Recovery at least exists now: wipe the shadow and re-run.
+    await wipeTarget(app().room, NAME);
     const rerun = await migrateInstance({
       from: old,
       to: app().room,
@@ -101,12 +185,14 @@ describe("B. the seal window: read-through-facade between seal and first chunk",
     });
     expect(rerun.skipped).toBe(false);
     expect(rerun.rows["messages"]).toBe(2);
-    expect((await app().room.get(NAME).history()).length).toBe(2);
+    expect(
+      (await facade.get(NAME).history()).map((m) => m.body),
+    ).toEqual(["stranded one", "stranded two"]);
   });
 });
 
-describe("C. wrong-shape migration: binding A's instance into binding B's kind", () => {
-  it("migrating a partyserver room into the match kind succeeds silently and serves nonsense", async () => {
+describe("C. wrong-shape migration: binding A's instance into binding B's kind (unchanged by design)", () => {
+  it("migrating a partyserver room into the match kind still succeeds silently and serves nonsense", async () => {
     const old = oldRoom("oops");
     await old.post("system", "this is a chat room");
     await old.post("alice", "definitely not a match");
@@ -119,9 +205,6 @@ describe("C. wrong-shape migration: binding A's instance into binding B's kind",
     });
     expect(summary.skipped).toBe(false);
     expect(summary.rows["messages"]).toBe(2); // chat rows, "successfully" imported
-    // (kv is 0 here: partyserver only persists its __ps_name record once a
-    // fetch/WebSocket/alarm entry point ran; this room was only seeded over
-    // RPC. The journey test's "lobby" DID carry __ps_name across.)
     expect(summary.kv).toBe(0);
 
     // The match kind now runs on top of chat-room data: no error, just
@@ -145,26 +228,19 @@ describe("C. wrong-shape migration: binding A's instance into binding B's kind",
     expect(strandedRows).toBe(2);
   });
 
-  it("the only guard is name-prefix vs declared-kind, which this footgun never trips", async () => {
-    // For completeness: importing under a name whose prefix implies another
-    // kind IS caught (target name "room:x" vs declared kind "match")...
-    const old = oldRoom("oops2");
-    await old.post("system", "hi");
-    const target = app().room.get("prefix-guard");
-    const raw = target.stub as unknown as {
-      __claydoImport(kind: string, chunk: unknown, seq: number): Promise<unknown>;
+  it("the only guard is name-prefix vs declared-kind, now enforced at reservation time", async () => {
+    const raw = app().room.get("prefix-guard").stub as unknown as {
+      __claydoBeginImport(kind: string, token: string): Promise<unknown>;
     };
-    await old.__claydoSeal();
-    const chunk = await old.__claydoExport(undefined, null);
-    await expect(raw.__claydoImport("match", chunk, 1)).rejects.toThrow(
+    await expectRejects(
+      () => raw.__claydoBeginImport("match", "audit-token"),
       /the target name 'room:prefix-guard' implies kind 'room', but the import declares kind 'match'/,
     );
-    await old.__claydoUnseal();
   });
 });
 
-describe("D. rowid-alias column that is not the first column", () => {
-  it("cannot migrate: the importer misaligns columns and the run rolls back with a bare SQLite error", async () => {
+describe("D. rowid-alias column that is not the first column (fixed)", () => {
+  it("migrates byte-exact: the explicit rowid field carries the alias position", async () => {
     const id = env.OLD_MATCHES.newUniqueId();
     const old = env.OLD_MATCHES.get(id);
     await old.setup(["gina", "hank"]);
@@ -177,25 +253,27 @@ describe("D. rowid-alias column that is not the first column", () => {
       { at: 2_000, seq: 2, note: "midgame" },
     ]);
 
-    // Observed: the importer builds INSERT columns as
-    // ["rowid", ...columns.slice(1)], which assumes the rowid alias is the
-    // FIRST column. Here it is not, so the first data column ("at") is
-    // dropped from the column list and the insert fails its NOT NULL
-    // constraint. The error says nothing about the real cause.
-    await expect(
-      migrateInstance({ from: old, to: app().match, name: "alias-probe" }),
-    ).rejects.toThrow(
-      /migration of 'alias-probe' to kind 'match' failed and was rolled back \(old instance unsealed\): NOT NULL constraint failed: turn_log\.at/,
-    );
+    // Pre-fix this rolled back with a bare
+    // "NOT NULL constraint failed: turn_log.at". POST-FIX the chunk carries
+    // the rowid alias name, so the importer aligns columns correctly.
+    const summary = await migrateInstance({
+      from: old,
+      to: app().match,
+      name: "alias-probe",
+    });
+    expect(summary.skipped).toBe(false);
+    expect(summary.rows["turn_log"]).toBe(2);
+    // Empty tables ship no row chunks but are reported with a zero count.
+    expect(summary.rows["moves"]).toBe(0);
 
-    // The rollback held: the old instance serves its data again.
-    expect(await old.turnLog()).toEqual(before);
-    expect(await old.__claydoSealed()).toMatchObject({ sealed: false });
+    const moved = app().match.get("alias-probe");
+    expect(await moved.turnLog()).toEqual(before);
+    expect((await moved.state()).players).toEqual(["gina", "hank"]);
   });
 });
 
-describe("E. tiny chunks while spamming facade reads", () => {
-  it("readers during the copy fail loudly; nobody ever sees partial data", async () => {
+describe("E. tiny chunks while spamming facade reads (fixed: readers wait, never see partial or empty)", () => {
+  it("every read during the copy returns the complete data set; the migration always completes", async () => {
     const NAME = "busy";
     const TOTAL = 30;
     const old = oldRoom(NAME);
@@ -207,7 +285,6 @@ describe("E. tiny chunks while spamming facade reads", () => {
       strategy: "manual",
       oldRouteTtlMs: 0, // re-resolve on every read: worst case for the race
     });
-    // Prime one read on the old side before the driver starts.
     expect((await facade.get(NAME).history()).length).toBe(TOTAL);
 
     const migration = migrateInstance({
@@ -216,53 +293,33 @@ describe("E. tiny chunks while spamming facade reads", () => {
       name: NAME,
       maxRowsPerChunk: 1,
       maxBytesPerChunk: 64,
-    }).then(
-      (summary) => ({ summary, error: undefined }),
-      (error: Error) => ({ summary: undefined, error }),
-    );
+    });
 
-    const outcomes: { len?: number; error?: string }[] = [];
+    // Pre-fix: readers here could pin an empty instance (wedging the
+    // migration) or fail with "is importing". POST-FIX: the facade waits
+    // out an in-progress import and every read sees the full data set.
+    const lengths: number[] = [];
     for (let i = 0; i < 12; i++) {
-      try {
-        const rows = await facade.get(NAME).history();
-        outcomes.push({ len: rows.length });
-      } catch (error) {
-        outcomes.push({ error: (error as Error).message });
-      }
+      const rows = await facade.get(NAME).history();
+      lengths.push(rows.length);
       await sleep(5);
     }
-    const result = await migration;
+    const summary = await migration;
 
-    // Invariant: no reader ever observes a partial copy. Every successful
-    // read is the full old data, the full new data, or (the seal-window
-    // bug from suite B) a freshly-initialized EMPTY instance.
-    for (const outcome of outcomes) {
-      if (outcome.len !== undefined) {
-        expect([0, TOTAL]).toContain(outcome.len);
-      } else {
-        expect(outcome.error).toMatch(
-          /is importing kind 'room'|is sealed|are live/,
-        );
-      }
-    }
-
-    // Record how the race ended. Both endings have been observed; assert
-    // the system settles into a state we can name, and that when the
-    // migration did succeed the data is complete.
-    if (result.summary !== undefined) {
-      expect(result.summary.rows["messages"]).toBe(TOTAL);
-      expect((await app().room.get(NAME).history()).length).toBe(TOTAL);
-    } else {
-      // A reader won the seal window and wedged the migration (suite B).
-      expect(result.error!.message).toMatch(
-        /is live as kind 'room'|failed and was rolled back/,
-      );
-    }
+    expect(lengths).toEqual(Array.from({ length: 12 }, () => TOTAL));
+    expect(summary.skipped).toBe(false);
+    expect(summary.rows["messages"]).toBe(TOTAL);
+    expect((await app().room.get(NAME).history()).length).toBe(TOTAL);
+    // The old side carries the move marker and is fully retired.
+    expect(await old.__claydoSealed()).toEqual({
+      sealed: true,
+      movedTo: app().room.get(NAME).id.toString(),
+    });
   });
 });
 
 describe("F. a WebSocket message racing the migration", () => {
-  it("the message either lands before the seal (and migrates) or vanishes; the copy stays consistent", async () => {
+  it("the message lands before the seal or vanishes; either way the socket gets a 1012 close and the copy is consistent", async () => {
     const NAME = "race-room";
     const old = oldRoom(NAME);
     await old.post("system", "round start");
@@ -274,8 +331,12 @@ describe("F. a WebSocket message racing the migration", () => {
     expect(response.status).toBe(101);
     const ws = response.webSocket!;
     let echoed = 0;
+    const closes: { code: number; reason: string }[] = [];
     ws.addEventListener("message", () => {
       echoed += 1;
+    });
+    ws.addEventListener("close", (event) => {
+      closes.push({ code: event.code, reason: event.reason });
     });
     ws.accept();
 
@@ -299,6 +360,13 @@ describe("F. a WebSocket message racing the migration", () => {
     const history = await app().room.get(NAME).history();
     expect(history.length).toBe(rows);
     expect(echoed).toBe(rows - 1);
-    ws.close(1000, "done");
+
+    // POST-FIX: the racer's socket is not silently dead — the seal closed
+    // it with a reconnect signal.
+    const deadline = Date.now() + 2_000;
+    while (closes.length === 0 && Date.now() < deadline) await sleep(50);
+    expect(closes).toEqual([
+      { code: 1012, reason: "claydo: instance migrating; reconnect" },
+    ]);
   });
 });

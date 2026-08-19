@@ -559,6 +559,10 @@ export function union<R extends KindRegistry>(
         }
       }
       if (chunk.totals !== undefined) {
+        // Report zero-row tables in the summary too.
+        for (const table of Object.keys(chunk.totals.rows)) {
+          state.applied.rows[table] ??= 0;
+        }
         const mismatches: string[] = [];
         if (chunk.totals.kv !== state.applied.kv) {
           mismatches.push(
@@ -638,6 +642,13 @@ export function union<R extends KindRegistry>(
       } catch (error) {
         const message =
           error instanceof Error ? error.message : String(error);
+        if (message.includes("is importing kind")) {
+          // Transient: a migration is filling this instance right now.
+          return new Response(message, {
+            status: 503,
+            headers: { "retry-after": "2" },
+          });
+        }
         return new Response(message, { status: 400 });
       }
       if (typeof impl.fetch !== "function") {
