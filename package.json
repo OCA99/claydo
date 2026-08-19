@@ -1,0 +1,56 @@
+{
+  "name": "generic-durable-objects",
+  "version": "0.1.0",
+  "description": "One Durable Object class, many use cases. Route each instance to a fixed kind and stay under the namespace limit.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/FermatResearch/GenericDurableObjects.git"
+  },
+  "keywords": [
+    "cloudflare",
+    "workers",
+    "durable-objects",
+    "cloudflare-workers"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "check": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepublishOnly": "npm run check && npm run build"
+  },
+  "peerDependencies": {
+    "@cloudflare/workers-types": "^4.0.0 || ^5.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@cloudflare/workers-types": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.22.0",
+    "@cloudflare/workers-types": "^5.20260819.1",
+    "partyserver": "^0.5.10",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.0",
+    "vitest": "^4.1.0",
+    "wrangler": "^4.124.0"
+  }
+}
