@@ -394,6 +394,8 @@ import { migrateInstance, previewInstance } from "claydo/migrate";
 // Optional dry run: sizes, alarm, seal state, and blockers. Changes nothing.
 const preview = await previewInstance({ from: env.OLD_TALLY.getByName(name) });
 // preview: { sealed, movedTo?, hasData, kv, rows, alarm, blockers }
+// kv is a count; rows is a per-table map ({ counts: 12, events: 3 });
+// blockers is a list of human-readable problem descriptions.
 
 const summary = await migrateInstance({
   from: env.OLD_TALLY.getByName(name),
@@ -497,10 +499,12 @@ What the facade does and does not give you:
   in its own module-scope singleton.
 - Route ALL traffic for migrating names through the facade. One forgotten
   route, debug script, or cross-kind call that touches the plain accessor
-  mid-migration initializes the target and the driver refuses with:
-  `claydo: both the old instance '<name>' and the new instance
-  '<kind>:<name>' are live. Refusing to migrate. ...` — recover with
-  `wipeTarget()` as the message says, then re-run.
+  mid-migration initializes the target and the driver refuses with a
+  "both the old instance ... and the new instance ... are live" error.
+  The full message offers both remediations: `wipeTarget()` when the new
+  side holds no real data (then re-run), or sealing the old side with
+  `__claydoSeal()` when the new side is the source of truth (the old data
+  will NOT be copied).
 
 ### 4. Cut over and reclaim the slot
 
