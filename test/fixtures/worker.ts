@@ -121,6 +121,15 @@ export class PartyRoom extends Server<Env> {
   onMessage(connection: Connection, message: WSMessage): void {
     connection.send(`party[${this.name}]:${message}`);
   }
+
+  /**
+   * A plain RPC method. It reads `this.name`, which only works after the
+   * framework startup hook ran — the host runs it, so RPC-first access
+   * works without a warm-up fetch().
+   */
+  roomName(): string {
+    return this.name;
+  }
 }
 
 export class AppDO extends union({
