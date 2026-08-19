@@ -51,7 +51,11 @@ npm install claydo
 ### 1. Write kinds as plain Durable Object classes
 
 A kind is any class with a `(ctx, env)` constructor. Extend `DurableObject`
-to get `this.ctx` and `this.env`:
+to get `this.ctx` and `this.env`. (Typing tip for SQLite rows: the
+`sql.exec<T>()` generic requires `T extends Record<string, SqlStorageValue>`,
+so type rows with a dedicated query-row interface — or an inline shape as
+below — rather than reusing a domain interface that has optional or
+non-SQL fields.)
 
 ```ts
 // src/kinds.ts
@@ -237,12 +241,19 @@ the hop — match on `error.name` instead. Non-cloneable fields are dropped.
 For errors your callers must branch on, attach a stable discriminator field
 (for example `error.code = "RATE_LIMITED"`): fields survive the hop, and
 matching on `code` is sturdier than matching on message text. Under strict
-TypeScript the caught value is `unknown`, so narrow it once:
+TypeScript the caught value is `unknown`, so narrow it with a real guard:
 
 ```ts
-const remote = error as Error & { code?: string; retryAfterMs?: number };
-if (remote.code === "RATE_LIMITED") { ... }
+function errorCode(error: unknown): string | undefined {
+  return error instanceof Error && "code" in error
+    ? String((error as { code?: unknown }).code)
+    : undefined;
+}
+if (errorCode(error) === "RATE_LIMITED") { ... }
 ```
+
+The library's own kind-mismatch error carries structured fields too:
+`code: "CLAYDO_KIND_MISMATCH"` plus `expectedKind` and `actualKind`.
 
 Errors thrown in `alarm()` and `webSocket*` handlers have no caller to reach.
 The host logs them with `console.error`, including the kind and the instance
@@ -847,9 +858,18 @@ export {};
 ```
 
 ```jsonc
-// tsconfig.json — compilerOptions.types
+// tsconfig.json — a complete, tested configuration
 {
   "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ESNext"],
+    "strict": true,
+    "noEmit": true,
+    // Workers type packages ship overlapping globals; without this,
+    // `tsc` may report TS6200 identifier conflicts from node_modules.
+    "skipLibCheck": true,
     "types": [
       "@cloudflare/workers-types",
       // The `/types` subpath declares the "cloudflare:test" module; the
@@ -857,7 +877,8 @@ export {};
       // `tsc --noEmit` failing with TS2307 on "cloudflare:test".
       "@cloudflare/vitest-pool-workers/types"
     ]
-  }
+  },
+  "include": ["src", "test"]
 }
 ```
 
@@ -880,7 +901,12 @@ Tips that apply to your own tests:
   with `DataCloneError: Could not serialize object of type "RpcPromise"`.
 - `runDurableObjectAlarm` and `runInDurableObject` from `cloudflare:test`
   expect a raw `DurableObjectStub`. Pass `stub.stub` (the escape hatch) or a
-  raw `env.APP_DO.get(...)` stub.
+  raw `env.APP_DO.get(...)` stub. Schedule test alarms in the future: an
+  already-due alarm may fire on its own before the helper runs, making the
+  helper return `false` even though the alarm work happened.
+- vitest's default reporter can swallow `console.log` output from Workers
+  and tests. Run with `--reporter=verbose` when you need to see driver or
+  kind logs.
 - The claydo stub proxies your kind's methods only. Introspection such as
   `stub.storage` or `stub.getAlarm()` is not RPC-reachable — use
   `runInDurableObject(stub.stub, ...)` or add a helper method to the kind.
