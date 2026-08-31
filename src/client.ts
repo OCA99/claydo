@@ -22,6 +22,7 @@ type ReservedKey =
   | "name"
   | "kind"
   | "stub"
+  | "then"
   | `__${string}`;
 
 /**

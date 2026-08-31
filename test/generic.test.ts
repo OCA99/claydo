@@ -167,6 +167,9 @@ describe("error fidelity", () => {
     await expect((plain as any).label()).rejects.toThrow(
       /'label' on kind 'plain' is a property, not a method/,
     );
+    await expect(plain.fieldFunction()).rejects.toThrow(
+      /function-valued instance field, not a prototype method/,
+    );
   });
 
   it("skips throwing error getters while preserving safe fields", async () => {
@@ -211,6 +214,14 @@ describe("resetStorage()", () => {
     const racingRead = vault.getValue("k");
     expect(await resetting).toBe("finished");
     expect(await racingRead).toBeUndefined();
+  });
+
+  it("resets foreign-key schemas atomically without partial drops", async () => {
+    const vault = kind(env.APP_DO, "vault").get("reset-foreign-keys");
+    await vault.seedForeignKeys();
+    expect(await vault.userTables()).toEqual(["a_parent", "z_child"]);
+    await vault.wipe();
+    expect(await vault.userTables()).toEqual([]);
   });
 });
 
@@ -335,6 +346,13 @@ describe("alarms", () => {
       ),
     ).toBe(false);
     expect(await reminder.fired()).toBeNull();
+  });
+
+  it("rejects non-atomic alarm operations inside storage transactions", async () => {
+    const reminder = kind(env.APP_DO, "reminder").get("alarm-transaction");
+    await expect(reminder.alarmInsideTransaction()).rejects.toThrow(
+      /alarm operations inside storage\.transaction\(\) cannot be atomic/,
+    );
   });
 });
 

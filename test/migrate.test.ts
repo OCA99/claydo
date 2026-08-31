@@ -250,6 +250,46 @@ describe("migrateInstance", () => {
     await old.__claydoUnseal();
   });
 
+  it("serializes concurrent duplicate final chunks without deleting live data", async () => {
+    await seed("m4-final-race");
+    const old = legacy("m4-final-race");
+    const raw = rawTarget("m4-final-race");
+    const token = "final-race";
+    await old.__claydoSeal(undefined, undefined, "tally:m4-final-race");
+    await raw.__claydoBeginImport("tally", token);
+    let cursor: ExportChunk["cursor"] = null;
+    let seq = 0;
+    for (;;) {
+      const chunk = (await old.__claydoExport(
+        undefined,
+        cursor,
+        { maxRows: 1 },
+      )) as ExportChunk;
+      seq += 1;
+      if (chunk.cursor === null) {
+        const [first, duplicate] = await Promise.all([
+          raw.__claydoImport("tally", chunk, seq, token),
+          raw.__claydoImport("tally", chunk, seq, token),
+        ]);
+        expect([first.alreadyApplied, duplicate.alreadyApplied].sort()).toEqual([
+          false,
+          true,
+        ]);
+        expect(first.done).toBe(true);
+        expect(duplicate.done).toBe(true);
+        break;
+      }
+      await raw.__claydoImport("tally", chunk, seq, token);
+      cursor = chunk.cursor;
+    }
+    expect(await tally().get("m4-final-race").total()).toBe(5);
+    await old.__claydoSeal(
+      undefined,
+      "tally:m4-final-race",
+      "tally:m4-final-race",
+    );
+  });
+
   it("blocks traffic on the target while an import is in progress", async () => {
     await seed("m5");
     const old = legacy("m5");
@@ -686,6 +726,25 @@ describe("data fidelity extensions", () => {
     await expectRejects(
       () => migrateInstance({ from: old, to: tally(), name: "g5" }),
       /shadows the rowid/,
+    );
+    expect((await old.__claydoSealed()).sealed).toBe(false);
+  });
+
+  it("refuses rowids outside JavaScript's safe integer range", async () => {
+    const old = legacy("g6");
+    await old.bump("x");
+    await runInDurableObject(old, async (_instance, state) => {
+      state.storage.sql.exec(`CREATE TABLE huge_rowid (value TEXT)`);
+      state.storage.sql.exec(
+        `INSERT INTO huge_rowid(rowid, value)
+         VALUES (9223372036854775807, 'too large')`,
+      );
+    });
+    const preview = await previewInstance({ from: old });
+    expect(preview.blockers.join(" ")).toMatch(/safe integer range/);
+    await expectRejects(
+      () => migrateInstance({ from: old, to: tally(), name: "g6" }),
+      /unsafe 64-bit rowids cannot be copied exactly/,
     );
     expect((await old.__claydoSealed()).sealed).toBe(false);
   });

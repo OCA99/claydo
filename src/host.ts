@@ -133,9 +133,19 @@ export interface GenericDurableObjectInstance<R extends KindRegistry>
     allowInit?: boolean,
   ): Promise<ClaydoCallResult>;
   __claydoKind(): Promise<string | undefined>;
-  __claydoSetAlarm(kind: string, timestamp: number): Promise<void>;
-  __claydoGetAlarm(kind: string): Promise<number | null>;
-  __claydoDeleteAlarm(kind: string): Promise<void>;
+  __claydoSetAlarm(
+    kind: string,
+    timestamp: number,
+    options?: DurableObjectSetAlarmOptions,
+  ): Promise<void>;
+  __claydoGetAlarm(
+    kind: string,
+    options?: DurableObjectGetAlarmOptions,
+  ): Promise<number | null>;
+  __claydoDeleteAlarm(
+    kind: string,
+    options?: DurableObjectSetAlarmOptions,
+  ): Promise<void>;
   __claydoBeginFacetReset(kind: string): Promise<void>;
   __claydoFinishFacetReset(kind: string): Promise<void>;
   __claydoCompleteFacetReset(kind: string): Promise<void>;
@@ -206,6 +216,7 @@ export function union<R extends KindRegistry>(
     #impl?: object & KindHandlers;
     #implLoading?: Promise<object & KindHandlers>;
     readonly #activeFacetResets = new Set<string>();
+    #importTail: Promise<void> = Promise.resolve();
 
     constructor(ctx: DurableObjectState, env: unknown) {
       super(ctx, env);
@@ -270,7 +281,9 @@ export function union<R extends KindRegistry>(
       const separator = name.indexOf(":");
       if (separator === -1) return undefined;
       const prefix = name.slice(0, separator);
-      return prefix in kinds ? prefix : undefined;
+      return Object.prototype.hasOwnProperty.call(kinds, prefix)
+        ? prefix
+        : undefined;
     }
 
     async #resolveKind(hint?: string, allowInit = true): Promise<string> {
@@ -327,7 +340,7 @@ export function union<R extends KindRegistry>(
       if (kind === undefined) {
         throw new Error(this.#noKindMessage(hint, allowInit));
       }
-      if (!(kind in kinds)) {
+      if (!Object.prototype.hasOwnProperty.call(kinds, kind)) {
         throw new Error(
           `claydo: unknown kind '${kind}' on instance ` +
             `'${this.#identity()}'. Registered kinds: ` +
@@ -434,16 +447,21 @@ export function union<R extends KindRegistry>(
               `through the stub.`,
           );
         }
-        const fn = (impl as Record<string, unknown>)[method];
-        if (
-          typeof fn !== "function" ||
-          fn === (Object.prototype as Record<string, unknown>)[method]
-        ) {
-          if (method in impl && typeof fn !== "function") {
+        const fn = prototypeMethod(impl, method);
+        if (fn === undefined) {
+          const value = (impl as Record<string, unknown>)[method];
+          if (method in impl && typeof value !== "function") {
             throw new Error(
               `claydo: '${method}' on kind '${kind}' is a property, not a ` +
-                `method (type: ${typeof fn}). The stub only proxies methods; ` +
+                `method (type: ${typeof value}). The stub only proxies methods; ` +
                 `add a getter method to read it.`,
+            );
+          }
+          if (method in impl && typeof value === "function") {
+            throw new Error(
+              `claydo: '${method}' on kind '${kind}' is a function-valued ` +
+                `instance field, not a prototype method. Workers RPC exposes ` +
+                `prototype methods only.`,
             );
           }
           throw new Error(`claydo: kind '${kind}' has no method '${method}'.`);
@@ -515,19 +533,29 @@ export function union<R extends KindRegistry>(
       }
     }
 
-    async __claydoSetAlarm(kind: string, timestamp: number): Promise<void> {
+    async __claydoSetAlarm(
+      kind: string,
+      timestamp: number,
+      alarmOptions?: DurableObjectSetAlarmOptions,
+    ): Promise<void> {
       await this.#assertAlarmKind(kind);
-      await this.ctx.storage.setAlarm(timestamp);
+      await this.ctx.storage.setAlarm(timestamp, alarmOptions);
     }
 
-    async __claydoGetAlarm(kind: string): Promise<number | null> {
+    async __claydoGetAlarm(
+      kind: string,
+      alarmOptions?: DurableObjectGetAlarmOptions,
+    ): Promise<number | null> {
       await this.#assertAlarmKind(kind);
-      return this.ctx.storage.getAlarm();
+      return this.ctx.storage.getAlarm(alarmOptions);
     }
 
-    async __claydoDeleteAlarm(kind: string): Promise<void> {
+    async __claydoDeleteAlarm(
+      kind: string,
+      alarmOptions?: DurableObjectSetAlarmOptions,
+    ): Promise<void> {
       await this.#assertAlarmKind(kind);
-      await this.ctx.storage.deleteAlarm();
+      await this.ctx.storage.deleteAlarm(alarmOptions);
     }
 
     async __claydoBeginFacetReset(kind: string): Promise<void> {
@@ -639,7 +667,7 @@ export function union<R extends KindRegistry>(
             `{ importable: true } or { importable: ["${kind}"] } to union().`,
         );
       }
-      if (!(kind in kinds)) {
+      if (!Object.prototype.hasOwnProperty.call(kinds, kind)) {
         throw new Error(
           `claydo: unknown kind '${kind}'. Registered kinds: ` +
             `${Object.keys(kinds).join(", ")}.`,
@@ -746,10 +774,46 @@ export function union<R extends KindRegistry>(
       token: string,
       secret?: string,
     ): Promise<ImportAck> {
+      const previous = this.#importTail;
+      let release!: () => void;
+      this.#importTail = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      await previous;
+      try {
+        return await this.#applyImport(kind, chunk, seq, token, secret);
+      } finally {
+        release();
+      }
+    }
+
+    async #applyImport(
+      kind: string,
+      chunk: ExportChunk,
+      seq: number,
+      token: string,
+      secret?: string,
+    ): Promise<ImportAck> {
       this.#checkMigrationAuth(secret);
       this.#checkImportEnabled(kind);
       const state = await this.ctx.storage.get<ImportState>(IMPORT_STATE_KEY);
       if (state === undefined) {
+        const pinned = await this.ctx.storage.get<string>(KIND_STORAGE_KEY);
+        if (
+          pinned === kind &&
+          chunk.cursor === null &&
+          chunk.totals !== undefined
+        ) {
+          return {
+            seq,
+            alreadyApplied: true,
+            done: true,
+            applied: {
+              kv: chunk.totals.kv,
+              rows: { ...chunk.totals.rows },
+            },
+          };
+        }
         throw new Error(
           `claydo: no import is reserved on instance '${this.#identity()}'. ` +
             `Call __claydoBeginImport first (migrateInstance does this ` +
@@ -1020,17 +1084,12 @@ export function union<R extends KindRegistry>(
           await this.#completeOwnFacetReset();
         }
       }
+      let kind: string;
       try {
-        const kind = await this.#resolveKind(
+        kind = await this.#resolveKind(
           request.headers.get(KIND_HEADER) ?? undefined,
           request.headers.get(NO_INIT_HEADER) === null,
         );
-        await this.#waitForFacetReset(kind);
-        try {
-          return await this.#facet(kind).fetch(request);
-        } finally {
-          await this.#completeFacetReset(kind);
-        }
       } catch (error) {
         const message =
           error instanceof Error ? error.message : String(error);
@@ -1041,6 +1100,12 @@ export function union<R extends KindRegistry>(
           });
         }
         return new Response(message, { status: 400 });
+      }
+      await this.#waitForFacetReset(kind);
+      try {
+        return await this.#facet(kind).fetch(request);
+      } finally {
+        await this.#completeFacetReset(kind);
       }
     }
 
@@ -1057,7 +1122,6 @@ export function union<R extends KindRegistry>(
       try {
         const impl = await this.#loadImpl();
         await run(impl);
-        await this.#completeOwnFacetReset();
       } catch (error) {
         console.error(
           `claydo: ${name} failed on kind ` +
@@ -1187,6 +1251,23 @@ export function union<R extends KindRegistry>(
   }
 
   return GenericDurableObject as unknown as GenericDurableObjectClass<R>;
+}
+
+function prototypeMethod(
+  instance: object,
+  name: string,
+): ((...args: unknown[]) => unknown) | undefined {
+  let prototype: object | null = Object.getPrototypeOf(instance);
+  while (prototype !== null && prototype !== Object.prototype) {
+    const descriptor = Object.getOwnPropertyDescriptor(prototype, name);
+    if (descriptor !== undefined) {
+      return typeof descriptor.value === "function"
+        ? (descriptor.value as (...args: unknown[]) => unknown)
+        : undefined;
+    }
+    prototype = Object.getPrototypeOf(prototype);
+  }
+  return undefined;
 }
 
 function validateRegistry(kinds: KindRegistry): void {

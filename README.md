@@ -253,6 +253,11 @@ inside `alarm()` uses the same API.
 This means one alarm per **kind instance**, as with regular Durable Objects.
 Different logical instances already have different supervisors.
 
+Alarm operations inside `storage.transaction()` are rejected with an
+explanation: facet data and the supervisor alarm cannot commit in one storage
+transaction. Commit facet data first, then call `this.ctx.storage.setAlarm()`;
+the awaited call preserves that ordering.
+
 ## WebSockets
 
 `fetch()` and hibernating WebSocket handlers are forwarded to the facet. The
@@ -290,9 +295,12 @@ Arguments and return values follow Workers RPC serialization. A value that
 cannot cross the facet→supervisor or supervisor→caller boundary fails with
 kind and method context.
 
-Only methods are proxied. Add a getter **method** for public properties. Method
-overloads collapse to their final TypeScript overload on mapped stubs; expose
-a non-overloaded wrapper when needed.
+Only prototype methods are proxied, matching Workers RPC. Add a getter
+**method** for public properties; arrow/function class fields are not remote
+methods (TypeScript cannot distinguish the two in the mapped stub type, so the
+runtime gives a direct explanation). Method overloads collapse to their final
+TypeScript overload on mapped stubs; expose a non-overloaded wrapper when
+needed.
 
 ## Third-party Durable Object frameworks
 
@@ -423,8 +431,8 @@ one source cannot race or rerun into two live destinations.
 The copy supports rowids, generated columns (recomputed), indexes, triggers,
 views, AUTOINCREMENT sequences, ordinary and external-content FTS5, KV, and
 alarms. It rejects `WITHOUT ROWID`, non-FTS virtual tables, contentless FTS5,
-rowid-shadowing columns, and the exact staging key
-`__claydo:import-checkpoint` before sealing.
+rowid-shadowing columns, rowids outside JavaScript's safe integer range, and
+the exact staging key `__claydo:import-checkpoint` before sealing.
 
 ### Transitional routing
 

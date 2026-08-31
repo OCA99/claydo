@@ -661,6 +661,11 @@ export function exportable<I extends object>(
             )
             .toArray()
             .map((column) => column.name);
+          const unsafeRange = this.#unsafeRowidRange(row.name);
+          if (unsafeRange !== undefined) {
+            blockers.push(unsafeRange);
+            continue;
+          }
           tables.push({
             name: row.name,
             ddl: row.sql,
@@ -706,6 +711,12 @@ export function exportable<I extends object>(
             );
           }
         }
+        if (
+          !visible.some((column) => column.name.toLowerCase() === "rowid")
+        ) {
+          const unsafeRange = this.#unsafeRowidRange(row.name);
+          if (unsafeRange !== undefined) blockers.push(unsafeRange);
+        }
         tables.push({
           name: row.name,
           ddl: row.sql,
@@ -714,6 +725,31 @@ export function exportable<I extends object>(
         });
       }
       return { tables, post, blockers };
+    }
+
+    #unsafeRowidRange(table: string): string | undefined {
+      const { ctx } = holderOf(this);
+      const range = ctx.storage.sql
+        .exec<{ minRowid: string | null; maxRowid: string | null }>(
+          `SELECT CAST(min(rowid) AS TEXT) AS minRowid,
+                  CAST(max(rowid) AS TEXT) AS maxRowid
+           FROM ${quoteIdent(table)}`,
+        )
+        .one();
+      if (range.minRowid === null || range.maxRowid === null) return undefined;
+      const floor = BigInt(-Number.MAX_SAFE_INTEGER);
+      const ceiling = BigInt(Number.MAX_SAFE_INTEGER);
+      if (
+        BigInt(range.minRowid) < floor ||
+        BigInt(range.maxRowid) > ceiling
+      ) {
+        return (
+          `table '${table}' has rowids outside JavaScript's safe integer ` +
+          `range (${range.minRowid}..${range.maxRowid}). Re-key those rows ` +
+          `before migrating; unsafe 64-bit rowids cannot be copied exactly.`
+        );
+      }
+      return undefined;
     }
 
     /** Names of shadow tables (FTS5 internals) that must not be copied. */

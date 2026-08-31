@@ -49,9 +49,19 @@ export function facetProps(
 }
 
 interface AlarmHostStub {
-  __claydoSetAlarm(kind: string, timestamp: number): Promise<void>;
-  __claydoGetAlarm(kind: string): Promise<number | null>;
-  __claydoDeleteAlarm(kind: string): Promise<void>;
+  __claydoSetAlarm(
+    kind: string,
+    timestamp: number,
+    options?: DurableObjectSetAlarmOptions,
+  ): Promise<void>;
+  __claydoGetAlarm(
+    kind: string,
+    options?: DurableObjectGetAlarmOptions,
+  ): Promise<number | null>;
+  __claydoDeleteAlarm(
+    kind: string,
+    options?: DurableObjectSetAlarmOptions,
+  ): Promise<void>;
   __claydoBeginFacetReset(kind: string): Promise<void>;
   __claydoFinishFacetReset(kind: string): Promise<void>;
   __claydoCompleteFacetReset(kind: string): Promise<void>;
@@ -86,30 +96,30 @@ export function consumeFacetResetRequest(ctx: DurableObjectState): boolean {
 async function deleteAllFacetStorage(
   storage: DurableObjectStorage,
 ): Promise<void> {
-  const schema = storage.sql
-    .exec<{ type: string; name: string }>(
-      `SELECT type, name FROM sqlite_master
-       WHERE type IN ('view', 'table')
-         AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'
-         AND name NOT LIKE '\\_cf\\_%' ESCAPE '\\'
-       ORDER BY CASE type WHEN 'view' THEN 0 ELSE 1 END, name`,
-    )
-    .toArray();
-  for (const { type, name } of schema) {
-    const quoted = `"${name.replaceAll('"', '""')}"`;
-    storage.sql.exec(
-      `${type === "view" ? "DROP VIEW" : "DROP TABLE"} IF EXISTS ${quoted}`,
-    );
-  }
-  let cursor: string | undefined;
-  for (;;) {
-    const page = await storage.list({ startAfter: cursor, limit: 128 });
-    if (page.size === 0) break;
-    const keys = [...page.keys()];
-    cursor = keys.at(-1);
-    await storage.delete(keys);
-    if (page.size < 128) break;
-  }
+  storage.transactionSync(() => {
+    // Defers FK checks until commit, after every user table is gone. The
+    // whole reset rolls back if any drop fails; partial destruction is not
+    // observable.
+    storage.sql.exec("PRAGMA defer_foreign_keys = ON");
+    const schema = storage.sql
+      .exec<{ type: string; name: string }>(
+        `SELECT type, name FROM sqlite_master
+         WHERE type IN ('view', 'table')
+           AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'
+           AND name NOT LIKE '\\_cf\\_%' ESCAPE '\\'
+         ORDER BY CASE type WHEN 'view' THEN 0 ELSE 1 END, name`,
+      )
+      .toArray();
+    for (const { type, name } of schema) {
+      const quoted = `"${name.replaceAll('"', '""')}"`;
+      storage.sql.exec(
+        `${type === "view" ? "DROP VIEW" : "DROP TABLE"} IF EXISTS ${quoted}`,
+      );
+    }
+    for (const [key] of storage.kv.list()) {
+      storage.kv.delete(key);
+    }
+  });
 }
 
 /**
@@ -134,19 +144,62 @@ export function facetContext(
   const storage = new Proxy(ctx.storage, {
     get(target, property) {
       if (property === "setAlarm") {
-        return async (scheduledTime: number | Date): Promise<void> => {
+        return async (
+          scheduledTime: number | Date,
+          options?: DurableObjectSetAlarmOptions,
+        ): Promise<void> => {
           const timestamp =
             scheduledTime instanceof Date
               ? scheduledTime.getTime()
               : scheduledTime;
-          await host.__claydoSetAlarm(props.kind, timestamp);
+          await host.__claydoSetAlarm(props.kind, timestamp, options);
         };
       }
       if (property === "getAlarm") {
-        return (): Promise<number | null> => host.__claydoGetAlarm(props.kind);
+        return (
+          options?: DurableObjectGetAlarmOptions,
+        ): Promise<number | null> =>
+          host.__claydoGetAlarm(props.kind, options);
       }
       if (property === "deleteAlarm") {
-        return (): Promise<void> => host.__claydoDeleteAlarm(props.kind);
+        return (
+          options?: DurableObjectSetAlarmOptions,
+        ): Promise<void> =>
+          host.__claydoDeleteAlarm(props.kind, options);
+      }
+      if (property === "transaction") {
+        return <T>(
+          closure: (txn: DurableObjectTransaction) => Promise<T>,
+        ): Promise<T> =>
+          target.transaction((txn) =>
+            closure(
+              new Proxy(txn, {
+                get(transaction, transactionProperty) {
+                  if (
+                    transactionProperty === "setAlarm" ||
+                    transactionProperty === "getAlarm" ||
+                    transactionProperty === "deleteAlarm"
+                  ) {
+                    return (): never => {
+                      throw new Error(
+                        "claydo: alarm operations inside storage.transaction() " +
+                          "cannot be atomic across facet and supervisor storage. " +
+                          "Commit the transaction, then call the alarm method.",
+                      );
+                    };
+                  }
+                  const value = Reflect.get(
+                    transaction,
+                    transactionProperty,
+                    transaction,
+                  );
+                  return typeof value === "function"
+                    ? value.bind(transaction)
+                    : value;
+                },
+              }),
+            ),
+          );
       }
       if (property === "deleteAll") {
         return async (): Promise<void> => {

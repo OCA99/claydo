@@ -117,11 +117,18 @@ export class Reminder extends DurableObject<Env> {
   async wipe(): Promise<void> {
     await this.ctx.storage.deleteAll();
   }
+
+  async alarmInsideTransaction(): Promise<void> {
+    await this.ctx.storage.transaction(async (txn) => {
+      await txn.setAlarm(Date.now() + 60_000);
+    });
+  }
 }
 
 /** A kind with no handlers, to exercise error paths. */
 export class Plain extends DurableObject<Env> {
   label = "plain-label";
+  fieldFunction = (): string => "not RPC";
 
   ping(): string {
     return "pong";
@@ -172,6 +179,32 @@ export class Vault extends DurableObject<Env> {
     await this.ctx.storage.deleteAll();
     await scheduler.wait(25);
     return "finished";
+  }
+
+  seedForeignKeys(): void {
+    this.ctx.storage.sql.exec("PRAGMA foreign_keys = ON");
+    this.ctx.storage.sql.exec(
+      `CREATE TABLE a_parent (id INTEGER PRIMARY KEY)`,
+    );
+    this.ctx.storage.sql.exec(
+      `CREATE TABLE z_child (
+        id INTEGER PRIMARY KEY,
+        parent_id INTEGER NOT NULL REFERENCES a_parent(id)
+      )`,
+    );
+    this.ctx.storage.sql.exec(`INSERT INTO a_parent VALUES (1)`);
+    this.ctx.storage.sql.exec(`INSERT INTO z_child VALUES (1, 1)`);
+  }
+
+  userTables(): string[] {
+    return this.ctx.storage.sql
+      .exec<{ name: string }>(
+        `SELECT name FROM sqlite_master
+         WHERE type = 'table' AND name NOT LIKE '_cf_%'
+         ORDER BY name`,
+      )
+      .toArray()
+      .map((row) => row.name);
   }
 }
 
