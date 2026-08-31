@@ -1,10 +1,9 @@
-import { DurableObject } from "cloudflare:workers";
 import {
   Server,
   type Connection,
   type WSMessage,
 } from "partyserver";
-import { kind, union } from "../../src/index";
+import { DurableObject, kind, union } from "../../src/index";
 
 export interface Env {
   APP_DO: DurableObjectNamespace<AppDO>;

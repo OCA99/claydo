@@ -1,44 +1,60 @@
 # claydo
 
-One Durable Object class, many use cases.
+One Durable Object class, many isolated use cases.
 
-Register each use case as a **kind**. The library binds every Durable Object
-instance to one fixed kind, forever. You deploy one DO class, one binding, and
-one migration. You never touch migrations again when you add a kind.
+Register each use case as a **kind**. Claydo runs every kind instance in its
+own [Durable Object facet](https://developers.cloudflare.com/dynamic-workers/usage/durable-object-facets/):
+an isolated SQLite database supervised by one exported Durable Object class.
+You configure one binding and one migration, then add kinds in TypeScript.
 
 ```ts
-import { union, kinds } from "claydo";
+import { DurableObject, kinds, union } from "claydo";
 
-// One exported DO class hosts all kinds.
-export class AppDO extends union({
-  counter: Counter,
-  chat: ChatRoom,
-  billing: BillingAgent,
-}) {}
+class Counter extends DurableObject<Env> {
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    this.ctx.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS counter (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        value INTEGER NOT NULL
+      )`,
+    );
+  }
 
-// Typed access from your Worker.
-const app = kinds(env.APP_DO);
-await app.counter.get("user-42").increment(2);
+  increment(): number {
+    return this.ctx.storage.sql
+      .exec<{ value: number }>(
+        `INSERT INTO counter (id, value) VALUES (1, 1)
+         ON CONFLICT(id) DO UPDATE SET value = value + 1
+         RETURNING value`,
+      )
+      .one().value;
+  }
+}
+
+export class AppDO extends union({ counter: Counter }) {}
+
+const counter = kinds(env.APP_DO).counter.get("user-42");
+await counter.increment();
 ```
 
-## Why
+## Why facets
 
-Cloudflare recommends one DO class per use case. Each class needs a binding
-and a migration. An account has a limit of 500 Durable Object namespaces.
-Teams with many services and many use cases reach this limit.
+Claydo's supervisor and each kind facet have separate databases:
 
-This library inverts the pattern. One DO class is the **host**. Your use cases
-are plain classes. The host loads the correct class for each instance at
-runtime. This is safe because the kind of an instance never changes:
+- A kind owns its full SQL schema and KV keyspace. Library metadata never
+  appears in user storage.
+- `ctx.storage.deleteAll()` cannot erase kind identity. Claydo clears and
+  restarts the facet, so its constructor rebuilds the schema on the next call.
+- Equal table names and KV keys in different kinds never collide.
+- A kind can use SQL, KV, hibernating WebSockets, RPC, and alarms as it would
+  in a regular Durable Object.
+- Migration imports can fill or discard one target facet without touching the
+  supervisor or another kind.
 
-- Instance names carry the kind as a prefix: `counter:user-42`.
-- The host persists the kind in the instance storage on first contact.
-- A different kind can never attach to the same instance. The host rejects
-  mismatched access with an error that names the instance and both kinds.
-
-Because one instance always runs one kind, each kind owns the full SQLite
-database, alarms, and WebSockets of its instances. Kinds do not share
-instances, so they need no schema coordination and no cross-kind migrations.
+Facets currently do not implement native alarms. Claydo virtualizes the normal
+`this.ctx.storage.setAlarm()`, `getAlarm()`, and `deleteAlarm()` API through the
+supervisor's alarm. Kind code does not need a separate scheduler API.
 
 ## Install
 
@@ -46,26 +62,28 @@ instances, so they need no schema coordination and no cross-kind migrations.
 npm install claydo
 ```
 
+Use a current Workers compatibility date. Facets and `ctx.exports` must be
+available in the runtime; the examples use `2026-08-01`.
+
 ## Quickstart
 
-### 1. Write kinds as plain Durable Object classes
+### 1. Write kinds
 
-A kind is any class with a `(ctx, env)` constructor. Extend `DurableObject`
-to get `this.ctx` and `this.env`. (Typing tip for SQLite rows: the
-`sql.exec<T>()` generic requires `T extends Record<string, SqlStorageValue>`,
-so type rows with a dedicated query-row interface — or an inline shape as
-below — rather than reusing a domain interface that has optional or
-non-SQL fields.)
+Import `DurableObject` from **claydo**, not `cloudflare:workers`. It extends the
+platform class and supplies the supervisor-backed alarm API inside facets.
 
 ```ts
 // src/kinds.ts
-import { DurableObject } from "cloudflare:workers";
+import { DurableObject, instanceName, kinds } from "claydo";
 
 export class Counter extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    ctx.storage.sql.exec(
-      `CREATE TABLE IF NOT EXISTS counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL)`,
+    this.ctx.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS counters (
+        name TEXT PRIMARY KEY,
+        value INTEGER NOT NULL
+      )`,
     );
   }
 
@@ -79,45 +97,57 @@ export class Counter extends DurableObject<Env> {
       )
       .one().value;
   }
+
+  logicalName(): string | undefined {
+    return instanceName(this.ctx);
+  }
 }
 
-export class ChatRoom extends DurableObject<Env> {
-  async fetch(request: Request): Promise<Response> {
-    const pair = new WebSocketPair();
-    this.ctx.acceptWebSocket(pair[1]);
-    return new Response(null, { status: 101, webSocket: pair[0] });
-  }
-
-  webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): void {
-    for (const socket of this.ctx.getWebSockets()) socket.send(message);
+export class Cart extends DurableObject<Env> {
+  async checkout(productId: string, qty: number): Promise<void> {
+    await kinds(this.env.APP_DO).inventory.get(productId).reserve(qty);
   }
 }
 ```
 
-### 2. Export one host class
+Use `this.ctx`, especially for alarm calls. The raw constructor `ctx` is the
+platform facet state; claydo installs its alarm adapter on `this.ctx` after
+`super(ctx, env)`.
+
+Ordinary classes with a `(ctx, env)` constructor also work. Platform
+`DurableObject` and framework subclasses are adapted after construction, but
+they cannot schedule an alarm from their constructor because native facet
+alarms are not implemented. The claydo base class is the fully supported path.
+
+### 2. Export one host
 
 ```ts
-// src/index.ts
 import { union } from "claydo";
-import { Counter, ChatRoom } from "./kinds";
+import { Cart, Counter, Inventory } from "./kinds";
 
 export class AppDO extends union({
   counter: Counter,
-  chat: ChatRoom,
+  cart: Cart,
+  inventory: Inventory,
 }) {}
 ```
 
-`union()` validates the registry when the module loads: kind names must not
-contain `:` or start with `__`, and kind classes must not define methods named
-`id`, `name`, `kind`, or `stub` (the stub reserves those for metadata).
-Validation failures throw at startup, so `wrangler deploy` and local dev
-catch them before any traffic does.
+The exported subclass name is how the supervisor finds its own facet class in
+`ctx.exports`. If a build tool changes that name, set it explicitly:
+
+```ts
+export class AppDO extends union(kinds, { exportName: "AppDO" }) {}
+```
+
+Kind names are permanent identifiers. They must be non-empty, cannot contain
+`:`, and cannot start with `__`.
 
 ### 3. Configure one binding and one migration
 
 ```jsonc
-// wrangler.jsonc
 {
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "compatibility_date": "2026-08-01",
   "durable_objects": {
     "bindings": [{ "name": "APP_DO", "class_name": "AppDO" }]
   },
@@ -125,10 +155,10 @@ catch them before any traffic does.
 }
 ```
 
-This is the only migration you will ever write. New kinds are code changes,
-not migrations.
+Do not add kind classes to `new_sqlite_classes`. `AppDO` is both supervisor
+and the props-configured facet runtime; all facets use that one class export.
 
-### 4. Call kinds from your Worker
+### 4. Call kinds
 
 ```ts
 import { kinds } from "claydo";
@@ -136,218 +166,185 @@ import { kinds } from "claydo";
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const app = kinds(env.APP_DO);
-
-    // RPC, fully typed from the registry.
     const value = await app.counter.get("user-42").increment();
 
-    // fetch() and WebSockets forward to the kind implementation.
     if (request.headers.get("Upgrade") === "websocket") {
       return app.chat.get("lobby").fetch(request);
     }
-
     return Response.json({ value });
   },
 } satisfies ExportedHandler<Env>;
 ```
 
-TypeScript infers the kind names and the method signatures from the registry.
-`kinds(env.APP_DO)` only exposes registered kind names, and a typo produces a
-"Did you mean ...?" diagnostic. The stub only exposes the methods of the kind
-class, with awaited return types.
+Every stub call is async, including methods that are synchronous in the kind.
 
-`kind(env.APP_DO, "counter")` is the two-argument equivalent. Use it when the
-kind name is a runtime value; type that value with `KindNameOf`:
+## Identity and accessors
+
+`kinds(namespace)` returns one typed accessor per registered kind.
+`kind(namespace, kindName)` is the dynamic-name form.
+
+| Accessor | Result |
+| --- | --- |
+| `get(name)` | Named instance at parent DO name `<kind>:<name>`. |
+| `unique()` | New unique parent DO. The first call pins its kind. |
+| `fromId(id)` | Existing instance. Never initializes an untouched ID. |
+| `idFromName(name)` | ID used by `get(name)`. |
+
+Each kind stub exposes:
+
+- typed public methods from the kind;
+- `fetch(input, init?)`;
+- `id`, `name`, and `kind`;
+- `stub`, the raw **supervisor** Durable Object stub (for test helpers and
+  migration internals). User SQL/KV is in the child facet, not on this stub.
+
+`instanceName(this.ctx)` removes the `<kind>:` prefix. It returns `undefined`
+for unique IDs.
+
+Raw `getByName("room")` reaches a different parent than
+`kinds(env.APP_DO).chat.get("room")` (`chat:room`). Use the helpers.
+
+## Storage lifecycle
+
+Inside a claydo kind:
 
 ```ts
-import { kind, type KindNameOf } from "claydo";
-
-const name = pickKind() as KindNameOf<typeof env.APP_DO>;
-const accessor = kind(env.APP_DO, name);
+async clear(): Promise<void> {
+  await this.ctx.storage.deleteAll();
+}
 ```
 
-When the kind name is a union of several literals, the accessor's stub is a
-union too, and TypeScript only lets you call methods that exist on every
-member. Narrow the name (or pass a literal such as `"counter" as const`)
-before you call kind-specific methods.
+Claydo explicitly drops the facet's user tables and KV entries, clears the
+supervisor alarm, and restarts the facet after the method returns. The next
+call runs the kind constructor and sees a fresh schema. Kind identity remains
+in supervisor storage, including for unique-ID instances.
 
-### Calling kinds from inside a kind
+`resetStorage(this.ctx)` is an equivalent convenience helper.
 
-Kinds receive `env`, so cross-kind calls work the same inside a Durable
-Object as in a Worker. This is the pattern for coordination between use
-cases:
+Do not query dropped tables later in the **same** method after `deleteAll()`;
+the replacement facet starts after the current call returns.
+
+Calling `this.ctx.abort()` aborts only the facet. The in-flight call fails, but
+the public claydo stub still points to the stable supervisor and reaches a new
+facet on its next call.
+
+## Alarms
+
+Use the regular API:
 
 ```ts
-export class Cart extends DurableObject<Env> {
-  async checkout(): Promise<void> {
-    const inventory = kinds(this.env.APP_DO).inventory;
-    await inventory.get(productId).reserve(qty);
+async remindAt(timestamp: number): Promise<void> {
+  await this.ctx.storage.setAlarm(timestamp);
+}
+
+async alarm(info?: AlarmInvocationInfo): Promise<void> {
+  await this.ctx.storage.put("fired", info?.scheduledTime ?? Date.now());
+}
+```
+
+Claydo stores the alarm in the supervisor. When it fires, the supervisor sends
+a plain snapshot of `AlarmInvocationInfo` to the kind facet. A reschedule from
+inside `alarm()` uses the same API.
+
+This means one alarm per **kind instance**, as with regular Durable Objects.
+Different logical instances already have different supervisors.
+
+## WebSockets
+
+`fetch()` and hibernating WebSocket handlers are forwarded to the facet. The
+facet owns accepted sockets, so hibernation, tags, broadcasts, and framework
+helpers continue to work.
+
+```ts
+export class Echo extends DurableObject<Env> {
+  async fetch(request: Request): Promise<Response> {
+    const pair = new WebSocketPair();
+    this.ctx.acceptWebSocket(pair[1]);
+    return new Response(null, { status: 101, webSocket: pair[0] });
+  }
+
+  webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): void {
+    ws.send(message);
   }
 }
 ```
 
-## How the host resolves the kind
+## Errors and serialization
 
-The host resolves the kind of an instance from three sources, in this order:
+Thrown kind errors preserve name, message, stack, and structured-cloneable
+enumerable fields. The local stack includes:
 
-1. **Storage.** The host persists the kind on first contact. Storage is the
-   source of truth after that.
-2. **The name prefix.** `app.counter.get("user-42")` names the instance
-   `counter:user-42`. The host reads the prefix from `ctx.id.name`.
-3. **The call hint.** The client helper sends the kind with every RPC call
-   and with a `x-claydo-kind` header on every `fetch()`. The hint initializes
-   instances reached through `get()` and `unique()`. `fromId()` sends the
-   hint for validation only and **never initializes** an instance.
-
-If a caller expects one kind and the instance has another, the call fails
-with an error that names the instance and both kinds. An instance never
-changes its kind.
-
-## Identity
-
-- `get(name)` maps to the Durable Object name `<kind>:<name>`. Equal names
-  under different kinds map to different instances. Logical names may
-  themselves contain `:`; only the first segment routes, and only when it
-  matches a registered kind.
-- `unique()` creates a `newUniqueId()` instance. The first call pins the
-  kind. Store `stub.id.toString()` to reach it again with `fromId()`.
-- `fromId(id)` reaches an existing instance. It never initializes: if the
-  instance has no kind yet, calls fail and tell you to create the instance
-  with `get()` or `unique()` first. It is also the place kind mismatches
-  surface: `kind(ns, "order").fromId(productStub.id)` fails with an error
-  naming both kinds. (`get("same-name")` under two kinds is NOT a
-  mismatch — the names map to two different instances by design.)
-- `instanceName(this.ctx)` returns the logical name without the kind prefix,
-  from inside a kind implementation. It is safe everywhere in a kind,
-  including its constructor, because kinds construct lazily on first contact.
-  It returns `undefined` for unique-ID instances.
-- Do not mix helper access with raw namespace access. `getByName("room-1")`
-  reaches a *different* instance than `app.chat.get("room-1")` (which maps to
-  `chat:room-1`). If you fetch such an unprefixed instance, the host answers
-  400 with an explanation of this exact mistake.
-
-## Error propagation
-
-When a kind method throws, the stub rethrows an `Error` to the caller with:
-
-- the original `name` and `message`;
-- the original **stack**, pointing into your kind code, followed by a marker
-  line `at [remote call <kind>.<method>() via claydo]` and
-  the local frames;
-- all own enumerable fields of the error that survive structured clone
-  (for example `error.code` or `error.productId`).
-
-What does not survive: the prototype. `instanceof MyError` is `false` after
-the hop — match on `error.name` instead. Non-cloneable fields are dropped.
-For errors your callers must branch on, attach a stable discriminator field
-(for example `error.code = "RATE_LIMITED"`): fields survive the hop, and
-matching on `code` is sturdier than matching on message text. Under strict
-TypeScript the caught value is `unknown`, so narrow it with a real guard:
-
-```ts
-function errorCode(error: unknown): string | undefined {
-  return error instanceof Error && "code" in error
-    ? String((error as { code?: unknown }).code)
-    : undefined;
-}
-if (errorCode(error) === "RATE_LIMITED") { ... }
+```text
+at [remote call <kind>.<method>() via claydo]
 ```
 
-The library's own kind-mismatch error carries structured fields too:
-`code: "CLAYDO_KIND_MISMATCH"` plus `expectedKind` and `actualKind`.
+Custom prototypes do not cross RPC (`instanceof MyError` is false). Branch on
+a stable `error.code` field. Kind-mismatch errors use
+`CLAYDO_KIND_MISMATCH` with `expectedKind` and `actualKind`.
 
-Errors thrown in `alarm()` and `webSocket*` handlers have no caller to reach.
-The host logs them with `console.error`, including the kind and the instance
-identity, then rethrows so the runtime semantics (such as alarm retries) stay
-intact.
+Arguments and return values follow Workers RPC serialization. A value that
+cannot cross the facet→supervisor or supervisor→caller boundary fails with
+kind and method context.
 
-## Serialization rules
+Only methods are proxied. Add a getter **method** for public properties. Method
+overloads collapse to their final TypeScript overload on mapped stubs; expose
+a non-overloaded wrapper when needed.
 
-RPC arguments and return values travel over Workers RPC:
+## Third-party Durable Object frameworks
 
-- Structured-cloneable values work: plain objects, arrays, strings, numbers,
-  `Map`, `Set`, `Date`, `ArrayBuffer`, typed arrays.
-- Functions and `RpcTarget` instances become live RPC stubs (a Workers RPC
-  feature — be deliberate about returning them).
-- Custom class instances do **not** serialize. The call fails and the stub
-  wraps the failure with context:
-  `claydo: call to <kind>.<method>() failed: Could not serialize object ...`.
-  Return plain objects instead.
-
-## Storage lifecycle
-
-`ctx.storage.deleteAll()` inside a kind also deletes the kind marker the
-library persists. Named instances re-pin from the name prefix, but unique-ID
-instances become kind-less husks. Use the provided helper instead:
+PartyServer, Agents SDK, and Think classes can register directly:
 
 ```ts
-import { resetStorage } from "claydo";
+import { Think } from "@cloudflare/think";
+import { union } from "claydo";
 
-async destroy(): Promise<void> {
-  await resetStorage(this.ctx); // deleteAll, but the kind stays pinned
-  await this.ctx.storage.deleteAlarm();
+class Assistant extends Think {
+  getModel() {
+    return myModel(this.env);
+  }
+
+  ask(input: string) {
+    return this.runTurn({ input, mode: "wait" });
+  }
 }
+
+export class AppDO extends union({ assistant: Assistant }) {}
 ```
 
-Durable Object instances cannot be deleted, only emptied; any later access
-revives them. Design "delete" flows as `resetStorage()` plus removal of the
-id from wherever you track instances.
+Claydo calls `__unsafe_ensureInitialized()` before RPC-first access, so
+PartyServer/Agents state is ready without a warm-up fetch.
 
-`resetStorage()` (like the `deleteAll()` it wraps) also drops every SQLite
-table. The already-running instance stays in memory, so its constructor —
-where `CREATE TABLE IF NOT EXISTS` usually lives — does not run again, and
-the next query fails with `no such table`. Put schema setup in an idempotent
-method and call it from both places:
+Framework caveats:
 
-```ts
-#ensureSchema(): void {
-  this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS items (...)`);
-}
-
-constructor(ctx: DurableObjectState, env: Env) {
-  super(ctx, env);
-  this.#ensureSchema();
-}
-
-async destroy(): Promise<void> {
-  await resetStorage(this.ctx);
-  await this.ctx.storage.deleteAlarm();
-  this.#ensureSchema(); // the instance keeps serving after the wipe
-}
-```
+- Their constructors receive native facet state. Constructor-time alarm calls
+  need to move to `onStart()` or another method.
+- `this.name` is the full `<kind>:<name>`; use `instanceName(this.ctx)` for
+  the logical name.
+- `getServerByName()` and `getAgentByName()` omit the kind prefix and are not
+  supported. Use `kinds(env.APP_DO).<kind>.get(name)`.
+- `routePartykitRequest()` and `routeAgentRequest()` also assume one binding
+  per class. Route manually to the claydo accessor, or use a kind-prefixed
+  room name.
+- Think's overloaded `runTurn()` needs a non-overloaded RPC wrapper such as
+  `ask()` above.
 
 ## Migrating existing bindings
 
-`claydo/migrate` moves instances of an existing Durable Object binding into
-a kind, so you can delete the old binding and reclaim its namespace slot.
-There is no platform way to merge namespaces, so a migration is an
-application-level data copy plus a routing cutover — gradual, per instance,
-and reversible until cutover.
+`claydo/migrate` copies existing Durable Object instances into kind facets.
+There is no platform API that merges namespaces.
 
-Working example: `examples/migrate-app` is a complete transitional app
-(old bindings, host, driver endpoint, router, tests) — start there.
-
-### 1. Wrap the old class and redeploy the old Worker
+### 1. Wrap the old class
 
 ```ts
 import { exportable } from "claydo/migrate";
 
-class TallyImpl extends DurableObject<Env> { /* unchanged */ }
-export class Tally extends exportable(TallyImpl) {}
+class TallyImpl extends DurableObject<Env> { /* existing implementation */ }
+export class OldTally extends exportable(TallyImpl) {}
 ```
 
-Behavior is unchanged until an instance is sealed. The wrapper does not
-rewrite the class's methods or prototype chain (framework base classes such
-as the Agents SDK inspect both); instead it guards `ctx.storage`. While
-sealed: every storage read and write fails with a "sealed" error, `fetch()`
-answers 410 (even when the class never defined a `fetch()`), alarms defer,
-and WebSocket handlers go quiet. The guards are synchronous, so sync
-methods, internal self-calls, and framework helpers keep working while
-unsealed. One caveat: storage references captured inside the wrapped
-class's own constructor (for example `this.db = ctx.storage.sql`) reach the
-real storage — the seal covers `this.ctx.storage` access after
-construction, which is the normal pattern.
+The old binding continues to serve until an instance is sealed.
 
-### 2. Enable imports on the host
+### 2. Enable target imports
 
 ```ts
 export class AppDO extends union(
@@ -356,562 +353,85 @@ export class AppDO extends union(
 ) {}
 ```
 
-The old class usually becomes the kind implementation as-is.
-
-During the transition, wrangler carries BOTH Durable Object classes, and
-the Worker entry must export both:
+During transition, wrangler carries both classes:
 
 ```jsonc
-// wrangler.jsonc (transitional)
 {
   "durable_objects": {
     "bindings": [
-      { "name": "OLD_TALLY", "class_name": "Tally" },
+      { "name": "OLD_TALLY", "class_name": "OldTally" },
       { "name": "APP_DO", "class_name": "AppDO" }
     ]
   },
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["Tally", "AppDO"] }
+    { "tag": "v1", "new_sqlite_classes": ["OldTally", "AppDO"] }
   ]
 }
 ```
 
-```ts
-// index.ts — wrangler resolves class_name against the entry's exports
-export { Tally, AppDO };
-export default { fetch: ... };
-```
-
-### 3. Move instances
-
-Bulk, from a Worker, cron, or Workflow — you supply the instance names (from
-your own registry; Cloudflare cannot list a namespace's names — a small SQL
-or KV table of names, maintained where you create instances, is enough):
+### 3. Preview and move
 
 ```ts
 import { migrateInstance, previewInstance } from "claydo/migrate";
 
-// Optional dry run: sizes, alarm, seal state, and blockers. Changes nothing.
-const preview = await previewInstance({ from: env.OLD_TALLY.getByName(name) });
-// preview: { sealed, movedTo?, hasData, kv, rows, alarm, blockers }
-// kv is a count; rows is a per-table map ({ counts: 12, events: 3 });
-// blockers is a list of human-readable problem descriptions.
+const from = env.OLD_TALLY.getByName(name);
+const preview = await previewInstance({ from });
 
 const summary = await migrateInstance({
-  from: env.OLD_TALLY.getByName(name),
+  from,
   to: kinds(env.APP_DO).tally,
   name,
-  onProgress: (p) => console.log(`chunk ${p.chunk} (seq ${p.seq})`, p.applied),
+  onProgress: ({ phase, chunk, applied }) =>
+    console.log({ phase, chunk, applied }),
 });
-// summary: { skipped, reason?, resumed, chunks, kv, rows, alarm }
 ```
 
-A skipped run's `reason` is one of: `"already migrated"`, `"old instance
-has no data (pass allowEmpty to migrate schema-only instances)"`, `"old
-instance is empty and the target is live"`, or `"completed by a concurrent
-driver"`.
+Migration ordering:
 
-A minimal admin driver, wired end to end:
+1. Reserve the supervisor; target traffic gets 503.
+2. Seal the old instance.
+3. Stream SQL and KV chunks into an isolated target facet.
+4. Rebuild indexes/FTS5, restore AUTOINCREMENT sequences, verify totals.
+5. Pin the target kind in supervisor storage and transfer the alarm.
+6. Record `<kind>:<name>` on the old instance.
+
+On failure, claydo deletes only the partial target facet and unseals the old
+instance. No user tables or partial rows can pollute supervisor metadata.
+
+The copy supports rowids, generated columns (recomputed), indexes, triggers,
+views, AUTOINCREMENT sequences, ordinary and external-content FTS5, KV, and
+alarms. It rejects `WITHOUT ROWID`, non-FTS virtual tables, contentless FTS5,
+and rowid-shadowing columns before sealing.
+
+### Transitional routing
 
 ```ts
-if (url.pathname.startsWith("/admin/preview/")) {
-  const name = url.pathname.split("/")[3]!;
-  return Response.json(
-    await previewInstance({ from: env.OLD_TALLY.getByName(name) }),
-  );
-}
-if (url.pathname.startsWith("/admin/migrate/")) {
-  const name = url.pathname.split("/")[3]!;
-  const summary = await migrateInstance({
-    from: env.OLD_TALLY.getByName(name),
-    to: kinds(env.APP_DO).tally,
-    name,
-    onProgress: (p) =>
-      console.log(`[migrate ${name}] ${p.phase} chunk ${p.chunk}`, p.applied),
-  });
-  return Response.json(summary);
-}
+const tally = migrated(env.OLD_TALLY, kinds(env.APP_DO).tally, {
+  strategy: "lazy", // or "manual" / "drain"
+});
 ```
 
-`onProgress` cadence: KV pages first (`phase: "kv"`), then row pages per
-table (`"rows"`), then one closing `"final"` chunk that replays post-DDL
-and verifies totals (it usually adds no rows). `applied` is the target's
-CUMULATIVE totals, not a per-chunk delta — compute deltas yourself for
-progress bars.
+- `lazy`: migrate an old instance on first touch.
+- `manual`: route old until an external driver moves it.
+- `drain`: never migrate existing data; new names use the kind.
+- `resolve(name)`: read-only `"old" | "new"` routing probe.
 
-The importer replays data as-is; it does not validate that the destination
-kind's class understands the imported schema. Registering the old class as
-the kind (as above) guarantees compatibility. Mapping data into a different
-kind is your responsibility.
+Create one facade per kind at module scope so its route cache survives requests.
+Route all traffic through it during transition.
 
-Or lazily, on first touch, through the transitional router:
+### Recovery
 
-```ts
-import { migrated, type MigratedAccessor } from "claydo/migrate";
+`wipeTarget(accessor, name)` deletes the target facet plus supervisor import
+metadata and alarm. It cannot touch another kind's database.
 
-let tally: MigratedAccessor<TallyImpl> | undefined;
+A completed migration can be rolled back before cutover: stop traffic, unseal
+the old instance, wipe the target, then restart Workers holding cached
+`migrated()` facades. Reconcile any writes accepted on the new side first.
 
-export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    // Create the facade ONCE per isolate: its route cache lives on the
-    // object, so a facade built per request caches nothing.
-    tally ??= migrated(env.OLD_TALLY, kinds(env.APP_DO).tally, {
-      strategy: "lazy",
-    });
-    await tally.get("user-42").bump(); // migrates on first touch, serves new
-    // ...
-  },
-};
-```
-
-Router strategies: `lazy` migrates inline on first touch (fleets of small
-instances); `manual` routes to the old instance until an external driver
-migrates it; `drain` never migrates — old instances stay old until their
-data expires, new names go to the kind.
-
-The router notices migrations quickly: RPC calls and `fetch()` requests
-(including WebSocket upgrades) that hit a freshly sealed old instance
-re-resolve the route once and retry on the new side, concurrent lazy first
-touches migrate exactly once, and when another worker is migrating an
-instance the facade waits briefly for it to finish instead of failing.
-
-Route decisions cache per facade: "new" decisions are final, "old"
-decisions expire after `oldRouteTtlMs` (default 30000 ms) so external
-migrations are noticed. Each cache miss costs a few extra RPC round trips,
-so avoid very low TTL values on hot paths. Requests that reach a target
-mid-import receive 503 with a `Retry-After` header.
-
-What the facade does and does not give you:
-
-- It exposes `get(name)` and `resolve(name)` only. `unique()` and
-  `fromId()` have no migration story (old `newUniqueId()` instances cannot
-  keep their IDs across namespaces — give them names, for example
-  `migrated:<oldId>`), and `idFromName()` would leak the new side's ID
-  while the old side may still be authoritative.
-- The stubs' `id` and `kind` metadata always describe the NEW side, even
-  while the old instance still serves the traffic. For observability
-  during the window, ask `await facade.resolve(name)` — it returns
-  `"new"` or `"old"`, is read-only under EVERY strategy (a `resolve()`
-  sweep over your fleet registry never migrates anything, unlike `get()`
-  under `lazy`), and does not touch the route cache.
-- Migrating several old bindings at once? Create one facade per kind pair
-  (`migrated()` maps exactly one old namespace to one kind) and keep each
-  in its own module-scope singleton.
-- Route ALL traffic for migrating names through the facade. One forgotten
-  route, debug script, or cross-kind call that touches the plain accessor
-  mid-migration initializes the target and the driver refuses with a
-  "both the old instance ... and the new instance ... are live" error.
-  The full message offers both remediations: `wipeTarget()` when the new
-  side holds no real data (then re-run), or sealing the old side with
-  `__claydoSeal()` when the new side is the source of truth (the old data
-  will NOT be copied).
-
-### 4. Cut over and reclaim the slot
-
-When the old namespace is empty, replace `migrated()` with the plain
-accessor and ship a `deleted_classes` migration for the old class. That
-deletes the old namespace — the goal of the exercise.
-
-### What moves, and the guarantees
-
-The copy includes SQLite tables (with rowids, rowid-alias primary keys in
-any column position, indexes, triggers, views, and AUTOINCREMENT
-sequences), FTS5 full-text tables (self-contained ones copy row by row;
-external-content ones are recreated and rebuilt on the target after their
-content table arrives), KV entries (all user keys, including keys that
-start with `__claydo` — only the library's three exact reserved keys stay
-behind), and the pending alarm. Generated columns (`STORED` and `VIRTUAL`)
-are excluded from the copy and recompute on the target. FTS5 shadow tables
-are never copied; the index rebuilds from the real data (a rebuilt index
-can be more compact than the original — compare the real tables, not the
-shadows, when verifying byte-level fidelity). PartyServer-based classes
-overwrite their own stored instance name (`__ps_name`) with the prefixed
-name on first contact after the move; everything else copies verbatim.
-
-The order is strict and race-proof:
-
-1. **Reserve the target.** From this moment, traffic to the target blocks
-   with a clear "importing" error instead of initializing an empty
-   instance. Exactly one driver owns the reservation; concurrent drivers
-   fail fast without touching anything, and a crashed driver's reservation
-   goes stale after ~30 seconds so the next run adopts and resumes it.
-2. **Seal the old instance.** Writes freeze, `fetch()` answers 410 with the
-   `x-claydo-sealed` header, open hibernatable WebSockets close with code
-   1012 so clients reconnect, and alarms that come due are deferred — not
-   lost — until the migration completes.
-3. **Stream, verify, go live.** Chunks apply idempotently; totals are
-   verified; the kind pins only after the final chunk.
-4. **Record the move.** The old instance remembers where it moved (as the
-   target's `<kind>:<name>` reference — sealed errors and previews report
-   something you can paste into `kinds(ns).<kind>.get(name)`) and deletes
-   its alarm. Only now does a re-run report `{ skipped: true }`.
-
-Concurrent drivers on the same instance: the loser of the reservation race
-gets a thrown error (`claydo: another migration driver owns the import on
-instance '<kind>:<name>' (last progress Nms ago). It is not stale yet;
-retry later.`) — expect it in bulk runners and retry that name later.
-
-After a successful migration the OLD instance still holds its full data
-copy (only sealed); the old namespace keeps billing for that storage until
-you ship the `deleted_classes` migration at cutover.
-
-On failure, the partial import is discarded and the old instance is
-unsealed — unless another driver owns the migration, in which case nothing
-is touched. Instances with no rows and no KV entries are skipped without
-sealing anything (pass `allowEmpty: true` to migrate schema-only
-instances), so stale registry entries cannot fabricate sealed husks. One
-exception: classes whose constructor writes rows on first contact —
-Agents SDK classes write a `cf_agents_state` row — are never "empty" once
-probed, so this skip cannot protect them; keep the name registry
-authoritative for such classes (see the framework section).
-
-Recovery: if traffic reached the target before the migration ever ran, the
-target is "polluted" and the driver refuses with a both-live error. Wipe
-the polluted target with `wipeTarget(accessor, name)` and re-run — it
-clears storage, alarms, import state, and the in-memory kind pin.
-
-Limits (each fails pre-flight with a clear error, before anything is
-sealed; `previewInstance` reports them under `blockers`):
-
-- `WITHOUT ROWID` tables.
-- Virtual tables other than FTS5, and contentless FTS5 (`content=''`).
-- Tables with a column named `rowid`, `_rowid_`, `oid`, or `__rowid__`
-  (they shadow the rowid the exporter pages by).
-
-Live WebSocket connections do not move — sealing closes them with code
-1012 and reason `claydo: instance migrating; reconnect`; clients should
-watch for that close and re-issue the same request through the router,
-which serves the new side. Old `newUniqueId()` instances cannot keep their
-IDs; give them names (for example `migrated:<oldId>`).
-
-Operational notes:
-
-- If a driver crashes between the final chunk and the move marker, the old
-  instance stays sealed with its alarm deferring every 60 seconds (with a
-  `console.warn`) until any re-run of `migrateInstance` records the
-  marker — re-runs are always safe, so retry after crashes.
-- Methods that touch no storage still answer on a sealed instance (the
-  seal freezes the data, not the event loop); the router's retry logic
-  keys off storage access and `fetch()`. Beware storage-free heartbeats:
-  a `ping()` that never reads storage keeps answering from a sealed old
-  instance until the route TTL expires. Make keepalives read something,
-  or accept up to `oldRouteTtlMs` of routing lag for them.
-- Expect some benign exception noise in logs, concentrated on specific
-  paths: `lazy` first-touch migrations are quiet, but a `manual`/`drain`
-  facade holding a cached "old" route logs one sealed-error exception per
-  instance when its retry lands (the call still succeeds), and framework
-  background bookkeeping (the Agents SDK's alarm scheduler) logs
-  sealed-storage errors until cutover. None of this indicates data loss;
-  the migration outcome is what the `MigrationSummary` says.
-
-### Auditing a fleet
-
-`resolve()` answers "where would traffic go", which is not the same as
-"was this migrated": names that never existed (typos, stale registry
-rows) resolve `"new"` because an empty old side routes to the kind. For a
-cutover audit, discriminate with the migration markers, which live on the
-raw stubs (the claydo stub does not proxy `__`-prefixed methods):
-
-```ts
-for (const name of registry) {
-  const seal = await env.OLD_TALLY.getByName(name).__claydoSealed();
-  // On the host, use the PREFIXED name — getByName(name) without the
-  // prefix reaches a different instance.
-  const status = await env.APP_DO
-    .getByName(`tally:${name}`)
-    .__claydoImportStatus();
-  const state = seal.movedTo !== undefined && status.kind !== undefined
-    ? "migrated"
-    : (await previewInstance({ from: env.OLD_TALLY.getByName(name) })).hasData
-      ? "pending"
-      : "absent";
-}
-```
-
-### Rolling back
-
-Until cutover, a completed migration can be reversed, but treat it as an
-exceptional operation, not a routine one — prefer forward-only:
-
-1. Stop traffic to the name (the facade must not serve during the swap).
-2. `__claydoUnseal()` the old instance (its data copy is still complete).
-3. `wipeTarget(accessor, name)` to clear the new side.
-4. Redeploy (or restart) the Workers that hold `migrated()` facades: a
-   facade caches "new" decisions for the isolate's lifetime, and a stale
-   "new" route would serve the freshly wiped, EMPTY target — repolluting
-   it on first touch and then failing every request with the both-live
-   error until you wipe again.
-
-Anything written to the new side after the migration is lost by the wipe;
-reconcile first if the new side took writes.
-
-### Secrets across Workers
-
-When the old class lives in another Worker, the same secret must be set in
-three places — on the wrapper, on the host, and in every driver call. The
-wrapper and the host take the secret at module load, before any request
-`env` exists — import the module-scope `env` from `cloudflare:workers`:
-
-```ts
-import { env } from "cloudflare:workers";
-
-// Old Worker
-export class Tally extends exportable(TallyImpl, {
-  secret: env.MIGRATION_SECRET,
-}) {}
-
-// New Worker
-export class AppDO extends union(
-  { tally: TallyImpl },
-  { importable: ["tally"], secret: env.MIGRATION_SECRET },
-) {}
-
-// Driver (and migrated() options): the fetch-handler env works here too.
-await migrateInstance({ from, to, name, secret: env.MIGRATION_SECRET });
-```
-
-A mismatch fails with a message that names the side that rejected
-(`exportable() wrapper` or `union() options`).
-
-### Migrating framework classes (Agents SDK, Think, PartyServer)
-
-`exportable()` wraps framework classes too — it does not touch the
-prototype chain their internals inspect, and constructors that call their
-own methods work. Framework-specific notes:
-
-- The host initializes framework kinds on first contact (see the
-  third-party section), so migrated agents answer RPC immediately — no
-  warm-up `fetch()` needed. The OLD binding has no such helper: RPC-first
-  access to a cold Agents SDK instance fails inside the framework
-  (`Cannot read properties of undefined (reading 'appendMessage')`)
-  because `onStart` only runs from `fetch()`. Seed and spot-check old
-  instances through `fetch()`, or add a warm-up fetch before old-side RPC.
-  The migration driver itself is unaffected.
-- Think creates a self-contained FTS5 conversation-search table; it
-  migrates with searchability intact.
-- Framework constructors write bookkeeping rows on first contact (the
-  Agents SDK writes `cf_agents_state`), which has two consequences. The
-  empty-instance skip never applies — every probed instance has data — so
-  a stale registry name migrates a husk instead of being skipped. And
-  `previewInstance`, though it writes nothing itself, constructs the
-  instance it probes, so a preview sweep materializes previously
-  nonexistent names. Keep the name registry authoritative about which
-  instances really exist.
-- The Agents SDK's `getAgentByName()` and `routeAgentRequest()` need the
-  same workarounds after migration as for any kind (see the third-party
-  section).
-
-Think, end to end — the complete path stitches three sections together:
-
-1. Kind setup: the Think snippet in "Cloudflare Agents SDK and Think"
-   (`ask()` shim, `nodejs_compat`, routing rules).
-2. Old side: wrap the standalone Think class with `exportable()`; seed and
-   spot-check old instances through `fetch()` (old-side RPC needs the
-   warm-up above).
-3. Move: `previewInstance` → `migrateInstance` (or the lazy router). The
-   conversation transcript, FTS5 search, alarms, and scheduled state all
-   move; the migrated kind answers RPC turns immediately.
-4. Testing: the Testing section's vitest setup, plus small helper methods
-   on your subclass (a `transcript()` reading `getMessages()`, a search
-   wrapper over `session.search()`) so tests can verify state through the
-   stub.
-
-### API: `claydo/migrate`
-
-| Export | Purpose |
-| --- | --- |
-| `exportable(Base, { secret? })` | Wraps the old class with seal + export support. |
-| `previewInstance({ from, secret? })` | Dry run: sizes, alarm, seal state, blockers. Writes nothing — but contacting an instance constructs it, and framework constructors write their own rows. |
-| `migrateInstance({ from, to, name, secret?, allowEmpty?, maxRowsPerChunk?, maxBytesPerChunk?, onProgress? })` | Moves one instance; returns a `MigrationSummary`. |
-| `migrated(oldNamespace, accessor, { strategy, secret?, oldRouteTtlMs? })` | Transitional router facade: `get(name)` routes (and under `lazy`, migrates); `resolve(name)` is a read-only probe under every strategy. |
-| `wipeTarget(accessor, name, secret?)` | Destructive recovery for polluted targets. |
-
-`union(kinds, options)` accepts `{ importable: true | string[] }` to allow
-imports and `{ secret }` for cross-Worker auth.
-
-## Third-party Durable Object libraries
-
-A kind is any class with a `(ctx, env)` constructor. Durable Object framework
-classes match this shape. Register them directly:
-
-```ts
-import { Server, type Connection, type WSMessage } from "partyserver";
-import { union, kinds } from "claydo";
-
-class GameRoom extends Server<Env> {
-  onMessage(connection: Connection, message: WSMessage): void {
-    this.broadcast(message);
-  }
-}
-
-export class AppDO extends union({
-  counter: Counter,
-  game: GameRoom, // PartyServer, injected as a kind
-}) {}
-
-// In the Worker:
-return kinds(env.APP_DO).game.get("match-1").fetch(request);
-```
-
-What works, and what to know (verified against `partyserver@0.5`):
-
-- `Server` lifecycle hooks, broadcast, hibernation, and `onAlarm` work. The
-  integration test suite runs a real `Server` as a kind.
-- `this.name` inside the `Server` is the full instance name, including the
-  kind prefix (for example `game:match-1`), because PartyServer reads
-  `ctx.id.name`. Use `instanceName(this.ctx)` when you need the logical name.
-- The host runs the framework's startup hook automatically. PartyServer and
-  the Agents SDK initialize themselves (`onStart`) from `fetch()` or their
-  own routing helpers; claydo calls the same hook
-  (`__unsafe_ensureInitialized`) when it constructs the kind, so RPC-first
-  access works without a warm-up `fetch()`.
-- `getServerByName()` is **not supported**: it addresses instances without
-  the kind prefix and drives them through a `setName` RPC. The host rejects
-  the call with an error that points you to the replacement:
-  `kinds(env.APP_DO).game.get(name)` — it serves the same purpose.
-- `routePartykitRequest()` routes by URL to a binding and passes the room
-  name without a kind prefix, so it reaches unprefixed instances. Route
-  manually instead:
-
-```ts
-// PartyKit-style URLs: /parties/:party/:room
-const match = /^\/parties\/([^/]+)\/([^/]+)$/.exec(url.pathname);
-if (match) {
-  return kinds(env.APP_DO).game.get(match[2]).fetch(request);
-}
-```
-
-### Cloudflare Agents SDK and Think
-
-Agents SDK classes (`Agent` from `agents`, `Think` from `@cloudflare/think`)
-are Durable Objects built on PartyServer, and they register as kinds the same
-way. Everything above applies, plus:
-
-- Add `"compatibility_flags": ["nodejs_compat"]` to wrangler — the Agents
-  SDK requires it.
-- Drive the agent through the claydo stub: RPC methods such as `runTurn()`
-  work directly on a cold instance (the host runs the agent's startup hook
-  first, so the session exists). `fetch()` through the stub reaches the
-  agent's own router.
-- A minimal Think kind, wrapper included:
-
-```ts
-import { Think } from "@cloudflare/think";
-
-class Assistant extends Think {
-  getModel() { return myModel(this.env); }
-  // The typed stub keeps only the LAST overload of an overloaded method
-  // (a TypeScript mapped-type limit), so runTurn's "wait" mode fails to
-  // type-check remotely. The runtime accepts every mode — this wrapper is
-  // a TypeScript shim, not a runtime requirement.
-  ask(input: string) {
-    return this.runTurn({ input, mode: "wait" });
-  }
-}
-
-export class AppDO extends union({ assistant: Assistant, ...others }) {}
-// kinds(env.APP_DO).assistant.get("alice").ask("hello")
-```
-
-- Do NOT copy the routing setup from the Think quickstart. Its
-  `routeAgentRequest()` URLs (`/agents/<agent-class>/<name>`) fail against
-  a claydo host with PartyServer's error `...does not match any server
-  namespace. Did you forget to add a durable object binding to the class
-  Assistant...` — adding that binding is exactly what claydo avoids, so do
-  not follow that suggestion. Either route manually (parse
-  `/agents/:agent/:name` and call
-  `kinds(env.APP_DO).<kind>.get(name).fetch(request)`), or keep
-  `routeAgentRequest()` and put your claydo binding plus a kind-prefixed
-  room name in the URL: `/agents/app-do/assistant:alice` reaches the
-  `assistant` kind instance `alice`. Client helpers such as `useAgent`
-  follow the same URL contract.
-- `getAgentByName()` is `getServerByName()` and fails the same way, with
-  the same redirect to `kinds(ns).<kind>.get(name)`. Its parameter type
-  also expects an `Agent` namespace, so the call only compiles against a
-  claydo host with a cast (`getAgentByName(env.APP_DO as never, name)`) —
-  another sign to use the kind helper instead.
-- Inside the agent, `this.name` is the prefixed instance name
-  (`assistant:alice`). Use `instanceName(this.ctx)` for the logical name.
-
-## API
-
-### `union(kinds)`
-
-Creates the host Durable Object class. `kinds` maps kind names to classes.
-Export the returned class and point your binding and migration at it.
-Validates kind names and reserved method names at module load.
-
-### `kinds(namespace)` / `kind(namespace, kindName)`
-
-`kinds()` returns one typed accessor per registered kind, as properties.
-`kind()` returns a single accessor; use it with runtime kind names typed as
-`KindNameOf<typeof namespace>`. Each accessor:
-
-| Method | Description |
-| --- | --- |
-| `get(name, options?)` | Stub for the named instance (`<kind>:<name>`). Initializes on first contact. |
-| `unique(options?)` | Stub for a new `newUniqueId()` instance. Initializes on first call. |
-| `fromId(id)` | Stub from a stored ID string or `DurableObjectId`. Never initializes. |
-| `idFromName(name)` | The `DurableObjectId` that `get(name)` resolves to. |
-
-Each stub exposes the public methods of the kind class as async functions,
-plus:
-
-| Property | Description |
-| --- | --- |
-| `fetch(input, init?)` | Sends a request to the kind's `fetch()` handler. |
-| `id` | The `DurableObjectId`. |
-| `name` | The logical name, when created with `get(name)`; otherwise `undefined`. |
-| `kind` | The kind name. |
-| `stub` | The raw `DurableObjectStub`, as an escape hatch (tests, `runDurableObjectAlarm`). |
-
-### `instanceName(ctx)`
-
-Returns the logical instance name without the `<kind>:` prefix, or
-`undefined` for unique-ID instances. Safe anywhere in a kind, including the
-constructor.
-
-### `resetStorage(ctx)`
-
-`deleteAll()` that re-pins the kind marker. Use it instead of a raw
-`ctx.storage.deleteAll()` inside kinds.
-
-### Forwarded handlers
-
-The host forwards these handlers to the kind implementation when the kind
-defines them: `fetch`, `alarm`, `webSocketMessage`, `webSocketClose`,
-`webSocketError`. Hibernated WebSockets and alarms wake the correct kind,
-because the host reads the persisted kind from storage.
-
-## Rules and limits
-
-- **RPC covers methods only.** The stub does not proxy property access.
-  Calling a plain property through the stub fails with a message that names
-  the property and its type; add a getter method instead.
-- **Overloads collapse.** The typed stub maps each method to a single
-  signature; TypeScript mapped types keep only the last overload. Wrap
-  overloaded methods you call remotely in a non-overloaded method.
-- **Reserved names.** Kind classes must not define methods named `id`,
-  `name`, `kind`, or `stub` — `union()` rejects them at startup. Getters with
-  those names are fine. Method names starting with `__` are not callable
-  through the stub.
-- **One namespace, one billing and metrics bucket.** All kinds share the DO
-  namespace, so per-kind analytics need your own labels.
-- **Kind renames are breaking.** The kind name is part of the instance name
-  and of the persisted state. Renamed kinds fail loudly for initialized
-  instances (`unknown kind`) but `get(name)` under the new name reaches
-  fresh, empty instances. Treat kind names as permanent identifiers.
-- **Always go through the helpers.** Raw namespace access without the
-  `<kind>:` prefix reaches different instances (see Identity).
+For fleets, keep your own authoritative instance-name registry. Cloudflare
+cannot list names in a namespace.
 
 ## Testing
-
-Tests run inside the Workers runtime with
-[`@cloudflare/vitest-pool-workers`](https://developers.cloudflare.com/workers/testing/vitest-integration/).
-Complete setup for your own app (with `@cloudflare/vitest-pool-workers@0.22`
-and `vitest@4` — note that the older `defineWorkersConfig` import from
-`@cloudflare/vitest-pool-workers/config` no longer exists; the current API
-is a Vite plugin):
 
 ```ts
 // vitest.config.ts
@@ -919,12 +439,14 @@ import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
-  plugins: [cloudflareTest({ wrangler: { configPath: "./wrangler.jsonc" } })],
+  plugins: [
+    cloudflareTest({ wrangler: { configPath: "./wrangler.jsonc" } }),
+  ],
 });
 ```
 
 ```ts
-// test/env.d.ts — makes `env` from "cloudflare:test" carry your bindings
+// test/env.d.ts
 import type { Env as WorkerEnv } from "../src/index";
 
 declare global {
@@ -932,82 +454,85 @@ declare global {
     interface Env extends WorkerEnv {}
   }
 }
-
 export {};
 ```
 
 ```jsonc
-// tsconfig.json — a complete, tested configuration
 {
   "compilerOptions": {
     "target": "ESNext",
     "module": "ESNext",
-    "moduleResolution": "bundler",
+    "moduleResolution": "Bundler",
     "lib": ["ESNext"],
     "strict": true,
     "noEmit": true,
-    // Workers type packages ship overlapping globals; without this,
-    // `tsc` may report TS6200 identifier conflicts from node_modules.
     "skipLibCheck": true,
     "types": [
-      "@cloudflare/workers-types",
-      // The `/types` subpath declares the "cloudflare:test" module; the
-      // bare package name only types the Vite plugin and leaves
-      // `tsc --noEmit` failing with TS2307 on "cloudflare:test".
+      "@cloudflare/workers-types/experimental",
       "@cloudflare/vitest-pool-workers/types"
     ]
-  },
-  "include": ["src", "test"]
+  }
 }
 ```
 
-```ts
-// test/app.test.ts
-import { env } from "cloudflare:test";
-import { expect, it } from "vitest";
-import { kinds } from "claydo";
+Useful helpers:
 
-it("increments", async () => {
-  const counter = kinds(env.APP_DO).counter.get("t1");
-  expect(await counter.increment()).toBe(1);
-});
-```
+- `runDurableObjectAlarm(stub.stub)` runs the **supervisor** alarm, which
+  forwards to the facet.
+- `runInDurableObject(stub.stub, ...)` inspects supervisor metadata, not user
+  SQL/KV. Add test-only methods to the kind when you need facet data.
+- Isolated test storage is per test file. Use unique instance names.
 
-Tips that apply to your own tests:
+Repository verification: `npm run test:all` type-checks the library and all
+twelve examples, runs every Workers-runtime suite, and builds both package
+entry points.
 
-- Every call through a stub is async, even when the kind method is
-  synchronous. Always `await`; using an unawaited call as a value fails
-  with `DataCloneError: Could not serialize object of type "RpcPromise"`.
-- `runDurableObjectAlarm` and `runInDurableObject` from `cloudflare:test`
-  expect a raw `DurableObjectStub`. Pass `stub.stub` (the escape hatch) or a
-  raw `env.APP_DO.get(...)` stub. Schedule test alarms in the future: an
-  already-due alarm may fire on its own before the helper runs, making the
-  helper return `false` even though the alarm work happened.
-- vitest's default reporter can swallow `console.log` output from Workers
-  and tests. Run with `--reporter=verbose` when you need to see driver or
-  kind logs.
-- The claydo stub proxies your kind's methods only. Introspection such as
-  `stub.storage` or `stub.getAlarm()` is not RPC-reachable — use
-  `runInDurableObject(stub.stub, ...)` or add a helper method to the kind.
-- `SELF.fetch()` from `cloudflare:test` drives your Worker's routes
-  end-to-end, claydo helpers included.
-- Isolated storage is per test **file**; tests within one file share DO
-  state. Give each test its own instance-name prefix (`t1-room`,
-  `t2-room`, ...) — reused names carry state between tests.
-- Expected rejections from Durable Object methods (sealed instances, wrong
-  secrets, and similar) may additionally print as `uncaught exception`
-  lines in vitest-pool-workers output even when your test catches them.
-  The tests still pass; the lines are harness noise.
+## API
 
-For the library's own suites: `npm test` (library) and
-`npm run test:examples` (the example apps under `examples/`).
+### `claydo`
 
-The `examples/` folder contains twelve complete applications: eight kind
-apps (chat rooms with rate limiting, collaborative documents, an alarm
-scheduler, instance management, a Lunora-style live table, a token-bucket
-rate limiter, a game lobby, and a shop with cross-kind checkout) and four
-migration apps (`migrate-app`, `migrate-fleet`, `migrate-lazy`,
-`migrate-gnarly`), each with tests and a DX audit report.
+| Export | Purpose |
+| --- | --- |
+| `DurableObject` | Recommended kind base; adapts facet alarms. |
+| `union(kinds, options?)` | Builds the supervisor/facet runtime class. |
+| `kinds(namespace)` / `kind(namespace, name)` | Typed kind accessors. |
+| `instanceName(ctx)` | Logical name without kind prefix. |
+| `resetStorage(ctx)` | Clears user storage; supervisor keeps identity and restarts the facet. |
+
+`union` options: `exportName`, `importable`, and migration `secret`.
+
+### `claydo/migrate`
+
+| Export | Purpose |
+| --- | --- |
+| `exportable(Base, options?)` | Adds seal/export support to an old class. |
+| `previewInstance(options)` | Read-only row/KV/alarm/blocker report. |
+| `migrateInstance(options)` | Moves one instance with optional progress. |
+| `migrated(old, accessor, options)` | Transitional routing facade. |
+| `wipeTarget(accessor, name, secret?)` | Deletes a polluted target facet. |
+
+## Examples
+
+`examples/` contains twelve tested applications:
+
+- `alarm-scheduler`, `chat-rooms`, `collab-doc`, `counter-fleet`,
+  `game-lobby`, `live-table`, `rate-limiter`, and `shop`;
+- `migrate-app`, `migrate-fleet`, `migrate-gnarly`, and `migrate-lazy`.
+
+Every kind example imports `DurableObject` from claydo and runs in facets.
+Every folder includes Workers-runtime tests and a DX report.
+
+## Current platform notes
+
+- Facets are available in current workerd, Wrangler, and
+  `@cloudflare/vitest-pool-workers`.
+- Native facet alarms currently throw "alarms are not yet implemented";
+  claydo's supervisor bridge is intentional and tested.
+- Native facet `storage.deleteAll()` currently triggers a workerd internal
+  assertion. Claydo intercepts it and explicitly drops user schema/KV before
+  restarting the facet.
+- `ctx.exports` is enabled by default on current compatibility dates. Do not
+  add the obsolete `enable_ctx_exports` flag.
 
 ## License
 

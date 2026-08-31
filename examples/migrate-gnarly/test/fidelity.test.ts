@@ -297,12 +297,11 @@ describe("4. hostile KV entries", () => {
       nested: { arr: [42, 84, null], even: true },
     });
 
-    // Key inventory: all 199 user keys plus the library's own
-    // "__claydo:kind" marker on the new side, and nothing else.
+    // Facet-native storage contains exactly the 199 user keys. The kind pin
+    // lives in the isolated supervisor database, not among user data.
     const keys = await moved.kvKeys();
-    expect(keys.length).toBe(200);
+    expect(keys.length).toBe(199);
     expect(keys.filter((k) => k.startsWith("__claydo"))).toEqual([
-      "__claydo:kind",
       "__claydo_config",
       "__claydonote",
     ]);

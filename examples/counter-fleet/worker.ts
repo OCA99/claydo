@@ -19,8 +19,7 @@
  * uses deleteAll-then-forget; a separate `nuke()` method demonstrates the
  * abort variant for the DX report.
  */
-import { DurableObject } from "cloudflare:workers";
-import { kind, resetStorage, union } from "../../src/index";
+import { DurableObject, kind, resetStorage, union } from "../../src/index";
 
 export interface Env {
   APP_DO: DurableObjectNamespace<AppDO>;
@@ -65,22 +64,17 @@ export class Counter extends DurableObject<Env> {
   }
 
   /**
-   * Best-effort deletion, using the library's `resetStorage()` helper: it
-   * wipes all storage but re-pins the `__claydo:kind` marker, so the instance
-   * never becomes a kind-less husk. The instance keeps existing as an empty
-   * shell; once the registry forgets its id, nothing addresses it again.
-   *
-   * NOTE: the warm in-memory instance still has its SQL tables dropped and
-   * its constructor does not re-run until eviction; only a restart heals it.
+   * Deletes facet-local user data. The supervisor keeps kind identity
+   * separately and restarts the cleared facet after this call, so the next
+   * request sees a fresh schema.
    */
   async destroy(): Promise<void> {
     await resetStorage(this.ctx);
   }
 
   /**
-   * The old footgun, kept as a DX probe: RAW deleteAll (kills the kind
-   * marker) plus `ctx.abort()`, which never returns and breaks the
-   * in-flight RPC, so the caller always sees an error from this call.
+   * Explicitly clears data and aborts the facet. The in-flight call fails,
+   * but the stable supervisor stub starts a replacement facet next time.
    */
   async nuke(): Promise<never> {
     await this.ctx.storage.deleteAll();

@@ -11,7 +11,7 @@
  *  E. Tiny chunks while spamming facade reads             → FIXED (reads wait)
  *  F. A WebSocket message racing the migration            → improved (1012 close)
  */
-import { env, runInDurableObject } from "cloudflare:test";
+import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { kinds } from "../../../src/index";
 import { migrateInstance, migrated, wipeTarget } from "../../../src/migrate";
@@ -221,14 +221,7 @@ describe("C. wrong-shape migration: binding A's instance into binding B's kind (
     });
 
     // The chat rows really are inside the match instance's database.
-    const strandedRows = await runInDurableObject(
-      env.APP_DO.get(env.APP_DO.idFromName("match:wrong-shape")),
-      async (instance) =>
-        (instance as unknown as { ctx: DurableObjectState }).ctx.storage.sql
-          .exec<{ n: number }>(`SELECT count(*) AS n FROM messages`)
-          .one().n,
-    );
-    expect(strandedRows).toBe(2);
+    expect(await app().match.get("wrong-shape").messageRows()).toBe(2);
   });
 
   it("the only guard is name-prefix vs declared-kind, now enforced at reservation time", async () => {

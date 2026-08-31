@@ -1,5 +1,4 @@
-import { DurableObject } from "cloudflare:workers";
-import { instanceName, kind, union } from "../../src/index";
+import { DurableObject, instanceName, kind, union } from "../../src/index";
 
 export interface Env {
   APP_DO: DurableObjectNamespace<LiveTableDO>;

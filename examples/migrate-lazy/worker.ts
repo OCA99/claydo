@@ -16,8 +16,7 @@
  * `migrated()` facades exactly as a real cutover would.
  */
 
-import { DurableObject } from "cloudflare:workers";
-import { kind, union } from "../../src/index";
+import { DurableObject, kind, union } from "../../src/index";
 import {
   exportable,
   migrated,

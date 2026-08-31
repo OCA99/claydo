@@ -9,8 +9,7 @@
  * signatures, KV key list + value checksum, pending alarm) so tests can
  * prove byte fidelity — or catch exactly where it breaks.
  */
-import { DurableObject } from "cloudflare:workers";
-import { union } from "../../src/index";
+import { DurableObject, union } from "../../src/index";
 import { exportable } from "../../src/migrate";
 
 export interface Env {

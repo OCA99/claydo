@@ -1,5 +1,4 @@
-import { DurableObject } from "cloudflare:workers";
-import { kind, resetStorage, union } from "../../src/index";
+import { DurableObject, kind, resetStorage, union } from "../../src/index";
 
 export interface Env {
   APP_DO: DurableObjectNamespace<RateLimiterDO>;

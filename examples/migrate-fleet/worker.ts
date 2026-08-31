@@ -8,8 +8,7 @@
  * story. (In this test harness everything lives in one Worker; the secret
  * plumbing is identical.)
  */
-import { DurableObject } from "cloudflare:workers";
-import { instanceName, kinds, union } from "../../src/index";
+import { DurableObject, instanceName, kinds, union } from "../../src/index";
 import { exportable, migrated } from "../../src/migrate";
 
 export interface Env {

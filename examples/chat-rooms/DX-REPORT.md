@@ -1,5 +1,15 @@
 # DX report: chat-rooms (PartyServer kind + plain DO kind, cross-kind RPC)
 
+> **Facet-native update (2026-08-31).** This example now imports `DurableObject`
+> from claydo and runs every kind in an isolated Durable Object facet. The
+> supervisor keeps routing, kind identity, migration state, and virtualized
+> alarms outside user storage. The tests were updated for the new lifecycle:
+> `deleteAll()` cannot erase kind identity, cleared facets restart with fresh
+> schemas, and stable public stubs survive facet eviction. The detailed report
+> below is the original build-time audit; findings about shared host storage,
+> `__claydo:kind` in user data, or kind-less husks are historical and are
+> resolved by this refactor.
+
 Audit of `generic-durable-objects` v0.1.0, written while building this
 example. Environment: Node 22, vitest 4.1.11, `@cloudflare/vitest-pool-workers`
 0.22, `partyserver` 0.5.10, workers-types v5, compatibility date 2026-08-01.

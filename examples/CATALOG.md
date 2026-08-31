@@ -1,8 +1,8 @@
 # Example catalog
 
-This catalog collects Durable Object use cases from the ecosystem and maps
-them to examples in this folder. Each example uses `claydo`
-instead of one DO class per use case.
+This catalog maps Durable Object use cases to facet-native claydo examples.
+Each kind imports claydo's `DurableObject` base and receives an isolated
+SQLite database behind one supervisor class, binding, and migration.
 
 ## Sources
 
@@ -29,7 +29,12 @@ instead of one DO class per use case.
 | `rate-limiter` | `bucket` | Classic DO pattern | Token bucket, many small instances, strong consistency |
 | `game-lobby` | `lobby`, `game` | PartyKit/game servers | Lobby creates unique game instances, turn state in SQLite, turn-timeout alarms |
 | `shop` | `cart`, `inventory` | Classic multi-DO commerce | Cross-kind checkout, error propagation across kinds, compensation |
+| `migrate-app` | `room`, `match`, `registry` | Binding consolidation | Manual routing cutover, PartyServer, unique-ID remapping |
+| `migrate-fleet` | `session` | Fleet consolidation | Bulk preview/progress, secrets, crash resume |
+| `migrate-gnarly` | `gnarly` | Data-fidelity audit | FTS5, generated columns, blobs, rowids, sequences |
+| `migrate-lazy` | `bucket`, `session` | First-touch migration | Lazy/manual/drain routing, concurrent ownership |
 
 Each example folder contains a worker, a wrangler config, tests that run in
 workerd, and a `DX-REPORT.md` with an audit of the developer experience,
-written while building the example.
+written while building the example. Each report has a facet-native update
+that distinguishes current behavior from historical pre-facet findings.

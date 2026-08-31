@@ -25,9 +25,8 @@
  *     The worker resolves the route itself from the registry.
  */
 
-import { DurableObject } from "cloudflare:workers";
 import { Server, type Connection, type WSMessage } from "partyserver";
-import { instanceName, kinds, union } from "../../src/index";
+import { DurableObject, instanceName, kinds, union } from "../../src/index";
 import {
   exportable,
   migrateInstance,
@@ -134,6 +133,10 @@ export class RoomServer extends Server<Env> {
     return { doName: this.name, logical: instanceName(this.ctx) ?? null };
   }
 
+  async storedPartyName(): Promise<string | undefined> {
+    return this.ctx.storage.get<string>("__ps_name");
+  }
+
   /**
    * Uses partyserver's synchronous `getConnections()` helper. Works as a
    * kind. Under `exportable()` the seal guard turns every prototype method
@@ -213,6 +216,13 @@ export class MatchImpl extends DurableObject<Env> {
       timeoutFiredAt:
         (await this.ctx.storage.get<number>("timeout-fired-at")) ?? null,
     };
+  }
+
+  /** Audit helper for a deliberately wrong-shape migration. */
+  messageRows(): number {
+    return this.ctx.storage.sql
+      .exec<{ n: number }>(`SELECT count(*) AS n FROM messages`)
+      .one().n;
   }
 
   /**

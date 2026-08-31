@@ -1,5 +1,15 @@
 # DX Report: `claydo/migrate` — bulk fleet migration (`examples/migrate-fleet`)
 
+> **Facet-native update (2026-08-31).** This example now imports `DurableObject`
+> from claydo and runs every kind in an isolated Durable Object facet. The
+> supervisor keeps routing, kind identity, migration state, and virtualized
+> alarms outside user storage. The tests were updated for the new lifecycle:
+> `deleteAll()` cannot erase kind identity, cleared facets restart with fresh
+> schemas, and stable public stubs survive facet eviction. The detailed report
+> below is the original build-time audit; findings about shared host storage,
+> `__claydo:kind` in user data, or kind-less husks are historical and are
+> resolved by this refactor.
+
 Audit performed against the workspace sources (`src/migrate.ts`, `src/migrate-wire.ts`,
 `src/host.ts`) with vitest 4 + `@cloudflare/vitest-pool-workers` 0.22, compatibility
 date 2026-08-01. All quoted errors are verbatim from test runs.

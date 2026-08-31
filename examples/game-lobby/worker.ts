@@ -7,8 +7,7 @@
  *    turn-based tic-tac-toe game with a turn-timeout alarm and WebSocket
  *    spectators.
  */
-import { DurableObject } from "cloudflare:workers";
-import { kind, union } from "../../src/index";
+import { DurableObject, kind, union } from "../../src/index";
 
 export interface Env {
   APP_DO: DurableObjectNamespace<AppDO>;

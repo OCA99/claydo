@@ -8,8 +8,7 @@
  * a `fired` table, and re-arms for the next job (immediately, if the next
  * job is already due).
  */
-import { DurableObject } from "cloudflare:workers";
-import { instanceName, kind, union } from "../../src/index";
+import { DurableObject, instanceName, kind, union } from "../../src/index";
 
 export interface Env {
   APP_DO: DurableObjectNamespace<AppDO>;

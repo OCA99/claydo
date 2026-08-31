@@ -327,14 +327,7 @@ describe("GameCo consolidation journey", () => {
     // partyserver persisted __ps_name: "lobby" on the OLD instance; the
     // migration copied it, and partyserver's init overwrote it with the
     // prefixed name on first contact.
-    const psName = await runInDurableObject(
-      env.APP_DO.get(env.APP_DO.idFromName("room:lobby")),
-      async (instance) =>
-        (instance as unknown as { ctx: DurableObjectState }).ctx.storage.get<string>(
-          "__ps_name",
-        ),
-    );
-    expect(psName).toBe("room:lobby");
+    expect(await app().room.get(ROOM).storedPartyName()).toBe("room:lobby");
   });
 
   // -------------------------------------------------------------------------

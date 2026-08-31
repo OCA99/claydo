@@ -4,7 +4,8 @@ import {
   runInDurableObject,
 } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { KIND_STORAGE_KEY, kind, kinds, union } from "../../../src/index";
+import { kind, kinds, union } from "../../../src/index";
+import { KIND_STORAGE_KEY } from "../../../src/types";
 import worker, { Game, type GameState } from "../worker";
 
 const lobby = () => kind(env.APP_DO, "lobby").get("main");
@@ -256,7 +257,7 @@ describe("dx probes", () => {
     expect(() =>
       union({ "bad:kind": Game }),
     ).toThrowErrorMatchingInlineSnapshot(
-      `[Error: claydo: invalid kind name 'bad:kind'. Kind names must be non-empty, must not contain ':' and must not start with '__'.]`,
+      `[Error: claydo: invalid kind name 'bad:kind'. Kind names must be non-empty, must not contain ':', and must not start with '__'.]`,
     );
   });
 

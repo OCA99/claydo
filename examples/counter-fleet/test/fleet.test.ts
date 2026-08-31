@@ -261,36 +261,22 @@ describeHosted("DX probes (adversarial)", () => {
     );
   });
 
-  it("PROBE: destroy() [resetStorage] still leaves the WARM instance broken until restart", async () => {
+  it("PROBE: destroy() [resetStorage] restarts a clean facet automatically", async () => {
     const c = kind(env.APP_DO, "counter").get("half-dead");
     await c.increment(3);
-    await c.destroy(); // resetStorage(): deleteAll but the kind marker stays
+    await c.destroy();
 
-    // resetStorage() fixes the identity problem, not the warm-instance
-    // problem: the constructor does not re-run, so the SQL tables are gone
-    // while the in-memory kind keeps answering RPC. The error now arrives
-    // with the remote stack pointing at the real frame:
-    let caught: Error | undefined;
-    try {
-      await c.increment(1);
-    } catch (error) {
-      caught = error as Error;
-    }
-    expect(caught!.message).toBe("no such table: counter: SQLITE_ERROR");
-    expect(caught!.stack).toContain("at Counter.increment");
-    expect(caught!.stack).toContain(
-      "at [remote call counter.increment() via claydo]",
-    );
-
-    // A fresh stub reaches the same broken warm instance:
-    await expect(
-      kind(env.APP_DO, "counter").get("half-dead").value(),
-    ).rejects.toThrow("no such table: counter: SQLITE_ERROR");
+    // User data is gone, supervisor identity remains, and the supervisor
+    // restarted the facet so its constructor recreated the schema before
+    // the next call.
+    expect(await c.value()).toBe(0);
+    expect(await c.increment(1)).toBe(1);
+    expect(
+      await kind(env.APP_DO, "counter").get("half-dead").value(),
+    ).toBe(1);
   });
 
-  it("PROBE (fixed): resetStorage() keeps a UNIQUE instance's kind across restarts — no husk", async () => {
-    // PRE-FIX, deleteAll() + eviction turned unique instances into
-    // kind-less husks. POST-FIX flow: destroy() uses resetStorage().
+  it("PROBE: resetStorage() cannot erase a UNIQUE supervisor's kind", async () => {
     const c = kind(env.APP_DO, "counter").unique();
     const id = c.id.toString();
     await c.increment(5);
@@ -298,9 +284,8 @@ describeHosted("DX probes (adversarial)", () => {
     // Evict the instance so the next access is a true cold start.
     await expect(c.crash()).rejects.toThrow("counter crashed on purpose");
 
-    // The kind marker survived the wipe: the cold instance still knows it
-    // is a counter, even without a name prefix, and fromId() (which never
-    // initializes) works because no initialization is needed.
+    // The isolated supervisor still knows this is a counter, even without a
+    // name prefix. fromId() works because identity is separate from user data.
     const raw = env.APP_DO.get(env.APP_DO.idFromString(id));
     expect(await raw.__claydoKind()).toBe("counter");
     const fresh = kind(env.APP_DO, "counter").fromId(id);
@@ -313,43 +298,27 @@ describeHosted("DX probes (adversarial)", () => {
     await c.increment(9);
     // The caller of nuke() always sees an error: abort() breaks the RPC.
     await expect(c.nuke()).rejects.toThrow("counter nuked");
-    // The old stub is dead too.
-    await expect(c.value()).rejects.toThrow("counter nuked");
-    // A fresh stub reaches a cold instance; the name prefix re-pins the
-    // kind and the constructor rebuilds storage. Data is gone; identity is
-    // not: the "deleted" counter is trivially resurrected by access.
+    // The public stub addresses the stable supervisor, so only the in-flight
+    // facet call dies. Its next call transparently creates a fresh facet.
+    expect(await c.value()).toBe(0);
+    // A separately-created stub sees the same empty replacement facet.
     const fresh = kind(env.APP_DO, "counter").get("phoenix");
     expect(await fresh.value()).toBe(0);
   });
 
-  it("PROBE: nuke() (raw deleteAll) on a UNIQUE instance now strands it PERMANENTLY", async () => {
+  it("PROBE: nuke() on a UNIQUE facet keeps supervisor identity intact", async () => {
     const r = registry("reg-husk");
     const record = await r.createCounter("husk");
     const c = kind(env.APP_DO, "counter").fromId(record.id);
     await expect(c.nuke()).rejects.toThrow("counter nuked");
 
-    // Cold instance, no stored kind, no name. PRE-FIX any hinted fromId()
-    // call silently resurrected (and could mis-pin) it. POST-FIX fromId()
-    // never initializes, so the husk is unreachable forever (verbatim):
+    // User data and kind identity live in separate databases. Even
+    // deleteAll()+abort inside the facet cannot erase the supervisor pin.
     const raw = env.APP_DO.get(env.APP_DO.idFromString(record.id));
-    expect(await raw.__claydoKind()).toBeUndefined();
-    await expect(
-      kind(env.APP_DO, "counter").fromId(record.id).value(),
-    ).rejects.toThrow(
-      `claydo: instance '${record.id}' has no kind yet. ` +
-        "It was accessed as kind 'counter' through fromId(), which never " +
-        "initializes an instance. Create the instance first with " +
-        "kind(ns, 'counter').get(name) or .unique(), then reach it by id.",
-    );
-    // The registry's own record now points at a dead id: its internal
-    // fromId() call fails the same way. Raw deleteAll is loudly fatal for
-    // unique instances — use resetStorage()/destroy() instead.
-    await expect(r.counterValue("husk")).rejects.toThrow(
-      /has no kind yet. It was accessed as kind 'counter' through fromId\(\)/,
-    );
-    // deleteCounter() can still forget the dead record: destroy() fails on
-    // the husk, so a robust registry must tolerate that. Clean up directly:
-    await expect(r.deleteCounter("husk")).rejects.toThrow(/has no kind yet/);
+    expect(await raw.__claydoKind()).toBe("counter");
+    expect(await kind(env.APP_DO, "counter").fromId(record.id).value()).toBe(0);
+    expect(await r.counterValue("husk")).toBe(0);
+    await r.deleteCounter("husk");
   });
 });
 

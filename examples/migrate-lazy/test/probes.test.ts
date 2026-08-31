@@ -124,7 +124,7 @@ describe("first-touch race", () => {
     // its rollback path (which used to unseal the old instance) never runs.
     const loserError = await expectRejects(
       () => raw.__claydoBeginImport("bucket", "loser-token"),
-      /is already live as kind 'bucket'/,
+      /is (?:already )?live as kind 'bucket'/,
     );
     console.log("[probe race-loser] loser reservation error:", loserError);
     expect(loserError).toMatch(/wipe it with wipeTarget\(\)/);

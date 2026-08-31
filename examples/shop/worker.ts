@@ -7,8 +7,7 @@
  *    product's inventory instance (cross-kind RPC from inside the DO) and
  *    compensates (releases) already-reserved stock when any product is short.
  */
-import { DurableObject } from "cloudflare:workers";
-import { instanceName, kind, kinds, union } from "../../src/index";
+import { DurableObject, instanceName, kind, kinds, union } from "../../src/index";
 
 export interface Env {
   APP_DO: DurableObjectNamespace<ShopDO>;
