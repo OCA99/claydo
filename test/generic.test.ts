@@ -255,6 +255,26 @@ describe("third-party kinds (partyserver)", () => {
     expect(reply).toBe("party[party:lobby]:hello");
     ws.close();
   });
+
+  it("initializes framework kinds on RPC-first access", async () => {
+    // No fetch() has touched this instance: the host must run the
+    // framework startup hook before dispatching the method.
+    const room = kind(env.APP_DO, "party").get("rpc-first");
+    expect(await room.roomName()).toBe("party:rpc-first");
+  });
+
+  it("rejects getServerByName/getAgentByName with directions", async () => {
+    const raw = env.APP_DO.get(env.APP_DO.idFromName("party:lobby"));
+    let message = "";
+    try {
+      await (
+        raw as unknown as { setName(n: string): Promise<void> }
+      ).setName("party:lobby");
+    } catch (error) {
+      message = String(error);
+    }
+    expect(message).toMatch(/getServerByName|getAgentByName/);
+  });
 });
 
 describe("worker end to end", () => {
