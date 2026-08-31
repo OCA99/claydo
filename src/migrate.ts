@@ -1150,8 +1150,8 @@ export async function migrateInstance(
 }
 
 /**
- * Wipes a migration target completely: storage, alarm, import state, and
- * the in-memory kind pin. Use it to recover a target that racing traffic
+ * Deletes the target's isolated facet plus its supervisor kind/import
+ * metadata and alarm. Use it to recover a target that racing traffic
  * polluted before a migration. Requires `{ importable }` on the host.
  *
  * Destructive: only call it when the target holds no data you need.

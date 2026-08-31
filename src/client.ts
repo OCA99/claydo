@@ -43,7 +43,10 @@ export type KindStub<T> = {
   readonly name: string | undefined;
   /** The kind of this instance. */
   readonly kind: string;
-  /** The raw Durable Object stub, for escape hatches such as `cloudflare:test`. */
+  /**
+   * The raw supervisor Durable Object stub, for helpers such as
+   * `runDurableObjectAlarm`. User SQL/KV lives in its child facet.
+   */
   readonly stub: DurableObjectStub;
   /**
    * Sends a request to the `fetch()` handler of the kind implementation.

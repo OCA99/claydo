@@ -7,18 +7,16 @@
 /** Storage key on the OLD instance that marks it sealed. */
 export const SEAL_KEY = "__claydo:sealed";
 
-/** Storage key on the NEW instance that tracks an import in progress. */
+/** Supervisor storage key on the NEW instance that tracks an import. */
 export const IMPORT_STATE_KEY = "__claydo:import";
 
 /**
- * The exact storage keys the library reserves. Everything else — including
- * other keys that happen to start with `__claydo` — is user data and
- * migrates normally.
+ * The only key the exporter adds to OLD user storage. The target's kind and
+ * import metadata live in isolated supervisor storage, so every other old
+ * key — even `__claydo:kind` — migrates into the user facet normally.
  */
 export const RESERVED_STORAGE_KEYS: ReadonlySet<string> = new Set([
   SEAL_KEY,
-  IMPORT_STATE_KEY,
-  "__claydo:kind",
 ]);
 
 /** Response header set on 410 responses from sealed instances. */

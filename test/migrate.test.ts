@@ -213,7 +213,7 @@ describe("migrateInstance", () => {
   it("defers alarms that fire while sealed, so they survive the migration", async () => {
     const old = legacy("m7b");
     await old.bump("x");
-    await old.remindAt(Date.now() + 1);
+    await old.remindAt(Date.now() + 60_000);
     await old.__claydoSeal();
     // The alarm fires during the sealed window: deferred, not swallowed.
     expect(await runDurableObjectAlarm(legacy("m7b"))).toBe(true);
@@ -289,9 +289,11 @@ describe("migrateInstance", () => {
     const old = legacy("m11");
     await old.bump("x");
     await old.putRaw("__claydonote", "mine");
+    await old.putRaw("__claydo:kind", "user-owned-value");
     await migrateInstance({ from: old, to: tally(), name: "m11" });
     const moved = tally().get("m11");
     expect(await moved.getRaw("__claydonote")).toBe("mine");
+    expect(await moved.getRaw("__claydo:kind")).toBe("user-owned-value");
     expect(await moved.getRaw("__claydo:sealed")).toBeUndefined();
   });
 
@@ -456,16 +458,9 @@ describe("data fidelity extensions", () => {
       );
     });
     await migrateInstance({ from: old, to: tally(), name: "g3" });
-    const hits = await runInDurableObject(
-      rawTarget("g3"),
-      async (_instance, state) =>
-        state.storage.sql
-          .exec<{ body: string }>(
-            `SELECT body FROM articles_fts WHERE articles_fts MATCH 'namespaces'`,
-          )
-          .toArray(),
-    );
-    expect(hits).toEqual([{ body: "claydo migrates namespaces" }]);
+    expect(await tally().get("g3").searchArticles("namespaces")).toEqual([
+      "claydo migrates namespaces",
+    ]);
   });
 
   it("refuses contentless FTS5 pre-flight, before sealing anything", async () => {

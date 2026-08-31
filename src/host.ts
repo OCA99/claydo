@@ -1,4 +1,4 @@
-import { DurableObject } from "cloudflare:workers";
+import { DurableObject as CloudflareDurableObject } from "cloudflare:workers";
 import {
   IMPORT_STALE_MS,
   IMPORT_STATE_KEY,
@@ -11,17 +11,17 @@ import {
   type SqlValue,
 } from "./migrate-wire";
 import {
+  facetContext,
+  facetProps,
+  kindFacetName,
   KIND_HEADER,
   KIND_STORAGE_KEY,
   NO_INIT_HEADER,
+  type ClaydoFacetProps,
   type KindHandlers,
   type KindRegistry,
 } from "./types";
 
-/**
- * Methods that remote callers must not invoke through `__claydoCall`.
- * Lifecycle handlers run through their dedicated host handlers instead.
- */
 const RESERVED_METHODS = new Set([
   "constructor",
   "fetch",
@@ -30,28 +30,17 @@ const RESERVED_METHODS = new Set([
   "webSocketClose",
   "webSocketError",
 ]);
-
-/**
- * Method names that the typed stub shadows with metadata. `union()` rejects
- * kind classes that define these as methods, so the shadowing can never hide
- * a real method at runtime.
- */
 const RESERVED_STUB_KEYS = ["id", "name", "kind", "stub"] as const;
 
-/** A serializable snapshot of an error, carried through the RPC envelope. */
+/** A serializable error snapshot carried through the claydo RPC envelope. */
 export interface WireError {
   name: string;
   message: string;
-  /** The stack captured where the error was thrown, inside the kind. */
   stack?: string;
-  /** Own enumerable, structured-cloneable fields of the error. */
   props?: Record<string, unknown>;
 }
 
-/**
- * The result envelope of a dispatched RPC call. The client helper unwraps it
- * and rethrows errors locally with the remote stack and fields attached.
- */
+/** The result envelope of a dispatched kind RPC call. */
 export type ClaydoCallResult =
   | { ok: true; value: unknown }
   | { ok: false; error: WireError };
@@ -73,39 +62,71 @@ function toWireError(error: unknown): WireError {
       structuredClone(value);
       props[key] = value;
     } catch {
-      // Skip fields that do not serialize.
+      // Non-cloneable error fields cannot cross Workers RPC.
     }
   }
   if (Object.keys(props).length > 0) wire.props = props;
   return wire;
 }
 
-/** The instance type of the class that {@link union} returns. */
-export interface GenericDurableObjectInstance<R extends KindRegistry>
-  extends Rpc.DurableObjectBranded {
-  /** Phantom field. It carries the registry type for client-side inference. */
-  readonly __kinds: R;
-  ctx: DurableObjectState;
-  env: unknown;
-  /** Dispatches an RPC call to the kind implementation. Internal. */
+interface FacetRuntimeStub {
   __claydoCall(
     kind: string,
     method: string,
     args: unknown[],
     allowInit?: boolean,
   ): Promise<ClaydoCallResult>;
-  /**
-   * Returns the kind of this instance, or `undefined` when the instance has
-   * no kind yet. This call never initializes the instance.
-   */
+  __claydoAlarm(alarmInfo?: AlarmInfoWire): Promise<void>;
+  __claydoWebSocketMessage(
+    ws: WebSocket,
+    message: string | ArrayBuffer,
+  ): Promise<void>;
+  __claydoWebSocketClose(
+    ws: WebSocket,
+    code: number,
+    reason: string,
+    wasClean: boolean,
+  ): Promise<void>;
+  __claydoWebSocketError(ws: WebSocket, error: unknown): Promise<void>;
+  __claydoApplyImport(chunk: ExportChunk): Promise<void>;
+  fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response>;
+}
+
+type AlarmInfoWire = Pick<
+  AlarmInvocationInfo,
+  "isRetry" | "retryCount" | "scheduledTime"
+>;
+
+interface LoopbackHostClass {
+  (options: { props?: unknown }): DurableObjectClass;
+  get(
+    id: DurableObjectId,
+    options?: DurableObjectNamespaceGetDurableObjectOptions,
+  ): GenericDurableObjectInstance<KindRegistry>;
+}
+
+/** The instance type of the class returned by {@link union}. */
+export interface GenericDurableObjectInstance<R extends KindRegistry>
+  extends Rpc.DurableObjectBranded {
+  readonly __kinds: R;
+  ctx: DurableObjectState;
+  env: unknown;
+  __claydoCall(
+    kind: string,
+    method: string,
+    args: unknown[],
+    allowInit?: boolean,
+  ): Promise<ClaydoCallResult>;
   __claydoKind(): Promise<string | undefined>;
-  /** Reserves an import and blocks traffic. See `claydo/migrate`. Internal. */
+  __claydoSetAlarm(kind: string, timestamp: number): Promise<void>;
+  __claydoGetAlarm(kind: string): Promise<number | null>;
+  __claydoDeleteAlarm(kind: string): Promise<void>;
+  __claydoFacetReset(kind: string): Promise<void>;
   __claydoBeginImport(
     kind: string,
     token: string,
     secret?: string,
   ): Promise<ImportBegin>;
-  /** Applies one migration chunk. See `claydo/migrate`. Internal. */
   __claydoImport(
     kind: string,
     chunk: ExportChunk,
@@ -113,16 +134,8 @@ export interface GenericDurableObjectInstance<R extends KindRegistry>
     token: string,
     secret?: string,
   ): Promise<ImportAck>;
-  /** Reports the migration state of this instance. See `claydo/migrate`. */
   __claydoImportStatus(secret?: string): Promise<ImportStatus>;
-  /** Discards a partial import owned by `token`. See `claydo/migrate`. */
   __claydoAbortImport(token: string, secret?: string): Promise<boolean>;
-  /**
-   * Wipes this instance completely: storage, alarm, import state, and the
-   * in-memory kind pin. A recovery tool for polluted migration targets.
-   * Requires `{ importable }` to be enabled. See `wipeTarget` in
-   * `claydo/migrate`.
-   */
   __claydoReset(confirmId: string, secret?: string): Promise<void>;
   fetch(request: Request): Promise<Response>;
   alarm(alarmInfo?: AlarmInvocationInfo): Promise<void>;
@@ -136,7 +149,7 @@ export interface GenericDurableObjectInstance<R extends KindRegistry>
   webSocketError(ws: WebSocket, error: unknown): Promise<void>;
 }
 
-/** The constructor type of the class that {@link union} returns. */
+/** The constructor type returned by {@link union}. */
 export type GenericDurableObjectClass<R extends KindRegistry> = new (
   ctx: DurableObjectState,
   env: any,
@@ -144,92 +157,108 @@ export type GenericDurableObjectClass<R extends KindRegistry> = new (
 
 /** Options for {@link union}. */
 export interface UnionOptions<R extends KindRegistry> {
-  /**
-   * Enables `claydo/migrate` imports into the listed kinds (or all kinds
-   * when `true`). Off by default: with imports disabled, the host rejects
-   * every `__claydoImport` call.
-   */
   importable?: boolean | (keyof R & string)[];
-  /**
-   * When set, migration calls (`__claydoImport`, `__claydoImportStatus`,
-   * `__claydoAbortImport`) must present the same secret. Use this when the
-   * old Durable Objects live in another Worker.
-   */
   secret?: string;
+  /**
+   * Overrides the top-level export name used to obtain the facet class from
+   * `ctx.exports`. Normally inferred from the exported subclass name.
+   */
+  exportName?: string;
 }
 
 /**
- * Creates one Durable Object class that hosts many kinds.
+ * Creates one supervisor Durable Object class that hosts every kind in an
+ * isolated Durable Object facet.
  *
- * Each instance binds to exactly one kind, forever. The host resolves the
- * kind from, in order:
- *
- * 1. The value persisted in storage on first contact.
- * 2. The `<kind>:` prefix of the instance name (`ctx.id.name`).
- * 3. The hint that the client helper sends with every call. The hint only
- *    initializes instances reached through `get()` or `unique()`; `fromId()`
- *    never initializes.
- *
- * Export the returned class from your Worker and point one binding plus one
- * SQLite migration at it. You never add migrations for new kinds.
- *
- * @example
- * export class AppDO extends union({ counter: Counter, chat: ChatRoom }) {}
+ * The exported class is both supervisor and facet runtime. This is why one
+ * binding and one SQLite migration still cover every kind: the supervisor
+ * obtains its own class handle from `ctx.exports`, configures it with
+ * `{ props: { kind } }`, and starts one isolated facet per instance.
  */
 export function union<R extends KindRegistry>(
   kinds: R,
   options: UnionOptions<R> = {},
 ): GenericDurableObjectClass<R> {
-  for (const [name, Kind] of Object.entries(kinds)) {
-    if (name.includes(":") || name.startsWith("__") || name.length === 0) {
-      throw new Error(
-        `claydo: invalid kind name '${name}'. ` +
-          `Kind names must be non-empty, must not contain ':' and must not start with '__'.`,
-      );
-    }
-    // Reject methods that the stub metadata would silently shadow.
-    let proto: object | null = Kind.prototype as object;
-    while (proto !== null && proto !== Object.prototype) {
-      for (const key of RESERVED_STUB_KEYS) {
-        const descriptor = Object.getOwnPropertyDescriptor(proto, key);
-        if (descriptor && typeof descriptor.value === "function") {
-          throw new Error(
-            `claydo: kind '${name}' (class ${Kind.name}) ` +
-              `defines a method named '${key}'. The stub reserves ` +
-              `'${RESERVED_STUB_KEYS.join("', '")}' for metadata, so this ` +
-              `method would not be callable. Rename the method.`,
-          );
-        }
-      }
-      proto = Object.getPrototypeOf(proto);
-    }
-  }
+  validateRegistry(kinds);
 
-  class GenericDurableObject extends DurableObject {
+  class GenericDurableObject extends CloudflareDurableObject<any> {
     declare readonly __kinds: R;
+    readonly #facetProps: ClaydoFacetProps | undefined;
     #kind?: string;
+    #kindLoading?: Promise<string>;
     #impl?: object & KindHandlers;
-    #loading?: Promise<void>;
+    #implLoading?: Promise<object & KindHandlers>;
 
-    /** A human-readable identity for error messages and logs. */
+    constructor(ctx: DurableObjectState, env: unknown) {
+      super(ctx, env);
+      this.#facetProps = facetProps(ctx);
+    }
+
     #identity(): string {
       return this.ctx.id.name ?? this.ctx.id.toString();
     }
 
-    async #load(hint?: string, allowInit = true): Promise<object & KindHandlers> {
-      if (this.#impl === undefined) {
-        if (this.#loading === undefined) {
-          this.#loading = this.#initialize(hint, allowInit).catch((error) => {
-            // Allow a later call (possibly with a hint) to retry.
-            this.#loading = undefined;
+    #hostExport(): string {
+      return (
+        this.#facetProps?.hostExport ??
+        options.exportName ??
+        this.constructor.name
+      );
+    }
+
+    #hostClass(): LoopbackHostClass {
+      const name = this.#hostExport();
+      const exported = (this.ctx.exports as unknown as Record<string, unknown>)[
+        name
+      ] as LoopbackHostClass | undefined;
+      if (
+        exported === undefined ||
+        typeof exported !== "function" ||
+        typeof exported.get !== "function"
+      ) {
+        throw new Error(
+          `claydo: cannot find Durable Object export '${name}' in ` +
+            `ctx.exports. Export the union() subclass under that name, or ` +
+            `pass { exportName: "YourExport" } to union().`,
+        );
+      }
+      return exported;
+    }
+
+    #facet(kind: string): FacetRuntimeStub {
+      const hostClass = this.#hostClass();
+      const props: ClaydoFacetProps = {
+        __claydoFacet: true,
+        kind,
+        hostExport: this.#hostExport(),
+      };
+      const configured = hostClass({ props });
+      return this.ctx.facets.get(kindFacetName(kind), () => ({
+        class: configured,
+      })) as unknown as FacetRuntimeStub;
+    }
+
+    #kindFromName(): string | undefined {
+      const name = this.ctx.id.name;
+      if (name === undefined) return undefined;
+      const separator = name.indexOf(":");
+      if (separator === -1) return undefined;
+      const prefix = name.slice(0, separator);
+      return prefix in kinds ? prefix : undefined;
+    }
+
+    async #resolveKind(hint?: string, allowInit = true): Promise<string> {
+      if (this.#facetProps !== undefined) return this.#facetProps.kind;
+      if (this.#kind === undefined) {
+        this.#kindLoading ??= this.#initializeKind(hint, allowInit).catch(
+          (error) => {
+            this.#kindLoading = undefined;
             throw error;
-          });
-        }
-        await this.#loading;
+          },
+        );
+        this.#kind = await this.#kindLoading;
       }
       if (hint !== undefined && hint !== this.#kind) {
-        // The structured fields survive the RPC hop (see toWireError), so
-        // callers can branch on `code` instead of parsing the message.
         throw Object.assign(
           new Error(
             `claydo: instance '${this.#identity()}' is kind ` +
@@ -242,10 +271,13 @@ export function union<R extends KindRegistry>(
           },
         );
       }
-      return this.#impl!;
+      return this.#kind;
     }
 
-    async #initialize(hint?: string, allowInit = true): Promise<void> {
+    async #initializeKind(
+      hint: string | undefined,
+      allowInit: boolean,
+    ): Promise<string> {
       const persisted = await this.ctx.storage.get<unknown>([
         KIND_STORAGE_KEY,
         IMPORT_STATE_KEY,
@@ -260,7 +292,7 @@ export function union<R extends KindRegistry>(
               `'${importing.kind}'. Traffic is blocked until the migration ` +
               `completes or is aborted.`,
           ),
-          { code: "claydo_importing" },
+          { code: "CLAYDO_IMPORTING" },
         );
       }
       const stored = persisted.get(KIND_STORAGE_KEY) as string | undefined;
@@ -269,32 +301,17 @@ export function union<R extends KindRegistry>(
       if (kind === undefined) {
         throw new Error(this.#noKindMessage(hint, allowInit));
       }
-      const Kind = kinds[kind];
-      if (Kind === undefined) {
+      if (!(kind in kinds)) {
         throw new Error(
           `claydo: unknown kind '${kind}' on instance ` +
-            `'${this.#identity()}'. Registered kinds: ${Object.keys(kinds).join(", ")}.`,
+            `'${this.#identity()}'. Registered kinds: ` +
+            `${Object.keys(kinds).join(", ")}.`,
         );
       }
       if (stored === undefined) {
         await this.ctx.storage.put(KIND_STORAGE_KEY, kind);
       }
-      const impl = new Kind(this.ctx, this.env);
-      // Framework classes (PartyServer `Server`, Cloudflare Agents `Agent`,
-      // Think) run their startup hook (`onStart`) only from `fetch()`,
-      // WebSocket events, or their own `setName` RPC — never from a plain
-      // method call. Claydo dispatches RPC directly to methods, so without
-      // this step an Agent kind reached by RPC first would run with
-      // uninitialized internal state. The hook is idempotent; plain kinds
-      // do not define it and skip this entirely.
-      const ensure = (impl as Record<string, unknown>)[
-        "__unsafe_ensureInitialized"
-      ];
-      if (typeof ensure === "function") {
-        await (ensure as (this: object) => unknown).call(impl);
-      }
-      this.#kind = kind;
-      this.#impl = impl;
+      return kind;
     }
 
     #noKindMessage(hint: string | undefined, allowInit: boolean): string {
@@ -312,10 +329,10 @@ export function union<R extends KindRegistry>(
       if (name !== undefined) {
         return (
           message +
-          ` Its name has no registered '<kind>:' prefix. Raw namespace access ` +
-          `(for example getByName('${name}')) reaches a different instance than ` +
-          `kind(ns, '<kind>').get('${name}'). Access instances through the ` +
-          `kind() helper, or use a '<kind>:' prefixed name.`
+          ` Its name has no registered '<kind>:' prefix. Raw namespace ` +
+          `access (for example getByName('${name}')) reaches a different ` +
+          `instance than kind(ns, '<kind>').get('${name}'). Access instances ` +
+          `through the kind() helper, or use a '<kind>:' prefixed name.`
         );
       }
       return (
@@ -325,30 +342,70 @@ export function union<R extends KindRegistry>(
       );
     }
 
-    #kindFromName(): string | undefined {
-      const name = this.ctx.id.name;
-      if (name === undefined) return undefined;
-      const separator = name.indexOf(":");
-      if (separator === -1) return undefined;
-      const prefix = name.slice(0, separator);
-      return prefix in kinds ? prefix : undefined;
+    async #loadImpl(): Promise<object & KindHandlers> {
+      if (this.#facetProps === undefined) {
+        throw new Error("claydo: kind implementation requested on supervisor.");
+      }
+      this.#implLoading ??= this.#constructImpl().catch((error) => {
+        this.#implLoading = undefined;
+        throw error;
+      });
+      this.#impl = await this.#implLoading;
+      return this.#impl;
     }
 
-    async __claydoCall(
+    async #constructImpl(): Promise<object & KindHandlers> {
+      const kind = this.#facetProps!.kind;
+      const Kind = kinds[kind];
+      if (Kind === undefined) {
+        throw new Error(
+          `claydo: facet requested unknown kind '${kind}'. Registered kinds: ` +
+            `${Object.keys(kinds).join(", ")}.`,
+        );
+      }
+      const impl = new Kind(this.ctx, this.env) as object & KindHandlers;
+      // Recommended claydo kinds already receive this context from their
+      // base class. Reinstalling it also makes normal DurableObject and
+      // framework classes use the supervisor-backed alarm API after their
+      // constructor has completed.
+      try {
+        Object.defineProperty(impl, "ctx", {
+          value: facetContext(this.ctx, this.#facetProps!),
+          writable: true,
+          configurable: true,
+        });
+      } catch (error) {
+        throw new Error(
+          `claydo: kind '${kind}' does not allow its ctx property to be ` +
+            `adapted for facet alarms. Extend DurableObject from "claydo" ` +
+            `or make ctx configurable.`,
+          { cause: error },
+        );
+      }
+      const ensure = (impl as Record<string, unknown>)[
+        "__unsafe_ensureInitialized"
+      ];
+      if (typeof ensure === "function") {
+        await (ensure as (this: object) => unknown).call(impl);
+      }
+      return impl;
+    }
+
+    async #dispatch(
       kind: string,
       method: string,
       args: unknown[],
-      allowInit = true,
     ): Promise<ClaydoCallResult> {
       try {
-        const impl = await this.#load(kind, allowInit);
+        const impl = await this.#loadImpl();
         if (
           typeof method !== "string" ||
           method.startsWith("__") ||
           RESERVED_METHODS.has(method)
         ) {
           throw new Error(
-            `claydo: method '${method}' is reserved and is not callable through the stub.`,
+            `claydo: method '${method}' is reserved and is not callable ` +
+              `through the stub.`,
           );
         }
         const fn = (impl as Record<string, unknown>)[method];
@@ -358,14 +415,12 @@ export function union<R extends KindRegistry>(
         ) {
           if (method in impl && typeof fn !== "function") {
             throw new Error(
-              `claydo: '${method}' on kind '${kind}' is a ` +
-                `property, not a method (type: ${typeof fn}). The stub only ` +
-                `proxies methods; add a getter method to read it.`,
+              `claydo: '${method}' on kind '${kind}' is a property, not a ` +
+                `method (type: ${typeof fn}). The stub only proxies methods; ` +
+                `add a getter method to read it.`,
             );
           }
-          throw new Error(
-            `claydo: kind '${kind}' has no method '${method}'.`,
-          );
+          throw new Error(`claydo: kind '${kind}' has no method '${method}'.`);
         }
         return { ok: true, value: await fn.apply(impl, args) };
       } catch (error) {
@@ -373,36 +428,129 @@ export function union<R extends KindRegistry>(
       }
     }
 
+    async __claydoCall(
+      kind: string,
+      method: string,
+      args: unknown[],
+      allowInit = true,
+    ): Promise<ClaydoCallResult> {
+      if (this.#facetProps !== undefined) {
+        if (kind !== this.#facetProps.kind) {
+          return {
+            ok: false,
+            error: toWireError(
+              new Error(
+                `claydo: facet is kind '${this.#facetProps.kind}', not ` +
+                  `'${kind}'.`,
+              ),
+            ),
+          };
+        }
+        return this.#dispatch(kind, method, args);
+      }
+      let resolved: string;
+      try {
+        resolved = await this.#resolveKind(kind, allowInit);
+      } catch (error) {
+        return { ok: false, error: toWireError(error) };
+      }
+      // Do not envelope transport/serialization failures from the facet:
+      // the client distinguishes them and adds kind + method call context.
+      const result = (await this.#facet(resolved).__claydoCall(
+        resolved,
+        method,
+        args,
+        allowInit,
+      )) as ClaydoCallResult;
+      await this.#completeFacetReset(resolved);
+      return result;
+    }
+
     async __claydoKind(): Promise<string | undefined> {
+      if (this.#facetProps !== undefined) return this.#facetProps.kind;
       if (this.#kind !== undefined) return this.#kind;
       const stored = await this.ctx.storage.get<string>(KIND_STORAGE_KEY);
       return stored ?? this.#kindFromName();
     }
 
-    /**
-     * PartyServer's `getServerByName()` and the Agents SDK's
-     * `getAgentByName()` call this RPC method on the raw stub. They cannot
-     * work against a claydo host (they address instances without the kind
-     * prefix), so fail with directions instead of the runtime's opaque
-     * "receiver does not implement" error.
-     */
+    async #assertAlarmKind(kind: string): Promise<void> {
+      if (this.#facetProps !== undefined) {
+        throw new Error("claydo: alarm bridge called on a facet.");
+      }
+      const actual = await this.__claydoKind();
+      if (actual !== kind) {
+        throw new Error(
+          `claydo: kind '${kind}' cannot control the alarm for ` +
+            `kind '${actual ?? "uninitialized"}'.`,
+        );
+      }
+    }
+
+    async __claydoSetAlarm(kind: string, timestamp: number): Promise<void> {
+      await this.#assertAlarmKind(kind);
+      await this.ctx.storage.setAlarm(timestamp);
+    }
+
+    async __claydoGetAlarm(kind: string): Promise<number | null> {
+      await this.#assertAlarmKind(kind);
+      return this.ctx.storage.getAlarm();
+    }
+
+    async __claydoDeleteAlarm(kind: string): Promise<void> {
+      await this.#assertAlarmKind(kind);
+      await this.ctx.storage.deleteAlarm();
+    }
+
+    async __claydoFacetReset(kind: string): Promise<void> {
+      await this.#assertAlarmKind(kind);
+      await this.ctx.storage.put("__claydo:reset-facet", kind);
+    }
+
+    async #completeFacetReset(kind: string): Promise<void> {
+      const requested = await this.ctx.storage.get<string>(
+        "__claydo:reset-facet",
+      );
+      if (requested !== kind) return;
+      await this.ctx.storage.delete("__claydo:reset-facet");
+      this.ctx.facets.abort(
+        kindFacetName(kind),
+        new Error("claydo: facet reset completed"),
+      );
+    }
+
     async setName(): Promise<never> {
       throw new Error(
         "claydo: this namespace is a claydo host. getServerByName() " +
           "(PartyServer) and getAgentByName() (Agents SDK) are not " +
-          "supported here, because they address instances without the " +
-          "kind prefix. Use kind(ns, '<kind>').get(name) or " +
-          "kinds(ns).<kind>.get(name) instead — see 'Third-party Durable " +
-          "Object libraries' in the claydo README.",
+          "supported because they omit the kind prefix. Use " +
+          "kind(ns, '<kind>').get(name) instead.",
       );
     }
 
     #checkMigrationAuth(secret: string | undefined): void {
       if (options.secret !== undefined && secret !== options.secret) {
         throw new Error(
-          "claydo: invalid migration secret (rejected by the claydo " +
-            "host's union() options). The same secret must be set on " +
-            "exportable(), on union(), and in the driver options.",
+          "claydo: invalid migration secret (rejected by union() options). " +
+            "Use the same secret on exportable(), union(), and the driver.",
+        );
+      }
+    }
+
+    #checkImportEnabled(kind: string): void {
+      const importable = options.importable ?? false;
+      const enabled =
+        importable === true ||
+        (Array.isArray(importable) && importable.includes(kind));
+      if (!enabled) {
+        throw new Error(
+          `claydo: imports are not enabled for kind '${kind}'. Pass ` +
+            `{ importable: true } or { importable: ["${kind}"] } to union().`,
+        );
+      }
+      if (!(kind in kinds)) {
+        throw new Error(
+          `claydo: unknown kind '${kind}'. Registered kinds: ` +
+            `${Object.keys(kinds).join(", ")}.`,
         );
       }
     }
@@ -429,25 +577,6 @@ export function union<R extends KindRegistry>(
       };
     }
 
-    #checkImportEnabled(kind: string): void {
-      const importable = options.importable ?? false;
-      const enabled =
-        importable === true ||
-        (Array.isArray(importable) && importable.includes(kind));
-      if (!enabled) {
-        throw new Error(
-          `claydo: imports are not enabled for kind '${kind}'. Pass ` +
-            `{ importable: true } or { importable: ["${kind}"] } to union().`,
-        );
-      }
-      if (!(kind in kinds)) {
-        throw new Error(
-          `claydo: unknown kind '${kind}'. Registered kinds: ` +
-            `${Object.keys(kinds).join(", ")}.`,
-        );
-      }
-    }
-
     async __claydoBeginImport(
       kind: string,
       token: string,
@@ -455,23 +584,17 @@ export function union<R extends KindRegistry>(
     ): Promise<ImportBegin> {
       this.#checkMigrationAuth(secret);
       this.#checkImportEnabled(kind);
-      if (this.#impl !== undefined) {
-        throw new Error(
-          `claydo: instance '${this.#identity()}' is live as kind ` +
-            `'${this.#kind}'. Imports only target untouched instances.`,
-        );
-      }
       const persisted = await this.ctx.storage.get<unknown>([
         KIND_STORAGE_KEY,
         IMPORT_STATE_KEY,
       ]);
       const pinned = persisted.get(KIND_STORAGE_KEY) as string | undefined;
-      if (pinned !== undefined) {
+      if (pinned !== undefined || this.#kind !== undefined) {
         throw new Error(
-          `claydo: instance '${this.#identity()}' is already live as kind ` +
-            `'${pinned}'. Imports only target untouched instances. If racing ` +
-            `traffic polluted this instance, wipe it with wipeTarget() from ` +
-            `claydo/migrate.`,
+          `claydo: instance '${this.#identity()}' is live as kind ` +
+            `'${pinned ?? this.#kind}'. Imports only target untouched ` +
+            `instances. If racing traffic polluted this instance, wipe it ` +
+            `with wipeTarget() from claydo/migrate.`,
         );
       }
       const nameKind = this.#kindFromName();
@@ -485,17 +608,13 @@ export function union<R extends KindRegistry>(
       if (state !== undefined) {
         if (state.kind !== kind) {
           throw new Error(
-            `claydo: an import of kind '${state.kind}' is in progress on ` +
-              `instance '${this.#identity()}'; cannot import kind '${kind}'.`,
+            `claydo: an import of kind '${state.kind}' is already in progress.`,
           );
         }
         const ageMs = Date.now() - state.updatedAtMs;
         if (state.token !== token && ageMs < IMPORT_STALE_MS) {
-          // A refusal is a normal outcome of correct concurrency, so it
-          // travels as a value instead of polluting logs with a throw.
           return { ok: false, reason: "owned", ageMs };
         }
-        // Adopt: same driver retrying, or a stale import from a crashed one.
         state.token = token;
         state.updatedAtMs = Date.now();
         await this.ctx.storage.put(IMPORT_STATE_KEY, state);
@@ -506,6 +625,10 @@ export function union<R extends KindRegistry>(
           resumed: state.seq > 0,
         };
       }
+      // A previous failed import may have left an unreferenced facet after a
+      // runtime interruption. Facet deletion is isolated and cannot touch
+      // supervisor metadata or another kind.
+      this.ctx.facets.delete(kindFacetName(kind));
       const fresh: ImportState = {
         kind,
         seq: 0,
@@ -535,16 +658,9 @@ export function union<R extends KindRegistry>(
             `automatically).`,
         );
       }
-      if (state.kind !== kind) {
+      if (state.kind !== kind || state.token !== token) {
         throw new Error(
-          `claydo: an import of kind '${state.kind}' is in progress on ` +
-            `instance '${this.#identity()}'; cannot import kind '${kind}'.`,
-        );
-      }
-      if (state.token !== token) {
-        throw new Error(
-          `claydo: this import is owned by another migration driver ` +
-            `(instance '${this.#identity()}').`,
+          `claydo: this import is owned by another migration driver.`,
         );
       }
       if (seq <= state.seq) {
@@ -552,20 +668,121 @@ export function union<R extends KindRegistry>(
       }
       if (seq !== state.seq + 1) {
         throw new Error(
-          `claydo: out-of-order import chunk on instance ` +
-            `'${this.#identity()}': expected seq ${state.seq + 1}, got ${seq}.`,
+          `claydo: out-of-order import chunk: expected seq ${state.seq + 1}, ` +
+            `got ${seq}.`,
         );
       }
 
+      await this.#facet(kind).__claydoApplyImport(chunk);
+      if (chunk.rows !== undefined) {
+        state.applied.rows[chunk.rows.table] =
+          (state.applied.rows[chunk.rows.table] ?? 0) +
+          chunk.rows.values.length;
+      }
+      if (chunk.kv !== undefined) state.applied.kv += chunk.kv.length;
+      state.seq = seq;
+      state.cursor = chunk.cursor;
+      state.updatedAtMs = Date.now();
+
+      if (chunk.cursor !== null) {
+        await this.ctx.storage.put(IMPORT_STATE_KEY, state);
+        return { seq, alreadyApplied: false, done: false, applied: state.applied };
+      }
+
+      if (chunk.totals !== undefined) {
+        for (const table of Object.keys(chunk.totals.rows)) {
+          state.applied.rows[table] ??= 0;
+        }
+      }
+      // Kind visibility, import-state removal, and alarm transfer commit
+      // atomically in supervisor storage after the facet verifies its final
+      // chunk. A crash cannot expose a live kind without its alarm or leave
+      // a live kind blocked by stale import metadata.
+      await this.ctx.storage.transaction(async (txn) => {
+        await txn.put(KIND_STORAGE_KEY, kind);
+        await txn.delete(IMPORT_STATE_KEY);
+        if (typeof chunk.alarm === "number") {
+          await txn.setAlarm(Math.max(chunk.alarm, Date.now() + 1000));
+        } else {
+          await txn.deleteAlarm();
+        }
+      });
+      this.#kind = kind;
+      return { seq, alreadyApplied: false, done: true, applied: state.applied };
+    }
+
+    async __claydoAbortImport(
+      token: string,
+      secret?: string,
+    ): Promise<boolean> {
+      this.#checkMigrationAuth(secret);
+      const state = await this.ctx.storage.get<ImportState>(IMPORT_STATE_KEY);
+      if (state === undefined) return false;
+      if (state.token !== token) {
+        throw new Error(
+          `claydo: cannot abort an import owned by another migration driver. ` +
+            `Use wipeTarget() to force.`,
+        );
+      }
+      this.ctx.facets.delete(kindFacetName(state.kind));
+      await this.ctx.storage.delete(IMPORT_STATE_KEY);
+      await this.ctx.storage.deleteAlarm();
+      return true;
+    }
+
+    async __claydoReset(
+      confirmId: string,
+      secret?: string,
+    ): Promise<void> {
+      this.#checkMigrationAuth(secret);
+      if (options.importable === undefined || options.importable === false) {
+        throw new Error(
+          "claydo: reset requires imports to be enabled on union().",
+        );
+      }
+      const identity = this.#identity();
+      if (confirmId !== identity) {
+        throw new Error(
+          `claydo: reset confirmation mismatch: expected '${identity}', ` +
+            `got '${confirmId}'.`,
+        );
+      }
+      const persisted = await this.ctx.storage.get<unknown>([
+        KIND_STORAGE_KEY,
+        IMPORT_STATE_KEY,
+      ]);
+      const pinned = persisted.get(KIND_STORAGE_KEY) as string | undefined;
+      const importing = persisted.get(IMPORT_STATE_KEY) as
+        | ImportState
+        | undefined;
+      const nameKind = this.#kindFromName();
+      for (const kind of new Set(
+        [pinned, importing?.kind, nameKind].filter(
+          (value): value is string => value !== undefined,
+        ),
+      )) {
+        this.ctx.facets.delete(kindFacetName(kind));
+      }
+      await this.ctx.storage.deleteAll();
+      await this.ctx.storage.deleteAlarm();
+      this.#kind = undefined;
+      this.#kindLoading = undefined;
+    }
+
+    async __claydoApplyImport(chunk: ExportChunk): Promise<void> {
+      if (this.#facetProps === undefined) {
+        throw new Error("claydo: import chunks can only apply inside a facet.");
+      }
       const sql = this.ctx.storage.sql;
       for (const table of chunk.tables ?? []) {
-        sql.exec(table.ddl);
+        try {
+          sql.exec(table.ddl);
+        } catch (error) {
+          if (!String(error).includes("already exists")) throw error;
+        }
       }
       if (chunk.rows !== undefined) {
         const { table, columns, values, rowid } = chunk.rows;
-        // When the rowid travels as an explicit `__rowid__` first column,
-        // insert it as `rowid`. When a column aliases the rowid (INTEGER
-        // PRIMARY KEY), the column itself carries it, wherever it sits.
         const cols =
           rowid === "__rowid__"
             ? ["rowid", ...columns.slice(1).map(quoteIdent)]
@@ -576,29 +793,21 @@ export function union<R extends KindRegistry>(
         for (const row of values) {
           sql.exec(statement, ...(row as SqlValue[]));
         }
-        state.applied.rows[table] =
-          (state.applied.rows[table] ?? 0) + values.length;
       }
       if (chunk.kv !== undefined && chunk.kv.length > 0) {
         await this.ctx.storage.put(Object.fromEntries(chunk.kv));
-        state.applied.kv += chunk.kv.length;
       }
-      state.seq = seq;
-      state.cursor = chunk.cursor;
-      state.updatedAtMs = Date.now();
+      if (chunk.cursor !== null) return;
 
-      if (chunk.cursor !== null) {
-        await this.ctx.storage.put(IMPORT_STATE_KEY, state);
-        return { seq, alreadyApplied: false, done: false, applied: state.applied };
-      }
-
-      // Final chunk: replay post DDL, restore sequences, verify, go live.
       for (const ddl of chunk.post ?? []) {
-        sql.exec(ddl);
+        try {
+          sql.exec(ddl);
+        } catch (error) {
+          if (!String(error).includes("already exists")) throw error;
+        }
       }
       for (const [name, value] of chunk.sequences ?? []) {
         try {
-          // `sqlite_sequence` has no unique constraint, so replace by hand.
           sql.exec(`DELETE FROM sqlite_sequence WHERE name = ?`, name);
           sql.exec(
             `INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)`,
@@ -606,97 +815,57 @@ export function union<R extends KindRegistry>(
             value,
           );
         } catch {
-          // No AUTOINCREMENT table was created; nothing to restore.
+          // No AUTOINCREMENT table exists.
         }
       }
-      if (chunk.totals !== undefined) {
-        // Report zero-row tables in the summary too.
-        for (const table of Object.keys(chunk.totals.rows)) {
-          state.applied.rows[table] ??= 0;
-        }
-        const mismatches: string[] = [];
-        if (chunk.totals.kv !== state.applied.kv) {
+      if (chunk.totals === undefined) return;
+      const mismatches: string[] = [];
+      const kv = (await this.ctx.storage.list()).size;
+      if (kv !== chunk.totals.kv) {
+        mismatches.push(`kv: expected ${chunk.totals.kv}, applied ${kv}`);
+      }
+      for (const [table, expected] of Object.entries(chunk.totals.rows)) {
+        const actual = sql
+          .exec<{ n: number }>(
+            `SELECT count(*) AS n FROM ${quoteIdent(table)}`,
+          )
+          .one().n;
+        if (actual !== expected) {
           mismatches.push(
-            `kv: expected ${chunk.totals.kv}, applied ${state.applied.kv}`,
-          );
-        }
-        for (const [table, count] of Object.entries(chunk.totals.rows)) {
-          const applied = state.applied.rows[table] ?? 0;
-          if (applied !== count) {
-            mismatches.push(
-              `table '${table}': expected ${count} rows, applied ${applied}`,
-            );
-          }
-        }
-        if (mismatches.length > 0) {
-          await this.ctx.storage.put(IMPORT_STATE_KEY, state);
-          throw new Error(
-            `claydo: import verification failed on instance ` +
-              `'${this.#identity()}': ${mismatches.join("; ")}. The driver ` +
-              `aborts and rolls back automatically.`,
+            `table '${table}': expected ${expected}, applied ${actual}`,
           );
         }
       }
-      if (typeof chunk.alarm === "number") {
-        await this.ctx.storage.setAlarm(
-          Math.max(chunk.alarm, Date.now() + 1000),
-        );
-      }
-      await this.ctx.storage.delete(IMPORT_STATE_KEY);
-      await this.ctx.storage.put(KIND_STORAGE_KEY, kind);
-      return { seq, alreadyApplied: false, done: true, applied: state.applied };
-    }
-
-    async __claydoAbortImport(token: string, secret?: string): Promise<boolean> {
-      this.#checkMigrationAuth(secret);
-      const state = await this.ctx.storage.get<ImportState>(IMPORT_STATE_KEY);
-      if (state === undefined) return false;
-      if (state.token !== token) {
+      if (mismatches.length > 0) {
         throw new Error(
-          `claydo: cannot abort an import owned by another migration driver ` +
-            `(instance '${this.#identity()}'). Use wipeTarget() to force.`,
+          `claydo: import verification failed: ${mismatches.join("; ")}.`,
         );
       }
-      await this.ctx.storage.deleteAll();
-      await this.ctx.storage.deleteAlarm();
-      return true;
-    }
-
-    async __claydoReset(confirmId: string, secret?: string): Promise<void> {
-      this.#checkMigrationAuth(secret);
-      if (options.importable === undefined || options.importable === false) {
-        throw new Error(
-          "claydo: __claydoReset requires imports to be enabled on union().",
-        );
-      }
-      const identity = this.#identity();
-      if (confirmId !== identity) {
-        throw new Error(
-          `claydo: reset confirmation mismatch: expected '${identity}', ` +
-            `got '${confirmId}'. Pass the exact instance name or id.`,
-        );
-      }
-      await this.ctx.storage.deleteAll();
-      await this.ctx.storage.deleteAlarm();
-      this.#kind = undefined;
-      this.#impl = undefined;
-      this.#loading = undefined;
     }
 
     async fetch(request: Request): Promise<Response> {
-      let impl: KindHandlers;
+      if (this.#facetProps !== undefined) {
+        const impl = await this.#loadImpl();
+        if (typeof impl.fetch !== "function") {
+          return new Response(
+            `claydo: kind '${this.#facetProps.kind}' does not implement fetch().`,
+            { status: 501 },
+          );
+        }
+        return impl.fetch(request);
+      }
       try {
-        impl = await this.#load(
+        const kind = await this.#resolveKind(
           request.headers.get(KIND_HEADER) ?? undefined,
           request.headers.get(NO_INIT_HEADER) === null,
         );
+        const response = await this.#facet(kind).fetch(request);
+        await this.#completeFacetReset(kind);
+        return response;
       } catch (error) {
         const message =
           error instanceof Error ? error.message : String(error);
-        if (
-          (error as { code?: unknown } | null)?.code === "claydo_importing"
-        ) {
-          // Transient: a migration is filling this instance right now.
+        if ((error as { code?: unknown } | null)?.code === "CLAYDO_IMPORTING") {
           return new Response(message, {
             status: 503,
             headers: { "retry-after": "2" },
@@ -704,47 +873,87 @@ export function union<R extends KindRegistry>(
         }
         return new Response(message, { status: 400 });
       }
-      if (typeof impl.fetch !== "function") {
-        return new Response(
-          `claydo: kind '${this.#kind}' does not implement fetch().`,
-          { status: 501 },
-        );
-      }
-      return impl.fetch(request);
     }
 
-    /**
-     * Run one forwarded handler. Errors from these paths have no direct
-     * caller, so log them with kind and instance context before rethrowing.
-     */
-    async #forward(
-      handler: string,
+    async #runHandler(
+      name: string,
       run: (impl: object & KindHandlers) => unknown,
     ): Promise<void> {
       try {
-        const impl = await this.#load();
+        const impl = await this.#loadImpl();
         await run(impl);
       } catch (error) {
         console.error(
-          `claydo: ${handler} failed on kind ` +
-            `'${this.#kind ?? "?"}' instance '${this.#identity()}':`,
+          `claydo: ${name} failed on kind ` +
+            `'${this.#facetProps?.kind ?? "?"}' instance ` +
+            `'${this.#identity()}':`,
           error,
         );
         throw error;
       }
     }
 
+    async __claydoAlarm(alarmInfo?: AlarmInfoWire): Promise<void> {
+      await this.#runHandler("alarm()", (impl) => impl.alarm?.(alarmInfo));
+    }
+
+    async __claydoWebSocketMessage(
+      ws: WebSocket,
+      message: string | ArrayBuffer,
+    ): Promise<void> {
+      await this.#runHandler("webSocketMessage()", (impl) =>
+        impl.webSocketMessage?.(ws, message),
+      );
+    }
+
+    async __claydoWebSocketClose(
+      ws: WebSocket,
+      code: number,
+      reason: string,
+      wasClean: boolean,
+    ): Promise<void> {
+      await this.#runHandler("webSocketClose()", (impl) =>
+        impl.webSocketClose?.(ws, code, reason, wasClean),
+      );
+    }
+
+    async __claydoWebSocketError(
+      ws: WebSocket,
+      error: unknown,
+    ): Promise<void> {
+      await this.#runHandler("webSocketError()", (impl) =>
+        impl.webSocketError?.(ws, error),
+      );
+    }
+
     async alarm(alarmInfo?: AlarmInvocationInfo): Promise<void> {
-      await this.#forward("alarm()", (impl) => impl.alarm?.(alarmInfo));
+      if (this.#facetProps !== undefined) {
+        await this.__claydoAlarm(alarmInfo);
+        return;
+      }
+      const kind = await this.#resolveKind();
+      await this.#facet(kind).__claydoAlarm(
+        alarmInfo === undefined
+          ? undefined
+          : {
+              isRetry: alarmInfo.isRetry,
+              retryCount: alarmInfo.retryCount,
+              scheduledTime: alarmInfo.scheduledTime,
+            },
+      );
+      await this.#completeFacetReset(kind);
     }
 
     async webSocketMessage(
       ws: WebSocket,
       message: string | ArrayBuffer,
     ): Promise<void> {
-      await this.#forward("webSocketMessage()", (impl) =>
-        impl.webSocketMessage?.(ws, message),
-      );
+      if (this.#facetProps !== undefined) {
+        await this.__claydoWebSocketMessage(ws, message);
+        return;
+      }
+      const kind = await this.#resolveKind();
+      await this.#facet(kind).__claydoWebSocketMessage(ws, message);
     }
 
     async webSocketClose(
@@ -753,29 +962,59 @@ export function union<R extends KindRegistry>(
       reason: string,
       wasClean: boolean,
     ): Promise<void> {
-      await this.#forward("webSocketClose()", (impl) =>
-        impl.webSocketClose?.(ws, code, reason, wasClean),
+      if (this.#facetProps !== undefined) {
+        await this.__claydoWebSocketClose(ws, code, reason, wasClean);
+        return;
+      }
+      const kind = await this.#resolveKind();
+      await this.#facet(kind).__claydoWebSocketClose(
+        ws,
+        code,
+        reason,
+        wasClean,
       );
     }
 
     async webSocketError(ws: WebSocket, error: unknown): Promise<void> {
-      await this.#forward("webSocketError()", (impl) =>
-        impl.webSocketError?.(ws, error),
-      );
+      if (this.#facetProps !== undefined) {
+        await this.__claydoWebSocketError(ws, error);
+        return;
+      }
+      const kind = await this.#resolveKind();
+      await this.#facet(kind).__claydoWebSocketError(ws, error);
     }
   }
 
   return GenericDurableObject as unknown as GenericDurableObjectClass<R>;
 }
 
-/**
- * Returns the logical name of the current instance, without the `<kind>:`
- * prefix. Returns `undefined` for instances created with `newUniqueId()` or
- * accessed with `idFromString()`.
- *
- * Safe to call anywhere in a kind implementation, including its constructor:
- * kinds construct lazily on first contact, after `ctx.id.name` is available.
- */
+function validateRegistry(kinds: KindRegistry): void {
+  for (const [name, Kind] of Object.entries(kinds)) {
+    if (name.includes(":") || name.startsWith("__") || name.length === 0) {
+      throw new Error(
+        `claydo: invalid kind name '${name}'. Kind names must be non-empty, ` +
+          `must not contain ':', and must not start with '__'.`,
+      );
+    }
+    let proto: object | null = Kind.prototype as object;
+    while (proto !== null && proto !== Object.prototype) {
+      for (const key of RESERVED_STUB_KEYS) {
+        const descriptor = Object.getOwnPropertyDescriptor(proto, key);
+        if (descriptor && typeof descriptor.value === "function") {
+          throw new Error(
+            `claydo: kind '${name}' (class ${Kind.name}) defines a method ` +
+              `named '${key}'. The stub reserves ` +
+              `'${RESERVED_STUB_KEYS.join("', '")}' for metadata, so this ` +
+              `method would not be callable. Rename the method.`,
+          );
+        }
+      }
+      proto = Object.getPrototypeOf(proto);
+    }
+  }
+}
+
+/** Returns the logical instance name without its `<kind>:` prefix. */
 export function instanceName(ctx: DurableObjectState): string | undefined {
   const name = ctx.id.name;
   if (name === undefined) return undefined;
@@ -784,16 +1023,9 @@ export function instanceName(ctx: DurableObjectState): string | undefined {
 }
 
 /**
- * Clears all storage of the current instance but keeps its kind pinned.
- *
- * Use this instead of `ctx.storage.deleteAll()` inside a kind. A raw
- * `deleteAll()` also deletes the persisted kind marker, which turns
- * unique-ID instances into kind-less husks.
+ * Clears all kind storage. The kind pin lives in the isolated supervisor,
+ * so unlike the pre-facet architecture, a normal `deleteAll()` is safe.
  */
 export async function resetStorage(ctx: DurableObjectState): Promise<void> {
-  const kind = await ctx.storage.get<string>(KIND_STORAGE_KEY);
   await ctx.storage.deleteAll();
-  if (kind !== undefined) {
-    await ctx.storage.put(KIND_STORAGE_KEY, kind);
-  }
 }

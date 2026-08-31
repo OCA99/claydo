@@ -2,6 +2,7 @@ import {
   createExecutionContext,
   env,
   runDurableObjectAlarm,
+  runInDurableObject,
   waitOnExecutionContext,
 } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
@@ -90,6 +91,28 @@ describe("kind isolation", () => {
     expect(await response.text()).toMatch(
       /Raw namespace access .* reaches a different instance/,
     );
+  });
+});
+
+describe("facet storage isolation", () => {
+  it("keeps user SQL and KV out of supervisor storage", async () => {
+    const counter = kind(env.APP_DO, "counter").get("facet-isolation");
+    await counter.increment(9);
+    await runInDurableObject(counter.stub, async (_instance, state) => {
+      const tables = state.storage.sql
+        .exec<{ name: string }>(
+          `SELECT name FROM sqlite_master
+           WHERE type = 'table' AND name NOT LIKE '_cf_%'`,
+        )
+        .toArray()
+        .map((row) => row.name);
+      expect(tables).not.toContain("counters");
+      expect([...((await state.storage.list()).keys())]).toEqual([
+        "__claydo:kind",
+      ]);
+    });
+    // The isolated facet still owns and serves the data.
+    expect(await counter.value()).toBe(9);
   });
 });
 
@@ -234,6 +257,23 @@ describe("alarms", () => {
     );
     expect(ran).toBe(true);
     expect(await reminder.fired()).toBe("fired:water the plants");
+  });
+
+  it("serializes AlarmInvocationInfo into the facet", async () => {
+    const reminder = kind(env.APP_DO, "reminder").get("alarm-info");
+    await reminder.remind("inspect info");
+    await runInDurableObject(reminder.stub, async (instance) => {
+      await instance.alarm!({
+        isRetry: true,
+        retryCount: 2,
+        scheduledTime: 123456,
+      });
+    });
+    expect(await reminder.alarmInfo()).toEqual({
+      isRetry: true,
+      retryCount: 2,
+      scheduledTime: 123456,
+    });
   });
 });
 

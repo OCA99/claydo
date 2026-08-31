@@ -1,6 +1,11 @@
-import { DurableObject } from "cloudflare:workers";
 import { Server, type Connection, type WSMessage } from "partyserver";
-import { instanceName, kind, resetStorage, union } from "../../src/index";
+import {
+  DurableObject,
+  instanceName,
+  kind,
+  resetStorage,
+  union,
+} from "../../src/index";
 import { exportable } from "../../src/migrate";
 
 export interface Env {
@@ -72,13 +77,32 @@ export class Reminder extends DurableObject<Env> {
     await this.ctx.storage.setAlarm(Date.now() + 60_000);
   }
 
-  async alarm(): Promise<void> {
+  async alarm(info?: AlarmInvocationInfo): Promise<void> {
     const text = await this.ctx.storage.get<string>("text");
     await this.ctx.storage.put("fired", `fired:${text}`);
+    await this.ctx.storage.put("alarm-info", {
+      isRetry: info?.isRetry,
+      retryCount: info?.retryCount,
+      scheduledTime: info?.scheduledTime,
+    });
   }
 
   async fired(): Promise<string | null> {
     return (await this.ctx.storage.get<string>("fired")) ?? null;
+  }
+
+  async alarmInfo(): Promise<{
+    isRetry?: boolean;
+    retryCount?: number;
+    scheduledTime?: number;
+  }> {
+    return (
+      (await this.ctx.storage.get("alarm-info")) as {
+        isRetry?: boolean;
+        retryCount?: number;
+        scheduledTime?: number;
+      }
+    ) ?? {};
   }
 }
 
@@ -258,6 +282,16 @@ export class Tally extends DurableObject<Env> {
   searchDocs(query: string): string[] {
     return this.ctx.storage.sql
       .exec<{ body: string }>(`SELECT body FROM docs WHERE docs MATCH ?`, query)
+      .toArray()
+      .map((row) => row.body);
+  }
+
+  searchArticles(query: string): string[] {
+    return this.ctx.storage.sql
+      .exec<{ body: string }>(
+        `SELECT body FROM articles_fts WHERE articles_fts MATCH ?`,
+        query,
+      )
       .toArray()
       .map((row) => row.body);
   }

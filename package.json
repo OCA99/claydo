@@ -1,7 +1,7 @@
 {
   "name": "claydo",
   "version": "0.1.0",
-  "description": "One Durable Object class, many use cases. Route each instance to a fixed kind and stay under the namespace limit.",
+  "description": "One Durable Object class, many isolated facet-backed kinds.",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -15,6 +15,7 @@
     "cloudflare",
     "workers",
     "durable-objects",
+    "durable-object-facets",
     "cloudflare-workers"
   ],
   "type": "module",
@@ -40,13 +41,15 @@
   "scripts": {
     "build": "tsup",
     "check": "tsc --noEmit",
+    "check:examples": "for c in examples/*/tsconfig.json; do tsc --noEmit -p \"$c\" || exit 1; done",
     "test": "vitest run",
     "test:examples": "for c in examples/*/vitest.config.ts; do vitest run --config \"$c\" || exit 1; done",
+    "test:all": "npm run check && npm run check:examples && npm test && npm run test:examples && npm run build",
     "test:watch": "vitest",
     "prepublishOnly": "npm run check && npm run build"
   },
   "peerDependencies": {
-    "@cloudflare/workers-types": "^4.0.0 || ^5.0.0"
+    "@cloudflare/workers-types": "^5.20260815.0"
   },
   "peerDependenciesMeta": {
     "@cloudflare/workers-types": {
@@ -55,11 +58,11 @@
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.22.0",
-    "@cloudflare/workers-types": "^5.20260819.1",
+    "@cloudflare/workers-types": "^5.20260831.1",
     "partyserver": "^0.5.10",
     "tsup": "^8.5.1",
-    "typescript": "^5.9.0",
-    "vitest": "^4.1.0",
-    "wrangler": "^4.124.0"
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.11",
+    "wrangler": "^4.127.1"
   }
 }

@@ -13,5 +13,9 @@ export type {
   KindStub,
   RegistryOf,
 } from "./client";
-export { KIND_HEADER, KIND_STORAGE_KEY, NO_INIT_HEADER } from "./types";
+/**
+ * Use this as the base class for claydo kinds. It is Cloudflare's Durable
+ * Object with facet alarm virtualization built in.
+ */
+export { FacetDurableObject as DurableObject } from "./types";
 export type { KindClass, KindHandlers, KindRegistry } from "./types";
