@@ -10,6 +10,7 @@ import {
   migrated,
   previewInstance,
   wipeTarget,
+  type ExportChunk,
   type MigrationProgress,
 } from "../src/migrate";
 import type { ImportState } from "../src/migrate-wire";
@@ -137,6 +138,118 @@ describe("migrateInstance", () => {
     expect((await old.__claydoSealed()).movedTo).toBe("tally:m4");
   });
 
+  it("replays a chunk idempotently after facet commit before supervisor checkpoint", async () => {
+    await seed("m4-checkpoint");
+    const old = legacy("m4-checkpoint");
+    const raw = rawTarget("m4-checkpoint");
+    const token = "checkpoint-crash";
+    await old.__claydoSeal();
+    await raw.__claydoBeginImport("tally", token);
+    const first = (await old.__claydoExport(undefined, null, {
+      maxRows: 1,
+    })) as ExportChunk;
+    await raw.__claydoImport("tally", first, 1, token);
+    const rowChunk = (await old.__claydoExport(
+      undefined,
+      first.cursor,
+      { maxRows: 1 },
+    )) as ExportChunk;
+    expect(rowChunk.rows?.values.length).toBe(1);
+
+    // Simulate the exact crash window: the staging facet atomically applied
+    // seq 2 and its local checkpoint, but the supervisor never updated
+    // IMPORT_STATE_KEY. Replaying through the public import method must not
+    // insert the row twice.
+    await runInDurableObject(raw, async (_instance, state) => {
+      const host = (
+        state.exports as unknown as Record<
+          string,
+          (options: { props: unknown }) => DurableObjectClass
+        >
+      ).AppDO!;
+      const configured = host({
+        props: {
+          __claydoFacet: true,
+          kind: "tally",
+          hostExport: "AppDO",
+        },
+      });
+      const stage = state.facets.get("import:tally", () => ({
+        class: configured,
+      })) as unknown as {
+        __claydoApplyImport(
+          chunk: ExportChunk,
+          seq: number,
+        ): Promise<boolean>;
+      };
+      expect(await stage.__claydoApplyImport(rowChunk, 2)).toBe(true);
+    });
+    const replay = await raw.__claydoImport(
+      "tally",
+      rowChunk,
+      2,
+      token,
+    );
+    expect(replay.alreadyApplied).toBe(true);
+    expect(replay.applied.rows["counts"]).toBe(1);
+
+    await runInDurableObject(raw, async (_instance, state) => {
+      const s = (await state.storage.get("__claydo:import")) as ImportState;
+      s.updatedAtMs = Date.now() - 60_000;
+      await state.storage.put("__claydo:import", s);
+    });
+    const summary = await migrateInstance({
+      from: old,
+      to: tally(),
+      name: "m4-checkpoint",
+      maxRowsPerChunk: 1,
+    });
+    expect(summary.resumed).toBe(true);
+    expect(await tally().get("m4-checkpoint").total()).toBe(5);
+  });
+
+  it("re-verifies a failed final chunk on every retry", async () => {
+    await seed("m4-verify-retry");
+    const old = legacy("m4-verify-retry");
+    const raw = rawTarget("m4-verify-retry");
+    const token = "verify-retry";
+    await old.__claydoSeal(undefined, undefined, "tally:m4-verify-retry");
+    await raw.__claydoBeginImport("tally", token);
+    let cursor: ExportChunk["cursor"] = null;
+    let seq = 0;
+    for (;;) {
+      const chunk = (await old.__claydoExport(
+        undefined,
+        cursor,
+        { maxRows: 1 },
+      )) as ExportChunk;
+      seq += 1;
+      if (chunk.cursor === null) {
+        chunk.totals!.rows.counts =
+          (chunk.totals!.rows.counts ?? 0) + 1;
+        await expectRejects(
+          () => raw.__claydoImport("tally", chunk, seq, token),
+          /import verification failed/,
+        );
+        // The staging checkpoint already contains this seq. A duplicate
+        // final chunk must still run verification and fail again, rather
+        // than cloning/publishing unverified data.
+        await expectRejects(
+          () => raw.__claydoImport("tally", chunk, seq, token),
+          /import verification failed/,
+        );
+        break;
+      }
+      await raw.__claydoImport("tally", chunk, seq, token);
+      cursor = chunk.cursor;
+    }
+    const status = await raw.__claydoImportStatus();
+    expect(status.kind).toBeUndefined();
+    expect(status.importing).toBeDefined();
+    await raw.__claydoAbortImport(token);
+    await old.__claydoUnseal();
+  });
+
   it("blocks traffic on the target while an import is in progress", async () => {
     await seed("m5");
     const old = legacy("m5");
@@ -258,6 +371,18 @@ describe("migrateInstance", () => {
     expect(await old.bump("a")).toBe(3);
   });
 
+  it("blocks RPC methods that use constructor-captured storage", async () => {
+    const old = legacy("m9-captured");
+    await old.bump("x");
+    await old.__claydoSeal();
+    await expectRejects(
+      () => old.putThroughCapturedStorage("late", "write"),
+      /is sealed/,
+    );
+    await old.__claydoUnseal();
+    expect(await old.getRaw("late")).toBeUndefined();
+  });
+
   it("skips instances with no data instead of fabricating sealed husks", async () => {
     const summary = await migrateInstance({
       from: legacy("never-existed"),
@@ -307,6 +432,53 @@ describe("migrateInstance", () => {
     const moved = tally().get("m12");
     await moved.bump("d");
     expect(await moved.maxCountId()).toBe(4); // not 3
+  });
+
+  it("refuses to copy one old instance to a second target", async () => {
+    await seed("one-source");
+    const old = legacy("one-source");
+    await migrateInstance({
+      from: old,
+      to: tally(),
+      name: "one-target",
+    });
+    await expectRejects(
+      () =>
+        migrateInstance({
+          from: old,
+          to: tally(),
+          name: "second-target",
+        }),
+      /already claimed by target 'tally:one-target'/,
+    );
+    expect(await tally().get("one-target").total()).toBe(5);
+    expect((await rawTarget("second-target").__claydoImportStatus()).kind)
+      .toBeUndefined();
+  });
+
+  it("lets only one concurrent target claim a source", async () => {
+    await seed("claim-race");
+    const old = legacy("claim-race");
+    const names = ["claim-a", "claim-b"] as const;
+    const results = await Promise.allSettled(
+      names.map((name) =>
+        migrateInstance({ from: old, to: tally(), name }),
+      ),
+    );
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(
+      1,
+    );
+    const failed = results.find(
+      (result): result is PromiseRejectedResult =>
+        result.status === "rejected",
+    );
+    expect(String(failed?.reason)).toMatch(/already claimed by target/);
+    const winner = names[results.findIndex((result) => result.status === "fulfilled")]!;
+    const loser = names.find((name) => name !== winner)!;
+    expect(await tally().get(winner).total()).toBe(5);
+    const loserStatus = await rawTarget(loser).__claydoImportStatus();
+    expect(loserStatus.kind).toBeUndefined();
+    expect(loserStatus.importing).toBeUndefined();
   });
 });
 
@@ -408,6 +580,32 @@ describe("migrated() router", () => {
     // A real touch still migrates, and resolve() notices.
     expect(await accessor.get("r10").total()).toBe(5);
     expect(await accessor.resolve("r10")).toBe("new");
+  });
+
+  it("lazy routing adopts a stale crashed import instead of caching new", async () => {
+    await seed("r11");
+    const old = legacy("r11");
+    const raw = rawTarget("r11");
+    await old.__claydoSeal(undefined, undefined, "tally:r11");
+    await raw.__claydoBeginImport("tally", "dead-router-driver");
+    const first = await old.__claydoExport(undefined, null, { maxRows: 1 });
+    await raw.__claydoImport(
+      "tally",
+      first,
+      1,
+      "dead-router-driver",
+    );
+    await runInDurableObject(raw, async (_instance, state) => {
+      const importState = (await state.storage.get(
+        "__claydo:import",
+      )) as ImportState;
+      importState.updatedAtMs = Date.now() - 60_000;
+      await state.storage.put("__claydo:import", importState);
+    });
+
+    const accessor = migrated(env.LEGACY, tally(), { strategy: "lazy" });
+    expect(await accessor.get("r11").total()).toBe(5);
+    expect(await accessor.resolve("r11")).toBe("new");
   });
 });
 
@@ -518,6 +716,24 @@ describe("previewInstance and progress", () => {
     const preview = await previewInstance({ from: old });
     expect(preview.blockers.length).toBe(1);
     expect(preview.blockers[0]).toMatch(/WITHOUT ROWID/);
+  });
+
+  it("rejects the exact staging checkpoint key before sealing", async () => {
+    const old = legacy("p-checkpoint-key");
+    await old.bump("x");
+    await old.putRaw("__claydo:import-checkpoint", "user value");
+    const preview = await previewInstance({ from: old });
+    expect(preview.blockers.join(" ")).toMatch(/reserved for target staging/);
+    await expectRejects(
+      () =>
+        migrateInstance({
+          from: old,
+          to: tally(),
+          name: "p-checkpoint-key",
+        }),
+      /reserved for target staging/,
+    );
+    expect((await old.__claydoSealed()).sealed).toBe(false);
   });
 
   it("reports progress per chunk", async () => {

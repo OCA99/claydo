@@ -53,6 +53,10 @@ export class Counter extends DurableObject<Env> {
 
 /** A kind with a fetch() handler and hibernating WebSockets. */
 export class Echo extends DurableObject<Env> {
+  async marker(): Promise<string | undefined> {
+    return this.ctx.storage.get<string>("marker");
+  }
+
   async fetch(request: Request): Promise<Response> {
     if (request.headers.get("Upgrade") === "websocket") {
       const pair = new WebSocketPair();
@@ -66,6 +70,11 @@ export class Echo extends DurableObject<Env> {
     ws: WebSocket,
     message: string | ArrayBuffer,
   ): Promise<void> {
+    if (message === "reset") {
+      await this.ctx.storage.put("marker", "before-reset");
+      await this.ctx.storage.deleteAll();
+      return;
+    }
     ws.send(`echo:${message}`);
   }
 }
@@ -104,6 +113,10 @@ export class Reminder extends DurableObject<Env> {
       }
     ) ?? {};
   }
+
+  async wipe(): Promise<void> {
+    await this.ctx.storage.deleteAll();
+  }
 }
 
 /** A kind with no handlers, to exercise error paths. */
@@ -126,6 +139,19 @@ export class Teapot extends DurableObject<Env> {
   explode(): never {
     throw new TeapotError("I am a teapot");
   }
+
+  explodeWithThrowingField(): never {
+    const error = Object.assign(new Error("still serializable"), {
+      code: "SAFE_CODE",
+    });
+    Object.defineProperty(error, "hostile", {
+      enumerable: true,
+      get(): never {
+        throw new Error("getter exploded");
+      },
+    });
+    throw error;
+  }
 }
 
 /** A kind that wipes its own storage, to exercise resetStorage(). */
@@ -140,6 +166,12 @@ export class Vault extends DurableObject<Env> {
 
   async wipe(): Promise<void> {
     await resetStorage(this.ctx);
+  }
+
+  async wipeAndFinishWork(): Promise<string> {
+    await this.ctx.storage.deleteAll();
+    await scheduler.wait(25);
+    return "finished";
   }
 }
 
@@ -165,8 +197,11 @@ export class PartyRoom extends Server<Env> {
  * old binding's class during migration.
  */
 export class Tally extends DurableObject<Env> {
+  readonly #capturedStorage: DurableObjectStorage;
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
+    this.#capturedStorage = ctx.storage;
     ctx.storage.sql.exec(
       `CREATE TABLE IF NOT EXISTS counts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -233,6 +268,10 @@ export class Tally extends DurableObject<Env> {
 
   async putRaw(key: string, value: string): Promise<void> {
     await this.ctx.storage.put(key, value);
+  }
+
+  async putThroughCapturedStorage(key: string, value: string): Promise<void> {
+    await this.#capturedStorage.put(key, value);
   }
 
   async getRaw(key: string): Promise<string | undefined> {

@@ -5,7 +5,7 @@ import {
   runInDurableObject,
   waitOnExecutionContext,
 } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { kind, kinds, union } from "../src/index";
 import worker from "./fixtures/worker";
 
@@ -168,6 +168,21 @@ describe("error fidelity", () => {
       /'label' on kind 'plain' is a property, not a method/,
     );
   });
+
+  it("skips throwing error getters while preserving safe fields", async () => {
+    const teapot = kind(env.APP_DO, "teapot").get("hostile-error");
+    let caught: unknown;
+    try {
+      await teapot.explodeWithThrowingField();
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toMatchObject({
+      message: "still serializable",
+      code: "SAFE_CODE",
+    });
+    expect((caught as Record<string, unknown>).hostile).toBeUndefined();
+  });
 });
 
 describe("resetStorage()", () => {
@@ -179,6 +194,23 @@ describe("resetStorage()", () => {
     expect(await vault.getValue("k")).toBeUndefined();
     const raw = env.APP_DO.get(env.APP_DO.idFromString(vault.id.toString()));
     expect(await raw.__claydoKind()).toBe("vault");
+  });
+
+  it("does not delete the facet before the resetting method returns", async () => {
+    const vault = kind(env.APP_DO, "vault").get("reset-finish");
+    await vault.set("k", "v");
+    expect(await vault.wipeAndFinishWork()).toBe("finished");
+    expect(await vault.getValue("k")).toBeUndefined();
+  });
+
+  it("blocks concurrent calls until a facet reset completes", async () => {
+    const vault = kind(env.APP_DO, "vault").get("reset-race");
+    await vault.set("k", "v");
+    const resetting = vault.wipeAndFinishWork();
+    await scheduler.wait(5);
+    const racingRead = vault.getValue("k");
+    expect(await resetting).toBe("finished");
+    expect(await racingRead).toBeUndefined();
   });
 });
 
@@ -246,6 +278,23 @@ describe("fetch and websockets", () => {
     expect(reply).toBe("echo:hi");
     ws.close();
   });
+
+  it("completes a facet reset requested by a WebSocket handler", async () => {
+    const echo = kind(env.APP_DO, "echo").get("ws-reset");
+    const response = await echo.fetch("https://do/ws", {
+      headers: { Upgrade: "websocket" },
+    });
+    const ws = response.webSocket!;
+    ws.accept();
+    ws.send("reset");
+    await vi.waitFor(
+      async () => {
+        expect(await echo.marker()).toBeUndefined();
+      },
+      { timeout: 2_000, interval: 10 },
+    );
+    ws.close();
+  });
 });
 
 describe("alarms", () => {
@@ -274,6 +323,18 @@ describe("alarms", () => {
       retryCount: 2,
       scheduledTime: 123456,
     });
+  });
+
+  it("reset atomically removes the supervisor alarm", async () => {
+    const reminder = kind(env.APP_DO, "reminder").get("alarm-reset");
+    await reminder.remind("must not fire");
+    await reminder.wipe();
+    expect(
+      await runDurableObjectAlarm(
+        env.APP_DO.get(env.APP_DO.idFromName("reminder:alarm-reset")),
+      ),
+    ).toBe(false);
+    expect(await reminder.fired()).toBeNull();
   });
 });
 

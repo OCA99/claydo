@@ -10,6 +10,9 @@ export const SEAL_KEY = "__claydo:sealed";
 /** Supervisor storage key on the NEW instance that tracks an import. */
 export const IMPORT_STATE_KEY = "__claydo:import";
 
+/** Temporary checkpoint key used only inside a target staging facet. */
+export const IMPORT_CHECKPOINT_KEY = "__claydo:import-checkpoint";
+
 /**
  * The only key the exporter adds to OLD user storage. The target's kind and
  * import metadata live in isolated supervisor storage, so every other old

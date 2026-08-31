@@ -1,6 +1,7 @@
 import { DurableObject as CloudflareDurableObject } from "cloudflare:workers";
 import {
   IMPORT_STALE_MS,
+  IMPORT_CHECKPOINT_KEY,
   IMPORT_STATE_KEY,
   quoteIdent,
   type ExportChunk,
@@ -11,8 +12,10 @@ import {
   type SqlValue,
 } from "./migrate-wire";
 import {
+  consumeFacetResetRequest,
   facetContext,
   facetProps,
+  isFacetResetActive,
   kindFacetName,
   KIND_HEADER,
   KIND_STORAGE_KEY,
@@ -57,12 +60,12 @@ function toWireError(error: unknown): WireError {
   const props: Record<string, unknown> = {};
   for (const key of Object.keys(error)) {
     if (key === "name" || key === "message" || key === "stack") continue;
-    const value = (error as unknown as Record<string, unknown>)[key];
     try {
+      const value = (error as unknown as Record<string, unknown>)[key];
       structuredClone(value);
       props[key] = value;
     } catch {
-      // Non-cloneable error fields cannot cross Workers RPC.
+      // Skip throwing getters and non-cloneable fields.
     }
   }
   if (Object.keys(props).length > 0) wire.props = props;
@@ -88,7 +91,8 @@ interface FacetRuntimeStub {
     wasClean: boolean,
   ): Promise<void>;
   __claydoWebSocketError(ws: WebSocket, error: unknown): Promise<void>;
-  __claydoApplyImport(chunk: ExportChunk): Promise<void>;
+  __claydoApplyImport(chunk: ExportChunk, seq: number): Promise<boolean>;
+  __claydoPrepareImportClone(): Promise<void>;
   fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response>;
 }
 
@@ -96,6 +100,17 @@ type AlarmInfoWire = Pick<
   AlarmInvocationInfo,
   "isRetry" | "retryCount" | "scheduledTime"
 >;
+
+const IMPORT_FACET_PREFIX = "import:";
+
+interface FacetResetState {
+  kind: string;
+  phase: "resetting" | "ready";
+  updatedAt: number;
+}
+function importFacetName(kind: string): string {
+  return `${IMPORT_FACET_PREFIX}${kind}`;
+}
 
 interface LoopbackHostClass {
   (options: { props?: unknown }): DurableObjectClass;
@@ -121,7 +136,9 @@ export interface GenericDurableObjectInstance<R extends KindRegistry>
   __claydoSetAlarm(kind: string, timestamp: number): Promise<void>;
   __claydoGetAlarm(kind: string): Promise<number | null>;
   __claydoDeleteAlarm(kind: string): Promise<void>;
-  __claydoFacetReset(kind: string): Promise<void>;
+  __claydoBeginFacetReset(kind: string): Promise<void>;
+  __claydoFinishFacetReset(kind: string): Promise<void>;
+  __claydoCompleteFacetReset(kind: string): Promise<void>;
   __claydoBeginImport(
     kind: string,
     token: string,
@@ -188,6 +205,7 @@ export function union<R extends KindRegistry>(
     #kindLoading?: Promise<string>;
     #impl?: object & KindHandlers;
     #implLoading?: Promise<object & KindHandlers>;
+    readonly #activeFacetResets = new Set<string>();
 
     constructor(ctx: DurableObjectState, env: unknown) {
       super(ctx, env);
@@ -225,7 +243,7 @@ export function union<R extends KindRegistry>(
       return exported;
     }
 
-    #facet(kind: string): FacetRuntimeStub {
+    #namedFacet(kind: string, name: string): FacetRuntimeStub {
       const hostClass = this.#hostClass();
       const props: ClaydoFacetProps = {
         __claydoFacet: true,
@@ -233,9 +251,17 @@ export function union<R extends KindRegistry>(
         hostExport: this.#hostExport(),
       };
       const configured = hostClass({ props });
-      return this.ctx.facets.get(kindFacetName(kind), () => ({
+      return this.ctx.facets.get(name, () => ({
         class: configured,
       })) as unknown as FacetRuntimeStub;
+    }
+
+    #facet(kind: string): FacetRuntimeStub {
+      return this.#namedFacet(kind, kindFacetName(kind));
+    }
+
+    #importFacet(kind: string): FacetRuntimeStub {
+      return this.#namedFacet(kind, importFacetName(kind));
     }
 
     #kindFromName(): string | undefined {
@@ -454,16 +480,19 @@ export function union<R extends KindRegistry>(
       } catch (error) {
         return { ok: false, error: toWireError(error) };
       }
+      await this.#waitForFacetReset(resolved);
       // Do not envelope transport/serialization failures from the facet:
       // the client distinguishes them and adds kind + method call context.
-      const result = (await this.#facet(resolved).__claydoCall(
-        resolved,
-        method,
-        args,
-        allowInit,
-      )) as ClaydoCallResult;
-      await this.#completeFacetReset(resolved);
-      return result;
+      try {
+        return (await this.#facet(resolved).__claydoCall(
+          resolved,
+          method,
+          args,
+          allowInit,
+        )) as ClaydoCallResult;
+      } finally {
+        await this.#completeFacetReset(resolved);
+      }
     }
 
     async __claydoKind(): Promise<string | undefined> {
@@ -501,21 +530,84 @@ export function union<R extends KindRegistry>(
       await this.ctx.storage.deleteAlarm();
     }
 
-    async __claydoFacetReset(kind: string): Promise<void> {
+    async __claydoBeginFacetReset(kind: string): Promise<void> {
       await this.#assertAlarmKind(kind);
-      await this.ctx.storage.put("__claydo:reset-facet", kind);
+      this.#activeFacetResets.add(kind);
+      try {
+        await this.ctx.storage.put("__claydo:reset-facet", {
+          kind,
+          phase: "resetting",
+          updatedAt: Date.now(),
+        } satisfies FacetResetState);
+      } catch (error) {
+        this.#activeFacetResets.delete(kind);
+        throw error;
+      }
+    }
+
+    async __claydoFinishFacetReset(kind: string): Promise<void> {
+      await this.#assertAlarmKind(kind);
+      await this.ctx.storage.put("__claydo:reset-facet", {
+        kind,
+        phase: "ready",
+        updatedAt: Date.now(),
+      } satisfies FacetResetState);
+    }
+
+    async __claydoCompleteFacetReset(kind: string): Promise<void> {
+      await this.#completeFacetReset(kind);
     }
 
     async #completeFacetReset(kind: string): Promise<void> {
-      const requested = await this.ctx.storage.get<string>(
+      const requested = await this.ctx.storage.get<FacetResetState>(
         "__claydo:reset-facet",
       );
-      if (requested !== kind) return;
-      await this.ctx.storage.delete("__claydo:reset-facet");
-      this.ctx.facets.abort(
-        kindFacetName(kind),
-        new Error("claydo: facet reset completed"),
-      );
+      if (
+        requested?.kind !== kind ||
+        requested.phase !== "ready"
+      ) {
+        return;
+      }
+      this.ctx.facets.delete(kindFacetName(kind));
+      await this.ctx.storage.transaction(async (txn) => {
+        await txn.delete("__claydo:reset-facet");
+        await txn.deleteAlarm();
+      });
+      this.#activeFacetResets.delete(kind);
+    }
+
+    async #waitForFacetReset(kind: string): Promise<boolean> {
+      const deadline = Date.now() + 5_000;
+      let observedReset = false;
+      for (;;) {
+        const requested = await this.ctx.storage.get<FacetResetState>(
+          "__claydo:reset-facet",
+        );
+        if (requested?.kind !== kind) return observedReset;
+        observedReset = true;
+        if (!this.#activeFacetResets.has(kind)) {
+          // A persisted marker without its in-memory owner means the
+          // supervisor restarted during reset. Discard the possibly partial
+          // facet and recover instead of wedging forever.
+          this.ctx.facets.delete(kindFacetName(kind));
+          await this.ctx.storage.transaction(async (txn) => {
+            await txn.delete("__claydo:reset-facet");
+            await txn.deleteAlarm();
+          });
+          this.#activeFacetResets.delete(kind);
+          return true;
+        }
+        if (Date.now() >= deadline) {
+          this.ctx.facets.delete(kindFacetName(kind));
+          await this.ctx.storage.transaction(async (txn) => {
+            await txn.delete("__claydo:reset-facet");
+            await txn.deleteAlarm();
+          });
+          this.#activeFacetResets.delete(kind);
+          return true;
+        }
+        await scheduler.wait(1);
+      }
     }
 
     async setName(): Promise<never> {
@@ -564,6 +656,11 @@ export function union<R extends KindRegistry>(
       const state = persisted.get(IMPORT_STATE_KEY) as ImportState | undefined;
       const kind =
         (persisted.get(KIND_STORAGE_KEY) as string | undefined) ?? this.#kind;
+      if (kind !== undefined && state === undefined) {
+        // Finalization may have committed before an interruption prevented
+        // best-effort staging cleanup.
+        this.ctx.facets.delete(importFacetName(kind));
+      }
       return {
         kind,
         importing: state
@@ -629,6 +726,7 @@ export function union<R extends KindRegistry>(
       // runtime interruption. Facet deletion is isolated and cannot touch
       // supervisor metadata or another kind.
       this.ctx.facets.delete(kindFacetName(kind));
+      this.ctx.facets.delete(importFacetName(kind));
       const fresh: ImportState = {
         kind,
         seq: 0,
@@ -673,20 +771,30 @@ export function union<R extends KindRegistry>(
         );
       }
 
-      await this.#facet(kind).__claydoApplyImport(chunk);
+      const facetApplied = await this.#importFacet(kind).__claydoApplyImport(
+        chunk,
+        seq,
+      );
       if (chunk.rows !== undefined) {
         state.applied.rows[chunk.rows.table] =
           (state.applied.rows[chunk.rows.table] ?? 0) +
           chunk.rows.values.length;
       }
-      if (chunk.kv !== undefined) state.applied.kv += chunk.kv.length;
+      if (chunk.kv !== undefined) {
+        state.applied.kv += chunk.kv.length;
+      }
       state.seq = seq;
       state.cursor = chunk.cursor;
       state.updatedAtMs = Date.now();
 
       if (chunk.cursor !== null) {
         await this.ctx.storage.put(IMPORT_STATE_KEY, state);
-        return { seq, alreadyApplied: false, done: false, applied: state.applied };
+        return {
+          seq,
+          alreadyApplied: !facetApplied,
+          done: false,
+          applied: state.applied,
+        };
       }
 
       if (chunk.totals !== undefined) {
@@ -694,6 +802,11 @@ export function union<R extends KindRegistry>(
           state.applied.rows[table] ??= 0;
         }
       }
+      await this.#importFacet(kind).__claydoPrepareImportClone();
+      // Traffic is blocked by IMPORT_STATE_KEY, so replacing a clone left by
+      // an interrupted finalization is safe and makes this step idempotent.
+      this.ctx.facets.delete(kindFacetName(kind));
+      this.ctx.facets.clone(importFacetName(kind), kindFacetName(kind));
       // Kind visibility, import-state removal, and alarm transfer commit
       // atomically in supervisor storage after the facet verifies its final
       // chunk. A crash cannot expose a live kind without its alarm or leave
@@ -708,7 +821,13 @@ export function union<R extends KindRegistry>(
         }
       });
       this.#kind = kind;
-      return { seq, alreadyApplied: false, done: true, applied: state.applied };
+      this.ctx.facets.delete(importFacetName(kind));
+      return {
+        seq,
+        alreadyApplied: !facetApplied,
+        done: true,
+        applied: state.applied,
+      };
     }
 
     async __claydoAbortImport(
@@ -725,6 +844,7 @@ export function union<R extends KindRegistry>(
         );
       }
       this.ctx.facets.delete(kindFacetName(state.kind));
+      this.ctx.facets.delete(importFacetName(state.kind));
       await this.ctx.storage.delete(IMPORT_STATE_KEY);
       await this.ctx.storage.deleteAlarm();
       return true;
@@ -762,6 +882,7 @@ export function union<R extends KindRegistry>(
         ),
       )) {
         this.ctx.facets.delete(kindFacetName(kind));
+        this.ctx.facets.delete(importFacetName(kind));
       }
       await this.ctx.storage.deleteAll();
       await this.ctx.storage.deleteAlarm();
@@ -769,63 +890,97 @@ export function union<R extends KindRegistry>(
       this.#kindLoading = undefined;
     }
 
-    async __claydoApplyImport(chunk: ExportChunk): Promise<void> {
+    async __claydoApplyImport(
+      chunk: ExportChunk,
+      seq: number,
+    ): Promise<boolean> {
       if (this.#facetProps === undefined) {
         throw new Error("claydo: import chunks can only apply inside a facet.");
       }
-      const sql = this.ctx.storage.sql;
-      for (const table of chunk.tables ?? []) {
-        try {
-          sql.exec(table.ddl);
-        } catch (error) {
-          if (!String(error).includes("already exists")) throw error;
+      const current =
+        this.ctx.storage.kv.get<number>(IMPORT_CHECKPOINT_KEY) ?? 0;
+      if (seq <= current) {
+        if (chunk.cursor === null && chunk.totals !== undefined) {
+          this.#verifyImportTotals(chunk.totals);
         }
+        return false;
       }
-      if (chunk.rows !== undefined) {
-        const { table, columns, values, rowid } = chunk.rows;
-        const cols =
-          rowid === "__rowid__"
-            ? ["rowid", ...columns.slice(1).map(quoteIdent)]
-            : columns.map(quoteIdent);
-        const statement =
-          `INSERT INTO ${quoteIdent(table)} (${cols.join(", ")}) ` +
-          `VALUES (${cols.map(() => "?").join(", ")})`;
-        for (const row of values) {
-          sql.exec(statement, ...(row as SqlValue[]));
+      if (
+        chunk.kv?.some(([key]) => key === IMPORT_CHECKPOINT_KEY) === true
+      ) {
+        throw new Error(
+          `claydo: old instance uses reserved staging key ` +
+            `'${IMPORT_CHECKPOINT_KEY}'. Rename it before migrating.`,
+        );
+      }
+      this.ctx.storage.transactionSync(() => {
+        const sql = this.ctx.storage.sql;
+        for (const table of chunk.tables ?? []) {
+          try {
+            sql.exec(table.ddl);
+          } catch (error) {
+            if (!String(error).includes("already exists")) throw error;
+          }
         }
-      }
-      if (chunk.kv !== undefined && chunk.kv.length > 0) {
-        await this.ctx.storage.put(Object.fromEntries(chunk.kv));
-      }
-      if (chunk.cursor !== null) return;
+        if (chunk.rows !== undefined) {
+          const { table, columns, values, rowid } = chunk.rows;
+          const cols =
+            rowid === "__rowid__"
+              ? ["rowid", ...columns.slice(1).map(quoteIdent)]
+              : columns.map(quoteIdent);
+          const statement =
+            `INSERT INTO ${quoteIdent(table)} (${cols.join(", ")}) ` +
+            `VALUES (${cols.map(() => "?").join(", ")})`;
+          for (const row of values) {
+            sql.exec(statement, ...(row as SqlValue[]));
+          }
+        }
+        for (const [key, value] of chunk.kv ?? []) {
+          this.ctx.storage.kv.put(key, value);
+        }
+        if (chunk.cursor === null) {
+          for (const ddl of chunk.post ?? []) {
+            try {
+              sql.exec(ddl);
+            } catch (error) {
+              if (!String(error).includes("already exists")) throw error;
+            }
+          }
+          for (const [name, value] of chunk.sequences ?? []) {
+            try {
+              sql.exec(`DELETE FROM sqlite_sequence WHERE name = ?`, name);
+              sql.exec(
+                `INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)`,
+                name,
+                value,
+              );
+            } catch {
+              // No AUTOINCREMENT table exists.
+            }
+          }
+        }
+        this.ctx.storage.kv.put(IMPORT_CHECKPOINT_KEY, seq);
+      });
 
-      for (const ddl of chunk.post ?? []) {
-        try {
-          sql.exec(ddl);
-        } catch (error) {
-          if (!String(error).includes("already exists")) throw error;
-        }
+      if (chunk.totals !== undefined) {
+        this.#verifyImportTotals(chunk.totals);
       }
-      for (const [name, value] of chunk.sequences ?? []) {
-        try {
-          sql.exec(`DELETE FROM sqlite_sequence WHERE name = ?`, name);
-          sql.exec(
-            `INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)`,
-            name,
-            value,
-          );
-        } catch {
-          // No AUTOINCREMENT table exists.
-        }
-      }
-      if (chunk.totals === undefined) return;
+      return true;
+    }
+
+    #verifyImportTotals(
+      totals: NonNullable<ExportChunk["totals"]>,
+    ): void {
       const mismatches: string[] = [];
-      const kv = (await this.ctx.storage.list()).size;
-      if (kv !== chunk.totals.kv) {
-        mismatches.push(`kv: expected ${chunk.totals.kv}, applied ${kv}`);
+      let kv = 0;
+      for (const [key] of this.ctx.storage.kv.list()) {
+        if (key !== IMPORT_CHECKPOINT_KEY) kv += 1;
       }
-      for (const [table, expected] of Object.entries(chunk.totals.rows)) {
-        const actual = sql
+      if (kv !== totals.kv) {
+        mismatches.push(`kv: expected ${totals.kv}, applied ${kv}`);
+      }
+      for (const [table, expected] of Object.entries(totals.rows)) {
+        const actual = this.ctx.storage.sql
           .exec<{ n: number }>(
             `SELECT count(*) AS n FROM ${quoteIdent(table)}`,
           )
@@ -843,6 +998,13 @@ export function union<R extends KindRegistry>(
       }
     }
 
+    async __claydoPrepareImportClone(): Promise<void> {
+      if (this.#facetProps === undefined) {
+        throw new Error("claydo: import staging is only available in a facet.");
+      }
+      this.ctx.storage.kv.delete(IMPORT_CHECKPOINT_KEY);
+    }
+
     async fetch(request: Request): Promise<Response> {
       if (this.#facetProps !== undefined) {
         const impl = await this.#loadImpl();
@@ -852,16 +1014,23 @@ export function union<R extends KindRegistry>(
             { status: 501 },
           );
         }
-        return impl.fetch(request);
+        try {
+          return await impl.fetch(request);
+        } finally {
+          await this.#completeOwnFacetReset();
+        }
       }
       try {
         const kind = await this.#resolveKind(
           request.headers.get(KIND_HEADER) ?? undefined,
           request.headers.get(NO_INIT_HEADER) === null,
         );
-        const response = await this.#facet(kind).fetch(request);
-        await this.#completeFacetReset(kind);
-        return response;
+        await this.#waitForFacetReset(kind);
+        try {
+          return await this.#facet(kind).fetch(request);
+        } finally {
+          await this.#completeFacetReset(kind);
+        }
       } catch (error) {
         const message =
           error instanceof Error ? error.message : String(error);
@@ -879,9 +1048,16 @@ export function union<R extends KindRegistry>(
       name: string,
       run: (impl: object & KindHandlers) => unknown,
     ): Promise<void> {
+      if (this.#facetProps !== undefined && isFacetResetActive(this.ctx)) {
+        // Another lifecycle callback raced a destructive reset on this
+        // facet. The supervisor will delete the facet when the resetting
+        // callback returns; do not run user code against its partial schema.
+        return;
+      }
       try {
         const impl = await this.#loadImpl();
         await run(impl);
+        await this.#completeOwnFacetReset();
       } catch (error) {
         console.error(
           `claydo: ${name} failed on kind ` +
@@ -890,7 +1066,21 @@ export function union<R extends KindRegistry>(
           error,
         );
         throw error;
+      } finally {
+        await this.#completeOwnFacetReset();
       }
+    }
+
+    async #completeOwnFacetReset(): Promise<void> {
+      if (
+        this.#facetProps === undefined ||
+        !consumeFacetResetRequest(this.ctx)
+      ) {
+        return;
+      }
+      await this.#hostClass()
+        .get(this.ctx.id)
+        .__claydoCompleteFacetReset(this.#facetProps.kind);
     }
 
     async __claydoAlarm(alarmInfo?: AlarmInfoWire): Promise<void> {
@@ -932,16 +1122,24 @@ export function union<R extends KindRegistry>(
         return;
       }
       const kind = await this.#resolveKind();
-      await this.#facet(kind).__claydoAlarm(
-        alarmInfo === undefined
-          ? undefined
-          : {
-              isRetry: alarmInfo.isRetry,
-              retryCount: alarmInfo.retryCount,
-              scheduledTime: alarmInfo.scheduledTime,
-            },
-      );
-      await this.#completeFacetReset(kind);
+      if (await this.#waitForFacetReset(kind)) {
+        // The alarm was already dispatched while reset was clearing it.
+        // Reset semantics win: do not deliver it to the replacement facet.
+        return;
+      }
+      try {
+        await this.#facet(kind).__claydoAlarm(
+          alarmInfo === undefined
+            ? undefined
+            : {
+                isRetry: alarmInfo.isRetry,
+                retryCount: alarmInfo.retryCount,
+                scheduledTime: alarmInfo.scheduledTime,
+              },
+        );
+      } finally {
+        await this.#completeFacetReset(kind);
+      }
     }
 
     async webSocketMessage(
@@ -953,6 +1151,7 @@ export function union<R extends KindRegistry>(
         return;
       }
       const kind = await this.#resolveKind();
+      await this.#waitForFacetReset(kind);
       await this.#facet(kind).__claydoWebSocketMessage(ws, message);
     }
 
@@ -967,6 +1166,7 @@ export function union<R extends KindRegistry>(
         return;
       }
       const kind = await this.#resolveKind();
+      await this.#waitForFacetReset(kind);
       await this.#facet(kind).__claydoWebSocketClose(
         ws,
         code,
@@ -981,6 +1181,7 @@ export function union<R extends KindRegistry>(
         return;
       }
       const kind = await this.#resolveKind();
+      await this.#waitForFacetReset(kind);
       await this.#facet(kind).__claydoWebSocketError(ws, error);
     }
   }

@@ -52,11 +52,28 @@ interface AlarmHostStub {
   __claydoSetAlarm(kind: string, timestamp: number): Promise<void>;
   __claydoGetAlarm(kind: string): Promise<number | null>;
   __claydoDeleteAlarm(kind: string): Promise<void>;
-  __claydoFacetReset(kind: string): Promise<void>;
+  __claydoBeginFacetReset(kind: string): Promise<void>;
+  __claydoFinishFacetReset(kind: string): Promise<void>;
+  __claydoCompleteFacetReset(kind: string): Promise<void>;
 }
 
 interface LoopbackHostNamespace {
   get(id: DurableObjectId): AlarmHostStub;
+}
+
+const facetResetRequests = new WeakSet<DurableObjectState>();
+const activeFacetResets = new WeakSet<DurableObjectState>();
+
+/** Internal: blocks direct facet lifecycle events during destructive reset. */
+export function isFacetResetActive(ctx: DurableObjectState): boolean {
+  return activeFacetResets.has(ctx);
+}
+
+/** Internal: true once after a kind requested deleteAll(). */
+export function consumeFacetResetRequest(ctx: DurableObjectState): boolean {
+  if (!facetResetRequests.has(ctx)) return false;
+  facetResetRequests.delete(ctx);
+  return true;
 }
 
 /**
@@ -133,9 +150,20 @@ export function facetContext(
       }
       if (property === "deleteAll") {
         return async (): Promise<void> => {
-          await deleteAllFacetStorage(target);
-          await host.__claydoDeleteAlarm(props.kind);
-          await host.__claydoFacetReset(props.kind);
+          activeFacetResets.add(ctx);
+          try {
+            await host.__claydoBeginFacetReset(props.kind);
+          } catch (error) {
+            activeFacetResets.delete(ctx);
+            throw error;
+          }
+          try {
+            await deleteAllFacetStorage(target);
+            await host.__claydoDeleteAlarm(props.kind);
+          } finally {
+            await host.__claydoFinishFacetReset(props.kind);
+            facetResetRequests.add(ctx);
+          }
         };
       }
       const value = Reflect.get(target, property, target);
