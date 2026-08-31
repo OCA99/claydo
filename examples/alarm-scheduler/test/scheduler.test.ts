@@ -202,9 +202,8 @@ describeHosted("DX probes (adversarial)", () => {
     await s.schedule("gone", Date.now() + 60_000);
     await s.wipeStorage();
 
-    // Facet-native deleteAll() clears the isolated kind database, then the
-    // supervisor restarts that facet after the call. The next call is
-    // already healthy: its constructor has recreated the schema.
+    // Facet-native deleteAll() clears only the isolated kind database.
+    // wipeStorage() recreates its schema before returning.
     expect(await s.list()).toEqual([]);
     const fresh = kind(env.APP_DO, "scheduler").get("wipe-named");
     expect(await fresh.list()).toEqual([]);

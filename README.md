@@ -44,8 +44,8 @@ Claydo's supervisor and each kind facet have separate databases:
 
 - A kind owns its full SQL schema and KV keyspace. Library metadata never
   appears in user storage.
-- `ctx.storage.deleteAll()` cannot erase kind identity. Claydo clears and
-  restarts the facet, so its constructor rebuilds the schema on the next call.
+- `ctx.storage.deleteAll()` cannot erase kind identity. Claydo atomically
+  clears only facet-local user storage; post-delete writes remain intact.
 - Equal table names and KV keys in different kinds never collide.
 - A kind can use SQL, KV, hibernating WebSockets, RPC, and alarms as it would
   in a regular Durable Object.
@@ -61,6 +61,9 @@ supervisor's alarm. Kind code does not need a separate scheduler API.
 ```sh
 npm install claydo
 ```
+
+Version 0.2 is a greenfield facet architecture. It does not adopt data in
+place from the experimental pre-facet 0.1 design; see `CHANGELOG.md`.
 
 Use a current Workers compatibility date. Facets and `ctx.exports` must be
 available in the runtime; the examples use `2026-08-01`.
@@ -214,19 +217,23 @@ async clear(): Promise<void> {
 }
 ```
 
-Claydo explicitly drops the facet's user tables and KV entries, clears the
-supervisor alarm, and restarts the facet after the method returns. The next
-call runs the kind constructor and sees a fresh schema. Kind identity remains
-in supervisor storage, including for unique-ID instances.
+Claydo atomically drops the facet's user tables and KV entries and clears the
+supervisor alarm. Like native `deleteAll()`, execution then continues in the
+same object: writes and alarms created after the awaited call are preserved.
+Kind identity remains in supervisor storage, including for unique-ID
+instances.
 
 `resetStorage(this.ctx)` is an equivalent convenience helper.
 
-Do not query dropped tables later in the **same** method after `deleteAll()`;
-the replacement facet starts after the current call returns.
+SQLite-backed kinds must recreate their schema after deletion:
 
-If a WebSocket handler calls `deleteAll()`, deleting the facet also closes its
-sockets. Current workerd logs `Facet was deleted` for that teardown; reconnect
-through the stable claydo endpoint.
+```ts
+async clear(): Promise<void> {
+  await this.ctx.storage.deleteAll();
+  this.ensureSchema();
+  await this.ctx.storage.put("epoch", 2); // preserved
+}
+```
 
 Calling `this.ctx.abort()` aborts only the facet. The in-flight call fails, but
 the public claydo stub still points to the stable supervisor and reaches a new
@@ -528,7 +535,7 @@ entry points.
 | `union(kinds, options?)` | Builds the supervisor/facet runtime class. |
 | `kinds(namespace)` / `kind(namespace, name)` | Typed kind accessors. |
 | `instanceName(ctx)` | Logical name without kind prefix. |
-| `resetStorage(ctx)` | Clears user storage; supervisor keeps identity and restarts the facet. |
+| `resetStorage(ctx)` | Clears facet user storage and alarm; supervisor identity remains. |
 
 `union` options: `exportName`, `importable`, and migration `secret`.
 
@@ -560,8 +567,8 @@ Every folder includes Workers-runtime tests and a DX report.
 - Native facet alarms currently throw "alarms are not yet implemented";
   claydo's supervisor bridge is intentional and tested.
 - Native facet `storage.deleteAll()` currently triggers a workerd internal
-  assertion. Claydo intercepts it and explicitly drops user schema/KV before
-  restarting the facet.
+  assertion. Claydo replaces it with an atomic user-schema/KV teardown that
+  preserves native post-delete write semantics.
 - Migration finalization uses the typed `facets.clone(src, dst)` API to move a
   verified staging database into its live facet.
 - `ctx.exports` is enabled by default on current compatibility dates. Do not

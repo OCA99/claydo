@@ -12,10 +12,8 @@ import {
   type SqlValue,
 } from "./migrate-wire";
 import {
-  consumeFacetResetRequest,
   facetContext,
   facetProps,
-  isFacetResetActive,
   kindFacetName,
   KIND_HEADER,
   KIND_STORAGE_KEY,
@@ -80,17 +78,6 @@ interface FacetRuntimeStub {
     allowInit?: boolean,
   ): Promise<ClaydoCallResult>;
   __claydoAlarm(alarmInfo?: AlarmInfoWire): Promise<void>;
-  __claydoWebSocketMessage(
-    ws: WebSocket,
-    message: string | ArrayBuffer,
-  ): Promise<void>;
-  __claydoWebSocketClose(
-    ws: WebSocket,
-    code: number,
-    reason: string,
-    wasClean: boolean,
-  ): Promise<void>;
-  __claydoWebSocketError(ws: WebSocket, error: unknown): Promise<void>;
   __claydoApplyImport(chunk: ExportChunk, seq: number): Promise<boolean>;
   __claydoPrepareImportClone(): Promise<void>;
   fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response>;
@@ -103,11 +90,6 @@ type AlarmInfoWire = Pick<
 
 const IMPORT_FACET_PREFIX = "import:";
 
-interface FacetResetState {
-  kind: string;
-  phase: "resetting" | "ready";
-  updatedAt: number;
-}
 function importFacetName(kind: string): string {
   return `${IMPORT_FACET_PREFIX}${kind}`;
 }
@@ -146,9 +128,6 @@ export interface GenericDurableObjectInstance<R extends KindRegistry>
     kind: string,
     options?: DurableObjectSetAlarmOptions,
   ): Promise<void>;
-  __claydoBeginFacetReset(kind: string): Promise<void>;
-  __claydoFinishFacetReset(kind: string): Promise<void>;
-  __claydoCompleteFacetReset(kind: string): Promise<void>;
   __claydoBeginImport(
     kind: string,
     token: string,
@@ -215,7 +194,11 @@ export function union<R extends KindRegistry>(
     #kindLoading?: Promise<string>;
     #impl?: object & KindHandlers;
     #implLoading?: Promise<object & KindHandlers>;
-    readonly #activeFacetResets = new Set<string>();
+    readonly #methodCache = new Map<
+      string,
+      ((...args: unknown[]) => unknown) | null
+    >();
+    readonly #facetClasses = new Map<string, DurableObjectClass>();
     #importTail: Promise<void> = Promise.resolve();
 
     constructor(ctx: DurableObjectState, env: unknown) {
@@ -255,14 +238,30 @@ export function union<R extends KindRegistry>(
     }
 
     #namedFacet(kind: string, name: string): FacetRuntimeStub {
-      const hostClass = this.#hostClass();
-      const props: ClaydoFacetProps = {
-        __claydoFacet: true,
-        kind,
-        hostExport: this.#hostExport(),
-      };
-      const configured = hostClass({ props });
-      return this.ctx.facets.get(name, () => ({
+      const facets = (
+        this.ctx as DurableObjectState & {
+          facets?: DurableObjectFacets;
+        }
+      ).facets;
+      if (facets === undefined || typeof facets.get !== "function") {
+        throw new Error(
+          "claydo: this Workers runtime does not support Durable Object " +
+            "facets. Use a current compatibility date (the examples use " +
+            "2026-08-01) and current Workers runtime.",
+        );
+      }
+      let configured = this.#facetClasses.get(name);
+      if (configured === undefined) {
+        const hostClass = this.#hostClass();
+        const props: ClaydoFacetProps = {
+          __claydoFacet: true,
+          kind,
+          hostExport: this.#hostExport(),
+        };
+        configured = hostClass({ props });
+        this.#facetClasses.set(name, configured);
+      }
+      return facets.get(name, () => ({
         class: configured,
       })) as unknown as FacetRuntimeStub;
     }
@@ -447,8 +446,12 @@ export function union<R extends KindRegistry>(
               `through the stub.`,
           );
         }
-        const fn = prototypeMethod(impl, method);
+        let fn = this.#methodCache.get(method);
         if (fn === undefined) {
+          fn = prototypeMethod(impl, method) ?? null;
+          this.#methodCache.set(method, fn);
+        }
+        if (fn === null) {
           const value = (impl as Record<string, unknown>)[method];
           if (method in impl && typeof value !== "function") {
             throw new Error(
@@ -498,19 +501,14 @@ export function union<R extends KindRegistry>(
       } catch (error) {
         return { ok: false, error: toWireError(error) };
       }
-      await this.#waitForFacetReset(resolved);
       // Do not envelope transport/serialization failures from the facet:
       // the client distinguishes them and adds kind + method call context.
-      try {
-        return (await this.#facet(resolved).__claydoCall(
-          resolved,
-          method,
-          args,
-          allowInit,
-        )) as ClaydoCallResult;
-      } finally {
-        await this.#completeFacetReset(resolved);
-      }
+      return (await this.#facet(resolved).__claydoCall(
+        resolved,
+        method,
+        args,
+        allowInit,
+      )) as ClaydoCallResult;
     }
 
     async __claydoKind(): Promise<string | undefined> {
@@ -556,86 +554,6 @@ export function union<R extends KindRegistry>(
     ): Promise<void> {
       await this.#assertAlarmKind(kind);
       await this.ctx.storage.deleteAlarm(alarmOptions);
-    }
-
-    async __claydoBeginFacetReset(kind: string): Promise<void> {
-      await this.#assertAlarmKind(kind);
-      this.#activeFacetResets.add(kind);
-      try {
-        await this.ctx.storage.put("__claydo:reset-facet", {
-          kind,
-          phase: "resetting",
-          updatedAt: Date.now(),
-        } satisfies FacetResetState);
-      } catch (error) {
-        this.#activeFacetResets.delete(kind);
-        throw error;
-      }
-    }
-
-    async __claydoFinishFacetReset(kind: string): Promise<void> {
-      await this.#assertAlarmKind(kind);
-      await this.ctx.storage.put("__claydo:reset-facet", {
-        kind,
-        phase: "ready",
-        updatedAt: Date.now(),
-      } satisfies FacetResetState);
-    }
-
-    async __claydoCompleteFacetReset(kind: string): Promise<void> {
-      await this.#completeFacetReset(kind);
-    }
-
-    async #completeFacetReset(kind: string): Promise<void> {
-      const requested = await this.ctx.storage.get<FacetResetState>(
-        "__claydo:reset-facet",
-      );
-      if (
-        requested?.kind !== kind ||
-        requested.phase !== "ready"
-      ) {
-        return;
-      }
-      this.ctx.facets.delete(kindFacetName(kind));
-      await this.ctx.storage.transaction(async (txn) => {
-        await txn.delete("__claydo:reset-facet");
-        await txn.deleteAlarm();
-      });
-      this.#activeFacetResets.delete(kind);
-    }
-
-    async #waitForFacetReset(kind: string): Promise<boolean> {
-      const deadline = Date.now() + 5_000;
-      let observedReset = false;
-      for (;;) {
-        const requested = await this.ctx.storage.get<FacetResetState>(
-          "__claydo:reset-facet",
-        );
-        if (requested?.kind !== kind) return observedReset;
-        observedReset = true;
-        if (!this.#activeFacetResets.has(kind)) {
-          // A persisted marker without its in-memory owner means the
-          // supervisor restarted during reset. Discard the possibly partial
-          // facet and recover instead of wedging forever.
-          this.ctx.facets.delete(kindFacetName(kind));
-          await this.ctx.storage.transaction(async (txn) => {
-            await txn.delete("__claydo:reset-facet");
-            await txn.deleteAlarm();
-          });
-          this.#activeFacetResets.delete(kind);
-          return true;
-        }
-        if (Date.now() >= deadline) {
-          this.ctx.facets.delete(kindFacetName(kind));
-          await this.ctx.storage.transaction(async (txn) => {
-            await txn.delete("__claydo:reset-facet");
-            await txn.deleteAlarm();
-          });
-          this.#activeFacetResets.delete(kind);
-          return true;
-        }
-        await scheduler.wait(1);
-      }
     }
 
     async setName(): Promise<never> {
@@ -980,11 +898,7 @@ export function union<R extends KindRegistry>(
       this.ctx.storage.transactionSync(() => {
         const sql = this.ctx.storage.sql;
         for (const table of chunk.tables ?? []) {
-          try {
-            sql.exec(table.ddl);
-          } catch (error) {
-            if (!String(error).includes("already exists")) throw error;
-          }
+          sql.exec(table.ddl);
         }
         if (chunk.rows !== undefined) {
           const { table, columns, values, rowid } = chunk.rows;
@@ -1004,11 +918,7 @@ export function union<R extends KindRegistry>(
         }
         if (chunk.cursor === null) {
           for (const ddl of chunk.post ?? []) {
-            try {
-              sql.exec(ddl);
-            } catch (error) {
-              if (!String(error).includes("already exists")) throw error;
-            }
+            sql.exec(ddl);
           }
           for (const [name, value] of chunk.sequences ?? []) {
             try {
@@ -1078,11 +988,7 @@ export function union<R extends KindRegistry>(
             { status: 501 },
           );
         }
-        try {
-          return await impl.fetch(request);
-        } finally {
-          await this.#completeOwnFacetReset();
-        }
+        return impl.fetch(request);
       }
       let kind: string;
       try {
@@ -1101,24 +1007,13 @@ export function union<R extends KindRegistry>(
         }
         return new Response(message, { status: 400 });
       }
-      await this.#waitForFacetReset(kind);
-      try {
-        return await this.#facet(kind).fetch(request);
-      } finally {
-        await this.#completeFacetReset(kind);
-      }
+      return this.#facet(kind).fetch(request);
     }
 
     async #runHandler(
       name: string,
       run: (impl: object & KindHandlers) => unknown,
     ): Promise<void> {
-      if (this.#facetProps !== undefined && isFacetResetActive(this.ctx)) {
-        // Another lifecycle callback raced a destructive reset on this
-        // facet. The supervisor will delete the facet when the resetting
-        // callback returns; do not run user code against its partial schema.
-        return;
-      }
       try {
         const impl = await this.#loadImpl();
         await run(impl);
@@ -1130,21 +1025,7 @@ export function union<R extends KindRegistry>(
           error,
         );
         throw error;
-      } finally {
-        await this.#completeOwnFacetReset();
       }
-    }
-
-    async #completeOwnFacetReset(): Promise<void> {
-      if (
-        this.#facetProps === undefined ||
-        !consumeFacetResetRequest(this.ctx)
-      ) {
-        return;
-      }
-      await this.#hostClass()
-        .get(this.ctx.id)
-        .__claydoCompleteFacetReset(this.#facetProps.kind);
     }
 
     async __claydoAlarm(alarmInfo?: AlarmInfoWire): Promise<void> {
@@ -1186,24 +1067,15 @@ export function union<R extends KindRegistry>(
         return;
       }
       const kind = await this.#resolveKind();
-      if (await this.#waitForFacetReset(kind)) {
-        // The alarm was already dispatched while reset was clearing it.
-        // Reset semantics win: do not deliver it to the replacement facet.
-        return;
-      }
-      try {
-        await this.#facet(kind).__claydoAlarm(
-          alarmInfo === undefined
-            ? undefined
-            : {
-                isRetry: alarmInfo.isRetry,
-                retryCount: alarmInfo.retryCount,
-                scheduledTime: alarmInfo.scheduledTime,
-              },
-        );
-      } finally {
-        await this.#completeFacetReset(kind);
-      }
+      await this.#facet(kind).__claydoAlarm(
+        alarmInfo === undefined
+          ? undefined
+          : {
+              isRetry: alarmInfo.isRetry,
+              retryCount: alarmInfo.retryCount,
+              scheduledTime: alarmInfo.scheduledTime,
+            },
+      );
     }
 
     async webSocketMessage(
@@ -1214,9 +1086,10 @@ export function union<R extends KindRegistry>(
         await this.__claydoWebSocketMessage(ws, message);
         return;
       }
-      const kind = await this.#resolveKind();
-      await this.#waitForFacetReset(kind);
-      await this.#facet(kind).__claydoWebSocketMessage(ws, message);
+      // Root/supervisor sockets are not part of the facet-native topology,
+      // and WebSocket objects cannot cross facet RPC. Close defensively
+      // instead of attempting an impossible forwarding call.
+      ws.close(1012, "claydo: reconnect through the facet endpoint");
     }
 
     async webSocketClose(
@@ -1229,14 +1102,7 @@ export function union<R extends KindRegistry>(
         await this.__claydoWebSocketClose(ws, code, reason, wasClean);
         return;
       }
-      const kind = await this.#resolveKind();
-      await this.#waitForFacetReset(kind);
-      await this.#facet(kind).__claydoWebSocketClose(
-        ws,
-        code,
-        reason,
-        wasClean,
-      );
+      // Facet-owned sockets receive this callback directly on the facet.
     }
 
     async webSocketError(ws: WebSocket, error: unknown): Promise<void> {
@@ -1244,9 +1110,7 @@ export function union<R extends KindRegistry>(
         await this.__claydoWebSocketError(ws, error);
         return;
       }
-      const kind = await this.#resolveKind();
-      await this.#waitForFacetReset(kind);
-      await this.#facet(kind).__claydoWebSocketError(ws, error);
+      // Facet-owned sockets receive this callback directly on the facet.
     }
   }
 

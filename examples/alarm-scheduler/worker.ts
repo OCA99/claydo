@@ -32,6 +32,10 @@ export type FiredJob = {
 export class Scheduler extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
+    Scheduler.#ensureSchema(this.ctx);
+  }
+
+  static #ensureSchema(ctx: DurableObjectState): void {
     ctx.storage.sql.exec(
       `CREATE TABLE IF NOT EXISTS jobs (
         name TEXT PRIMARY KEY,
@@ -114,6 +118,7 @@ export class Scheduler extends DurableObject<Env> {
   /** DX-probe helper: wipes all storage, including the library's kind key. */
   async wipeStorage(): Promise<void> {
     await this.ctx.storage.deleteAll();
+    Scheduler.#ensureSchema(this.ctx);
   }
 
   async alarm(): Promise<void> {

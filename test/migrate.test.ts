@@ -748,6 +748,25 @@ describe("data fidelity extensions", () => {
     );
     expect((await old.__claydoSealed()).sealed).toBe(false);
   });
+
+  it("checks unsafe rowids when INTEGER PRIMARY KEY is named rowid", async () => {
+    const old = legacy("g7");
+    await old.bump("x");
+    await runInDurableObject(old, async (_instance, state) => {
+      state.storage.sql.exec(
+        `CREATE TABLE alias_huge (rowid INTEGER PRIMARY KEY, value TEXT)`,
+      );
+      state.storage.sql.exec(
+        `INSERT INTO alias_huge(rowid, value)
+         VALUES (9223372036854775807, 'too large')`,
+      );
+    });
+    const preview = await previewInstance({ from: old });
+    expect(preview.blockers.join(" ")).toMatch(
+      /table 'alias_huge'.*safe integer range/,
+    );
+    expect((await old.__claydoSealed()).sealed).toBe(false);
+  });
 });
 
 describe("previewInstance and progress", () => {

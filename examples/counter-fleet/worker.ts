@@ -37,6 +37,10 @@ export class Counter extends DurableObject<Env> {
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
+    Counter.#ensureSchema(this.ctx);
+  }
+
+  static #ensureSchema(ctx: DurableObjectState): void {
     ctx.storage.sql.exec(
       `CREATE TABLE IF NOT EXISTS counter (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 0),
@@ -64,12 +68,12 @@ export class Counter extends DurableObject<Env> {
   }
 
   /**
-   * Deletes facet-local user data. The supervisor keeps kind identity
-   * separately and restarts the cleared facet after this call, so the next
-   * request sees a fresh schema.
+   * Deletes facet-local user data. Supervisor kind identity is unaffected;
+   * this method recreates its own SQL schema before returning.
    */
   async destroy(): Promise<void> {
     await resetStorage(this.ctx);
+    Counter.#ensureSchema(this.ctx);
   }
 
   /**

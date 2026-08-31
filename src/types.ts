@@ -1,4 +1,5 @@
 import { DurableObject as CloudflareDurableObject } from "cloudflare:workers";
+import { quoteIdent } from "./migrate-wire";
 
 /**
  * Internal props that distinguish a facet-hosted claydo kind from the
@@ -62,28 +63,11 @@ interface AlarmHostStub {
     kind: string,
     options?: DurableObjectSetAlarmOptions,
   ): Promise<void>;
-  __claydoBeginFacetReset(kind: string): Promise<void>;
-  __claydoFinishFacetReset(kind: string): Promise<void>;
-  __claydoCompleteFacetReset(kind: string): Promise<void>;
 }
 
 interface LoopbackHostNamespace {
+  (options: { props?: unknown }): DurableObjectClass;
   get(id: DurableObjectId): AlarmHostStub;
-}
-
-const facetResetRequests = new WeakSet<DurableObjectState>();
-const activeFacetResets = new WeakSet<DurableObjectState>();
-
-/** Internal: blocks direct facet lifecycle events during destructive reset. */
-export function isFacetResetActive(ctx: DurableObjectState): boolean {
-  return activeFacetResets.has(ctx);
-}
-
-/** Internal: true once after a kind requested deleteAll(). */
-export function consumeFacetResetRequest(ctx: DurableObjectState): boolean {
-  if (!facetResetRequests.has(ctx)) return false;
-  facetResetRequests.delete(ctx);
-  return true;
 }
 
 /**
@@ -111,12 +95,11 @@ async function deleteAllFacetStorage(
       )
       .toArray();
     for (const { type, name } of schema) {
-      const quoted = `"${name.replaceAll('"', '""')}"`;
       storage.sql.exec(
-        `${type === "view" ? "DROP VIEW" : "DROP TABLE"} IF EXISTS ${quoted}`,
+        `${type === "view" ? "DROP VIEW" : "DROP TABLE"} IF EXISTS ${quoteIdent(name)}`,
       );
     }
-    for (const [key] of storage.kv.list()) {
+    for (const [key] of [...storage.kv.list()]) {
       storage.kv.delete(key);
     }
   });
@@ -134,7 +117,11 @@ export function facetContext(
   const exported = (ctx.exports as unknown as Record<string, unknown>)[
     props.hostExport
   ] as LoopbackHostNamespace | undefined;
-  if (exported === undefined || typeof exported.get !== "function") {
+  if (
+    exported === undefined ||
+    typeof exported !== "function" ||
+    typeof exported.get !== "function"
+  ) {
     throw new Error(
       `claydo: cannot find exported host class '${props.hostExport}' in ` +
         `ctx.exports. Export the class returned by union() under that name.`,
@@ -203,20 +190,8 @@ export function facetContext(
       }
       if (property === "deleteAll") {
         return async (): Promise<void> => {
-          activeFacetResets.add(ctx);
-          try {
-            await host.__claydoBeginFacetReset(props.kind);
-          } catch (error) {
-            activeFacetResets.delete(ctx);
-            throw error;
-          }
-          try {
-            await deleteAllFacetStorage(target);
-            await host.__claydoDeleteAlarm(props.kind);
-          } finally {
-            await host.__claydoFinishFacetReset(props.kind);
-            facetResetRequests.add(ctx);
-          }
+          await deleteAllFacetStorage(target);
+          await host.__claydoDeleteAlarm(props.kind);
         };
       }
       const value = Reflect.get(target, property, target);

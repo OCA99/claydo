@@ -181,6 +181,16 @@ export class Vault extends DurableObject<Env> {
     return "finished";
   }
 
+  async wipeThenWrite(): Promise<void> {
+    await this.ctx.storage.deleteAll();
+    await this.ctx.storage.put("v:epoch", "2");
+    await this.ctx.storage.setAlarm(Date.now() + 60_000);
+  }
+
+  async alarmTime(): Promise<number | null> {
+    return this.ctx.storage.getAlarm();
+  }
+
   seedForeignKeys(): void {
     this.ctx.storage.sql.exec("PRAGMA foreign_keys = ON");
     this.ctx.storage.sql.exec(

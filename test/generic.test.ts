@@ -206,7 +206,7 @@ describe("resetStorage()", () => {
     expect(await vault.getValue("k")).toBeUndefined();
   });
 
-  it("blocks concurrent calls until a facet reset completes", async () => {
+  it("makes cleared state visible to concurrent calls", async () => {
     const vault = kind(env.APP_DO, "vault").get("reset-race");
     await vault.set("k", "v");
     const resetting = vault.wipeAndFinishWork();
@@ -214,6 +214,15 @@ describe("resetStorage()", () => {
     const racingRead = vault.getValue("k");
     expect(await resetting).toBe("finished");
     expect(await racingRead).toBeUndefined();
+  });
+
+  it("preserves writes and alarms made after deleteAll()", async () => {
+    const vault = kind(env.APP_DO, "vault").get("reset-post-write");
+    await vault.set("old", "gone");
+    await vault.wipeThenWrite();
+    expect(await vault.getValue("old")).toBeUndefined();
+    expect(await vault.getValue("epoch")).toBe("2");
+    expect(await vault.alarmTime()).toBeTypeOf("number");
   });
 
   it("resets foreign-key schemas atomically without partial drops", async () => {

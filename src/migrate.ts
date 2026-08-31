@@ -72,6 +72,7 @@ interface SealHolder {
   sealed: SealRecord | null;
   /** The real, unguarded state. The library's own operations use it. */
   ctx: DurableObjectState;
+  inspection?: TableInspection;
 }
 
 const holders = new WeakMap<object, SealHolder>();
@@ -417,6 +418,7 @@ export function exportable<I extends object>(
       const holder = holderOf(this);
       await holder.ctx.storage.delete(SEAL_KEY);
       holder.sealed = null;
+      holder.inspection = undefined;
     }
 
     async __claydoSealed(
@@ -487,10 +489,11 @@ export function exportable<I extends object>(
       this.#auth(secret);
       const holder = holderOf(this);
       const inspection = this.#inspectTables();
+      const blockers = [...inspection.blockers];
       if (
         (await holder.ctx.storage.get(IMPORT_CHECKPOINT_KEY)) !== undefined
       ) {
-        inspection.blockers.push(
+        blockers.push(
           `KV key '${IMPORT_CHECKPOINT_KEY}' is reserved for target staging. ` +
             `Rename it before migrating.`,
         );
@@ -512,7 +515,7 @@ export function exportable<I extends object>(
         kv,
         rows,
         alarm: await holder.ctx.storage.getAlarm(),
-        blockers: inspection.blockers,
+        blockers,
       };
     }
 
@@ -604,7 +607,11 @@ export function exportable<I extends object>(
     }
 
     #inspectTables(): TableInspection {
-      const { ctx } = holderOf(this);
+      const holder = holderOf(this);
+      if (holder.sealed !== null && holder.inspection !== undefined) {
+        return holder.inspection;
+      }
+      const { ctx } = holder;
       const sql = ctx.storage.sql;
       const all = sql
         .exec<{ name: string; sql: string }>(
@@ -711,9 +718,14 @@ export function exportable<I extends object>(
             );
           }
         }
-        if (
-          !visible.some((column) => column.name.toLowerCase() === "rowid")
-        ) {
+        const namedRowid = visible.find(
+          (column) => column.name.toLowerCase() === "rowid",
+        );
+        // `rowid INTEGER PRIMARY KEY` is a legal alias and still needs the
+        // precision check. A non-alias column named rowid is already a
+        // shadowing blocker above; querying `rowid` there would read text
+        // user data rather than SQLite's hidden integer.
+        if (namedRowid === undefined || namedRowid.name === rowidAlias) {
           const unsafeRange = this.#unsafeRowidRange(row.name);
           if (unsafeRange !== undefined) blockers.push(unsafeRange);
         }
@@ -724,7 +736,9 @@ export function exportable<I extends object>(
           columns: visible.map((column) => column.name),
         });
       }
-      return { tables, post, blockers };
+      const inspection = { tables, post, blockers };
+      if (holder.sealed !== null) holder.inspection = inspection;
+      return inspection;
     }
 
     #unsafeRowidRange(table: string): string | undefined {

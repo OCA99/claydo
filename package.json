@@ -1,6 +1,6 @@
 {
   "name": "claydo",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "One Durable Object class, many isolated facet-backed kinds.",
   "license": "MIT",
   "repository": {
@@ -36,6 +36,7 @@
     "dist",
     "src",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "scripts": {
