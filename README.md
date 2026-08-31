@@ -224,6 +224,10 @@ in supervisor storage, including for unique-ID instances.
 Do not query dropped tables later in the **same** method after `deleteAll()`;
 the replacement facet starts after the current call returns.
 
+If a WebSocket handler calls `deleteAll()`, deleting the facet also closes its
+sockets. Current workerd logs `Facet was deleted` for that teardown; reconnect
+through the stable claydo endpoint.
+
 Calling `this.ctx.abort()` aborts only the facet. The in-flight call fails, but
 the public claydo stub still points to the stable supervisor and reaches a new
 facet on its next call.
@@ -343,6 +347,19 @@ export class OldTally extends exportable(TallyImpl) {}
 ```
 
 The old binding continues to serve until an instance is sealed.
+`exportable()` guards every RPC method defined directly on `TallyImpl` before
+it can touch storage, including methods that captured the raw constructor
+storage reference. If the finished class exposes inherited business RPC
+methods with such a captured reference, list them explicitly:
+
+```ts
+export class OldTally extends exportable(TallyImpl, {
+  guardMethods: ["inheritedWrite"],
+}) {}
+```
+
+Function-valued instance fields are not Workers RPC methods; expose remote
+operations as prototype methods.
 
 ### 2. Enable target imports
 
@@ -390,18 +407,24 @@ Migration ordering:
 
 1. Reserve the supervisor; target traffic gets 503.
 2. Seal the old instance.
-3. Stream SQL and KV chunks into an isolated target facet.
-4. Rebuild indexes/FTS5, restore AUTOINCREMENT sequences, verify totals.
-5. Pin the target kind in supervisor storage and transfer the alarm.
+3. Stream SQL and KV chunks into an isolated staging facet. Every chunk and
+   its sequence checkpoint commit in one facet-local SQLite transaction.
+4. Rebuild indexes/FTS5, restore AUTOINCREMENT sequences, verify totals, then
+   clone the staging facet into the live facet.
+5. Atomically pin the target kind, remove import state, and transfer the alarm
+   in one supervisor transaction.
 6. Record `<kind>:<name>` on the old instance.
 
-On failure, claydo deletes only the partial target facet and unseals the old
-instance. No user tables or partial rows can pollute supervisor metadata.
+On failure, claydo deletes the staging/live target facets and unseals an old
+instance that this run sealed. No user tables or partial rows can pollute
+supervisor metadata. The old seal also carries an immutable target claim, so
+one source cannot race or rerun into two live destinations.
 
 The copy supports rowids, generated columns (recomputed), indexes, triggers,
 views, AUTOINCREMENT sequences, ordinary and external-content FTS5, KV, and
 alarms. It rejects `WITHOUT ROWID`, non-FTS virtual tables, contentless FTS5,
-and rowid-shadowing columns before sealing.
+rowid-shadowing columns, and the exact staging key
+`__claydo:import-checkpoint` before sealing.
 
 ### Transitional routing
 
@@ -531,6 +554,8 @@ Every folder includes Workers-runtime tests and a DX report.
 - Native facet `storage.deleteAll()` currently triggers a workerd internal
   assertion. Claydo intercepts it and explicitly drops user schema/KV before
   restarting the facet.
+- Migration finalization uses the typed `facets.clone(src, dst)` API to move a
+  verified staging database into its live facet.
 - `ctx.exports` is enabled by default on current compatibility dates. Do not
   add the obsolete `enable_ctx_exports` flag.
 

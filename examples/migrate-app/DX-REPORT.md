@@ -1,4 +1,4 @@
-# DX audit: `claydo/migrate` — consolidating a real two-binding app ("GameCo")
+# DX audit: `claydo/migrate` — consolidating a real two-binding app ("GameCo") — historical pre-facet audit
 
 > **Facet-native update (2026-08-31).** This example now imports `DurableObject`
 > from claydo and runs every kind in an isolated Durable Object facet. The

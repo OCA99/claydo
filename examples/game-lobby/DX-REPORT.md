@@ -1,4 +1,4 @@
-# DX report: game-lobby example
+# DX report: game-lobby example — historical pre-facet audit
 
 > **Facet-native update (2026-08-31).** This example now imports `DurableObject`
 > from claydo and runs every kind in an isolated Durable Object facet. The
