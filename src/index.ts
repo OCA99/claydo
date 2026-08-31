@@ -3,6 +3,7 @@ export type {
   ClaydoCallResult,
   GenericDurableObjectClass,
   GenericDurableObjectInstance,
+  UnionOptions,
   WireError,
 } from "./host";
 export { kind, kinds } from "./client";

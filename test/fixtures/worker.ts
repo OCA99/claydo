@@ -1,9 +1,12 @@
 import { DurableObject } from "cloudflare:workers";
 import { Server, type Connection, type WSMessage } from "partyserver";
 import { instanceName, kind, resetStorage, union } from "../../src/index";
+import { exportable } from "../../src/migrate";
 
 export interface Env {
   APP_DO: DurableObjectNamespace<AppDO>;
+  LEGACY: DurableObjectNamespace<LegacyTally>;
+  LEGACY_FW: DurableObjectNamespace<LegacyFramework>;
 }
 
 /** A SQLite-backed counter kind. */
@@ -132,15 +135,237 @@ export class PartyRoom extends Server<Env> {
   }
 }
 
-export class AppDO extends union({
-  counter: Counter,
-  echo: Echo,
-  reminder: Reminder,
-  plain: Plain,
-  teapot: Teapot,
-  vault: Vault,
-  party: PartyRoom,
-}) {}
+/**
+ * The class that used to be its own binding. It serves as the kind
+ * implementation after migration, and — wrapped with exportable() — as the
+ * old binding's class during migration.
+ */
+export class Tally extends DurableObject<Env> {
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    ctx.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS counts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        label TEXT NOT NULL UNIQUE,
+        value INTEGER NOT NULL
+      )`,
+    );
+    ctx.storage.sql.exec(
+      `CREATE INDEX IF NOT EXISTS counts_by_value ON counts (value)`,
+    );
+  }
+
+  bump(label: string, by = 1): number {
+    return this.ctx.storage.sql
+      .exec<{ value: number }>(
+        `INSERT INTO counts (label, value) VALUES (?, ?)
+         ON CONFLICT(label) DO UPDATE SET value = value + excluded.value
+         RETURNING value`,
+        label,
+        by,
+      )
+      .one().value;
+  }
+
+  /** Sync self-call: breaks if a wrapper turns bump() async. */
+  bumpAndRead(label: string): number {
+    const value = this.bump(label);
+    return value + 100;
+  }
+
+  removeLabel(label: string): void {
+    this.ctx.storage.sql.exec(`DELETE FROM counts WHERE label = ?`, label);
+  }
+
+  maxCountId(): number {
+    return this.ctx.storage.sql
+      .exec<{ m: number }>(`SELECT COALESCE(MAX(id), 0) AS m FROM counts`)
+      .one().m;
+  }
+
+  /** A rowid-alias table whose INTEGER PRIMARY KEY is NOT the first column. */
+  addEvent(ts: number, note: string): void {
+    this.ctx.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS events (
+        ts INTEGER NOT NULL,
+        id INTEGER PRIMARY KEY,
+        note TEXT NOT NULL
+      )`,
+    );
+    this.ctx.storage.sql.exec(
+      `INSERT INTO events (ts, note) VALUES (?, ?)`,
+      ts,
+      note,
+    );
+  }
+
+  events(): { ts: number; id: number; note: string }[] {
+    return this.ctx.storage.sql
+      .exec<{ ts: number; id: number; note: string }>(
+        `SELECT ts, id, note FROM events ORDER BY id`,
+      )
+      .toArray();
+  }
+
+  async putRaw(key: string, value: string): Promise<void> {
+    await this.ctx.storage.put(key, value);
+  }
+
+  async getRaw(key: string): Promise<string | undefined> {
+    return this.ctx.storage.get<string>(key);
+  }
+
+  total(): number {
+    return this.ctx.storage.sql
+      .exec<{ total: number }>(
+        `SELECT COALESCE(SUM(value), 0) AS total FROM counts`,
+      )
+      .one().total;
+  }
+
+  async note(key: string, value: string): Promise<void> {
+    await this.ctx.storage.put(`note:${key}`, value);
+  }
+
+  async getNote(key: string): Promise<string | undefined> {
+    return this.ctx.storage.get<string>(`note:${key}`);
+  }
+
+  async remindAt(timestamp: number): Promise<void> {
+    await this.ctx.storage.setAlarm(timestamp);
+  }
+
+  async alarm(): Promise<void> {
+    await this.ctx.storage.put("alarm-fired-at", Date.now());
+  }
+
+  async alarmFiredAt(): Promise<number | undefined> {
+    return this.ctx.storage.get<number>("alarm-fired-at");
+  }
+
+  async fetch(_request: Request): Promise<Response> {
+    return new Response(`tally:${instanceName(this.ctx) ?? "?"}`);
+  }
+
+  /** A self-contained FTS5 table (Think-style conversation search). */
+  addDoc(body: string): void {
+    this.ctx.storage.sql.exec(
+      `CREATE VIRTUAL TABLE IF NOT EXISTS docs USING fts5(body)`,
+    );
+    this.ctx.storage.sql.exec(`INSERT INTO docs (body) VALUES (?)`, body);
+  }
+
+  searchDocs(query: string): string[] {
+    return this.ctx.storage.sql
+      .exec<{ body: string }>(`SELECT body FROM docs WHERE docs MATCH ?`, query)
+      .toArray()
+      .map((row) => row.body);
+  }
+
+  /** A table with STORED and VIRTUAL generated columns. */
+  addPriced(name: string, cents: number): void {
+    this.ctx.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS priced (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        cents INTEGER NOT NULL,
+        dollars REAL GENERATED ALWAYS AS (cents / 100.0) STORED,
+        upper_name TEXT GENERATED ALWAYS AS (upper(name)) VIRTUAL
+      )`,
+    );
+    this.ctx.storage.sql.exec(
+      `INSERT INTO priced (name, cents) VALUES (?, ?)`,
+      name,
+      cents,
+    );
+  }
+
+  pricedRows(): { name: string; cents: number; dollars: number; upper_name: string }[] {
+    return this.ctx.storage.sql
+      .exec<{ name: string; cents: number; dollars: number; upper_name: string }>(
+        `SELECT name, cents, dollars, upper_name FROM priced ORDER BY id`,
+      )
+      .toArray();
+  }
+}
+
+/**
+ * Simulates a framework base class (Agents SDK shape): the constructor
+ * calls its own prototype methods, and a subclass constructor inspects the
+ * prototype chain and refuses when one level owns both deprecated-pair
+ * hooks. exportable() must not break either behavior.
+ */
+class FrameworkBase extends DurableObject<Env> {
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    this._setup();
+  }
+
+  _setup(): void {
+    this.ctx.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS fw (k TEXT PRIMARY KEY, v TEXT NOT NULL)`,
+    );
+  }
+
+  onStateChanged(): void {}
+  onStateUpdate(): void {}
+}
+
+export class FrameworkImpl extends FrameworkBase {
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    // Mimic the Agents SDK override detection: no single prototype level
+    // between the instance and the framework base may own both hooks.
+    let proto: object | null = Object.getPrototypeOf(this) as object;
+    while (proto !== null && proto !== FrameworkBase.prototype) {
+      const owns = (name: string) =>
+        Object.prototype.hasOwnProperty.call(proto, name);
+      if (owns("onStateChanged") && owns("onStateUpdate")) {
+        throw new Error(
+          "framework: Cannot override both onStateChanged and onStateUpdate.",
+        );
+      }
+      proto = Object.getPrototypeOf(proto);
+    }
+  }
+
+  setEntry(k: string, v: string): void {
+    this.ctx.storage.sql.exec(
+      `INSERT INTO fw (k, v) VALUES (?, ?)
+       ON CONFLICT(k) DO UPDATE SET v = excluded.v`,
+      k,
+      v,
+    );
+  }
+
+  getEntry(k: string): string | undefined {
+    const rows = this.ctx.storage.sql
+      .exec<{ v: string }>(`SELECT v FROM fw WHERE k = ?`, k)
+      .toArray();
+    return rows[0]?.v;
+  }
+}
+
+/** The old binding's class: the same behavior, plus the export surface. */
+export class LegacyTally extends exportable(Tally) {}
+
+/** A framework-shaped old binding. */
+export class LegacyFramework extends exportable(FrameworkImpl) {}
+
+export class AppDO extends union(
+  {
+    counter: Counter,
+    echo: Echo,
+    reminder: Reminder,
+    plain: Plain,
+    teapot: Teapot,
+    vault: Vault,
+    party: PartyRoom,
+    tally: Tally,
+    fw: FrameworkImpl,
+  },
+  { importable: ["tally", "fw"] },
+) {}
 
 export default {
   async fetch(

@@ -1,0 +1,21 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "claydo-example-migrate-app",
+  "main": "./worker.ts",
+  "compatibility_date": "2026-08-01",
+  "durable_objects": {
+    "bindings": [
+      // The claydo host that everything consolidates into.
+      { "name": "APP_DO", "class_name": "AppDO" },
+      // Legacy binding A: partyserver chat rooms.
+      { "name": "OLD_ROOMS", "class_name": "OldRoom" },
+      // Legacy binding B: plain DO matches, addressed by newUniqueId().
+      { "name": "OLD_MATCHES", "class_name": "OldMatch" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["AppDO", "OldRoom", "OldMatch"] }
+    // Cutover (NOT shipped while data still lives in the old namespaces):
+    // { "tag": "v2", "deleted_classes": ["OldRoom", "OldMatch"] }
+  ]
+}

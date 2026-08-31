@@ -315,6 +315,420 @@ async destroy(): Promise<void> {
 }
 ```
 
+## Migrating existing bindings
+
+`claydo/migrate` moves instances of an existing Durable Object binding into
+a kind, so you can delete the old binding and reclaim its namespace slot.
+There is no platform way to merge namespaces, so a migration is an
+application-level data copy plus a routing cutover — gradual, per instance,
+and reversible until cutover.
+
+Working example: `examples/migrate-app` is a complete transitional app
+(old bindings, host, driver endpoint, router, tests) — start there.
+
+### 1. Wrap the old class and redeploy the old Worker
+
+```ts
+import { exportable } from "claydo/migrate";
+
+class TallyImpl extends DurableObject<Env> { /* unchanged */ }
+export class Tally extends exportable(TallyImpl) {}
+```
+
+Behavior is unchanged until an instance is sealed. The wrapper does not
+rewrite the class's methods or prototype chain (framework base classes such
+as the Agents SDK inspect both); instead it guards `ctx.storage`. While
+sealed: every storage read and write fails with a "sealed" error, `fetch()`
+answers 410 (even when the class never defined a `fetch()`), alarms defer,
+and WebSocket handlers go quiet. The guards are synchronous, so sync
+methods, internal self-calls, and framework helpers keep working while
+unsealed. One caveat: storage references captured inside the wrapped
+class's own constructor (for example `this.db = ctx.storage.sql`) reach the
+real storage — the seal covers `this.ctx.storage` access after
+construction, which is the normal pattern.
+
+### 2. Enable imports on the host
+
+```ts
+export class AppDO extends union(
+  { tally: TallyImpl, ...otherKinds },
+  { importable: ["tally"] },
+) {}
+```
+
+The old class usually becomes the kind implementation as-is.
+
+During the transition, wrangler carries BOTH Durable Object classes, and
+the Worker entry must export both:
+
+```jsonc
+// wrangler.jsonc (transitional)
+{
+  "durable_objects": {
+    "bindings": [
+      { "name": "OLD_TALLY", "class_name": "Tally" },
+      { "name": "APP_DO", "class_name": "AppDO" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Tally", "AppDO"] }
+  ]
+}
+```
+
+```ts
+// index.ts — wrangler resolves class_name against the entry's exports
+export { Tally, AppDO };
+export default { fetch: ... };
+```
+
+### 3. Move instances
+
+Bulk, from a Worker, cron, or Workflow — you supply the instance names (from
+your own registry; Cloudflare cannot list a namespace's names — a small SQL
+or KV table of names, maintained where you create instances, is enough):
+
+```ts
+import { migrateInstance, previewInstance } from "claydo/migrate";
+
+// Optional dry run: sizes, alarm, seal state, and blockers. Changes nothing.
+const preview = await previewInstance({ from: env.OLD_TALLY.getByName(name) });
+// preview: { sealed, movedTo?, hasData, kv, rows, alarm, blockers }
+// kv is a count; rows is a per-table map ({ counts: 12, events: 3 });
+// blockers is a list of human-readable problem descriptions.
+
+const summary = await migrateInstance({
+  from: env.OLD_TALLY.getByName(name),
+  to: kinds(env.APP_DO).tally,
+  name,
+  onProgress: (p) => console.log(`chunk ${p.chunk} (seq ${p.seq})`, p.applied),
+});
+// summary: { skipped, reason?, resumed, chunks, kv, rows, alarm }
+```
+
+A skipped run's `reason` is one of: `"already migrated"`, `"old instance
+has no data (pass allowEmpty to migrate schema-only instances)"`, `"old
+instance is empty and the target is live"`, or `"completed by a concurrent
+driver"`.
+
+A minimal admin driver, wired end to end:
+
+```ts
+if (url.pathname.startsWith("/admin/preview/")) {
+  const name = url.pathname.split("/")[3]!;
+  return Response.json(
+    await previewInstance({ from: env.OLD_TALLY.getByName(name) }),
+  );
+}
+if (url.pathname.startsWith("/admin/migrate/")) {
+  const name = url.pathname.split("/")[3]!;
+  const summary = await migrateInstance({
+    from: env.OLD_TALLY.getByName(name),
+    to: kinds(env.APP_DO).tally,
+    name,
+    onProgress: (p) =>
+      console.log(`[migrate ${name}] ${p.phase} chunk ${p.chunk}`, p.applied),
+  });
+  return Response.json(summary);
+}
+```
+
+`onProgress` cadence: KV pages first (`phase: "kv"`), then row pages per
+table (`"rows"`), then one closing `"final"` chunk that replays post-DDL
+and verifies totals (it usually adds no rows). `applied` is the target's
+CUMULATIVE totals, not a per-chunk delta — compute deltas yourself for
+progress bars.
+
+The importer replays data as-is; it does not validate that the destination
+kind's class understands the imported schema. Registering the old class as
+the kind (as above) guarantees compatibility. Mapping data into a different
+kind is your responsibility.
+
+Or lazily, on first touch, through the transitional router:
+
+```ts
+import { migrated, type MigratedAccessor } from "claydo/migrate";
+
+let tally: MigratedAccessor<TallyImpl> | undefined;
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    // Create the facade ONCE per isolate: its route cache lives on the
+    // object, so a facade built per request caches nothing.
+    tally ??= migrated(env.OLD_TALLY, kinds(env.APP_DO).tally, {
+      strategy: "lazy",
+    });
+    await tally.get("user-42").bump(); // migrates on first touch, serves new
+    // ...
+  },
+};
+```
+
+Router strategies: `lazy` migrates inline on first touch (fleets of small
+instances); `manual` routes to the old instance until an external driver
+migrates it; `drain` never migrates — old instances stay old until their
+data expires, new names go to the kind.
+
+The router notices migrations quickly: RPC calls and `fetch()` requests
+(including WebSocket upgrades) that hit a freshly sealed old instance
+re-resolve the route once and retry on the new side, concurrent lazy first
+touches migrate exactly once, and when another worker is migrating an
+instance the facade waits briefly for it to finish instead of failing.
+
+Route decisions cache per facade: "new" decisions are final, "old"
+decisions expire after `oldRouteTtlMs` (default 30000 ms) so external
+migrations are noticed. Each cache miss costs a few extra RPC round trips,
+so avoid very low TTL values on hot paths. Requests that reach a target
+mid-import receive 503 with a `Retry-After` header.
+
+What the facade does and does not give you:
+
+- It exposes `get(name)` and `resolve(name)` only. `unique()` and
+  `fromId()` have no migration story (old `newUniqueId()` instances cannot
+  keep their IDs across namespaces — give them names, for example
+  `migrated:<oldId>`), and `idFromName()` would leak the new side's ID
+  while the old side may still be authoritative.
+- The stubs' `id` and `kind` metadata always describe the NEW side, even
+  while the old instance still serves the traffic. For observability
+  during the window, ask `await facade.resolve(name)` — it returns
+  `"new"` or `"old"`, is read-only under EVERY strategy (a `resolve()`
+  sweep over your fleet registry never migrates anything, unlike `get()`
+  under `lazy`), and does not touch the route cache.
+- Migrating several old bindings at once? Create one facade per kind pair
+  (`migrated()` maps exactly one old namespace to one kind) and keep each
+  in its own module-scope singleton.
+- Route ALL traffic for migrating names through the facade. One forgotten
+  route, debug script, or cross-kind call that touches the plain accessor
+  mid-migration initializes the target and the driver refuses with a
+  "both the old instance ... and the new instance ... are live" error.
+  The full message offers both remediations: `wipeTarget()` when the new
+  side holds no real data (then re-run), or sealing the old side with
+  `__claydoSeal()` when the new side is the source of truth (the old data
+  will NOT be copied).
+
+### 4. Cut over and reclaim the slot
+
+When the old namespace is empty, replace `migrated()` with the plain
+accessor and ship a `deleted_classes` migration for the old class. That
+deletes the old namespace — the goal of the exercise.
+
+### What moves, and the guarantees
+
+The copy includes SQLite tables (with rowids, rowid-alias primary keys in
+any column position, indexes, triggers, views, and AUTOINCREMENT
+sequences), FTS5 full-text tables (self-contained ones copy row by row;
+external-content ones are recreated and rebuilt on the target after their
+content table arrives), KV entries (all user keys, including keys that
+start with `__claydo` — only the library's three exact reserved keys stay
+behind), and the pending alarm. Generated columns (`STORED` and `VIRTUAL`)
+are excluded from the copy and recompute on the target. FTS5 shadow tables
+are never copied; the index rebuilds from the real data (a rebuilt index
+can be more compact than the original — compare the real tables, not the
+shadows, when verifying byte-level fidelity). PartyServer-based classes
+overwrite their own stored instance name (`__ps_name`) with the prefixed
+name on first contact after the move; everything else copies verbatim.
+
+The order is strict and race-proof:
+
+1. **Reserve the target.** From this moment, traffic to the target blocks
+   with a clear "importing" error instead of initializing an empty
+   instance. Exactly one driver owns the reservation; concurrent drivers
+   fail fast without touching anything, and a crashed driver's reservation
+   goes stale after ~30 seconds so the next run adopts and resumes it.
+2. **Seal the old instance.** Writes freeze, `fetch()` answers 410 with the
+   `x-claydo-sealed` header, open hibernatable WebSockets close with code
+   1012 so clients reconnect, and alarms that come due are deferred — not
+   lost — until the migration completes.
+3. **Stream, verify, go live.** Chunks apply idempotently; totals are
+   verified; the kind pins only after the final chunk.
+4. **Record the move.** The old instance remembers where it moved (as the
+   target's `<kind>:<name>` reference — sealed errors and previews report
+   something you can paste into `kinds(ns).<kind>.get(name)`) and deletes
+   its alarm. Only now does a re-run report `{ skipped: true }`.
+
+Concurrent drivers on the same instance: the loser of the reservation race
+gets a thrown error (`claydo: another migration driver owns the import on
+instance '<kind>:<name>' (last progress Nms ago). It is not stale yet;
+retry later.`) — expect it in bulk runners and retry that name later.
+
+After a successful migration the OLD instance still holds its full data
+copy (only sealed); the old namespace keeps billing for that storage until
+you ship the `deleted_classes` migration at cutover.
+
+On failure, the partial import is discarded and the old instance is
+unsealed — unless another driver owns the migration, in which case nothing
+is touched. Instances with no rows and no KV entries are skipped without
+sealing anything (pass `allowEmpty: true` to migrate schema-only
+instances), so stale registry entries cannot fabricate sealed husks. One
+exception: classes whose constructor writes rows on first contact —
+Agents SDK classes write a `cf_agents_state` row — are never "empty" once
+probed, so this skip cannot protect them; keep the name registry
+authoritative for such classes (see the framework section).
+
+Recovery: if traffic reached the target before the migration ever ran, the
+target is "polluted" and the driver refuses with a both-live error. Wipe
+the polluted target with `wipeTarget(accessor, name)` and re-run — it
+clears storage, alarms, import state, and the in-memory kind pin.
+
+Limits (each fails pre-flight with a clear error, before anything is
+sealed; `previewInstance` reports them under `blockers`):
+
+- `WITHOUT ROWID` tables.
+- Virtual tables other than FTS5, and contentless FTS5 (`content=''`).
+- Tables with a column named `rowid`, `_rowid_`, `oid`, or `__rowid__`
+  (they shadow the rowid the exporter pages by).
+
+Live WebSocket connections do not move — sealing closes them with code
+1012 and reason `claydo: instance migrating; reconnect`; clients should
+watch for that close and re-issue the same request through the router,
+which serves the new side. Old `newUniqueId()` instances cannot keep their
+IDs; give them names (for example `migrated:<oldId>`).
+
+Operational notes:
+
+- If a driver crashes between the final chunk and the move marker, the old
+  instance stays sealed with its alarm deferring every 60 seconds (with a
+  `console.warn`) until any re-run of `migrateInstance` records the
+  marker — re-runs are always safe, so retry after crashes.
+- Methods that touch no storage still answer on a sealed instance (the
+  seal freezes the data, not the event loop); the router's retry logic
+  keys off storage access and `fetch()`. Beware storage-free heartbeats:
+  a `ping()` that never reads storage keeps answering from a sealed old
+  instance until the route TTL expires. Make keepalives read something,
+  or accept up to `oldRouteTtlMs` of routing lag for them.
+- Expect some benign exception noise in logs, concentrated on specific
+  paths: `lazy` first-touch migrations are quiet, but a `manual`/`drain`
+  facade holding a cached "old" route logs one sealed-error exception per
+  instance when its retry lands (the call still succeeds), and framework
+  background bookkeeping (the Agents SDK's alarm scheduler) logs
+  sealed-storage errors until cutover. None of this indicates data loss;
+  the migration outcome is what the `MigrationSummary` says.
+
+### Auditing a fleet
+
+`resolve()` answers "where would traffic go", which is not the same as
+"was this migrated": names that never existed (typos, stale registry
+rows) resolve `"new"` because an empty old side routes to the kind. For a
+cutover audit, discriminate with the migration markers, which live on the
+raw stubs (the claydo stub does not proxy `__`-prefixed methods):
+
+```ts
+for (const name of registry) {
+  const seal = await env.OLD_TALLY.getByName(name).__claydoSealed();
+  // On the host, use the PREFIXED name — getByName(name) without the
+  // prefix reaches a different instance.
+  const status = await env.APP_DO
+    .getByName(`tally:${name}`)
+    .__claydoImportStatus();
+  const state = seal.movedTo !== undefined && status.kind !== undefined
+    ? "migrated"
+    : (await previewInstance({ from: env.OLD_TALLY.getByName(name) })).hasData
+      ? "pending"
+      : "absent";
+}
+```
+
+### Rolling back
+
+Until cutover, a completed migration can be reversed, but treat it as an
+exceptional operation, not a routine one — prefer forward-only:
+
+1. Stop traffic to the name (the facade must not serve during the swap).
+2. `__claydoUnseal()` the old instance (its data copy is still complete).
+3. `wipeTarget(accessor, name)` to clear the new side.
+4. Redeploy (or restart) the Workers that hold `migrated()` facades: a
+   facade caches "new" decisions for the isolate's lifetime, and a stale
+   "new" route would serve the freshly wiped, EMPTY target — repolluting
+   it on first touch and then failing every request with the both-live
+   error until you wipe again.
+
+Anything written to the new side after the migration is lost by the wipe;
+reconcile first if the new side took writes.
+
+### Secrets across Workers
+
+When the old class lives in another Worker, the same secret must be set in
+three places — on the wrapper, on the host, and in every driver call. The
+wrapper and the host take the secret at module load, before any request
+`env` exists — import the module-scope `env` from `cloudflare:workers`:
+
+```ts
+import { env } from "cloudflare:workers";
+
+// Old Worker
+export class Tally extends exportable(TallyImpl, {
+  secret: env.MIGRATION_SECRET,
+}) {}
+
+// New Worker
+export class AppDO extends union(
+  { tally: TallyImpl },
+  { importable: ["tally"], secret: env.MIGRATION_SECRET },
+) {}
+
+// Driver (and migrated() options): the fetch-handler env works here too.
+await migrateInstance({ from, to, name, secret: env.MIGRATION_SECRET });
+```
+
+A mismatch fails with a message that names the side that rejected
+(`exportable() wrapper` or `union() options`).
+
+### Migrating framework classes (Agents SDK, Think, PartyServer)
+
+`exportable()` wraps framework classes too — it does not touch the
+prototype chain their internals inspect, and constructors that call their
+own methods work. Framework-specific notes:
+
+- The host initializes framework kinds on first contact (see the
+  third-party section), so migrated agents answer RPC immediately — no
+  warm-up `fetch()` needed. The OLD binding has no such helper: RPC-first
+  access to a cold Agents SDK instance fails inside the framework
+  (`Cannot read properties of undefined (reading 'appendMessage')`)
+  because `onStart` only runs from `fetch()`. Seed and spot-check old
+  instances through `fetch()`, or add a warm-up fetch before old-side RPC.
+  The migration driver itself is unaffected.
+- Think creates a self-contained FTS5 conversation-search table; it
+  migrates with searchability intact.
+- Framework constructors write bookkeeping rows on first contact (the
+  Agents SDK writes `cf_agents_state`), which has two consequences. The
+  empty-instance skip never applies — every probed instance has data — so
+  a stale registry name migrates a husk instead of being skipped. And
+  `previewInstance`, though it writes nothing itself, constructs the
+  instance it probes, so a preview sweep materializes previously
+  nonexistent names. Keep the name registry authoritative about which
+  instances really exist.
+- The Agents SDK's `getAgentByName()` and `routeAgentRequest()` need the
+  same workarounds after migration as for any kind (see the third-party
+  section).
+
+Think, end to end — the complete path stitches three sections together:
+
+1. Kind setup: the Think snippet in "Cloudflare Agents SDK and Think"
+   (`ask()` shim, `nodejs_compat`, routing rules).
+2. Old side: wrap the standalone Think class with `exportable()`; seed and
+   spot-check old instances through `fetch()` (old-side RPC needs the
+   warm-up above).
+3. Move: `previewInstance` → `migrateInstance` (or the lazy router). The
+   conversation transcript, FTS5 search, alarms, and scheduled state all
+   move; the migrated kind answers RPC turns immediately.
+4. Testing: the Testing section's vitest setup, plus small helper methods
+   on your subclass (a `transcript()` reading `getMessages()`, a search
+   wrapper over `session.search()`) so tests can verify state through the
+   stub.
+
+### API: `claydo/migrate`
+
+| Export | Purpose |
+| --- | --- |
+| `exportable(Base, { secret? })` | Wraps the old class with seal + export support. |
+| `previewInstance({ from, secret? })` | Dry run: sizes, alarm, seal state, blockers. Writes nothing — but contacting an instance constructs it, and framework constructors write their own rows. |
+| `migrateInstance({ from, to, name, secret?, allowEmpty?, maxRowsPerChunk?, maxBytesPerChunk?, onProgress? })` | Moves one instance; returns a `MigrationSummary`. |
+| `migrated(oldNamespace, accessor, { strategy, secret?, oldRouteTtlMs? })` | Transitional router facade: `get(name)` routes (and under `lazy`, migrates); `resolve(name)` is a read-only probe under every strategy. |
+| `wipeTarget(accessor, name, secret?)` | Destructive recovery for polluted targets. |
+
+`union(kinds, options)` accepts `{ importable: true | string[] }` to allow
+imports and `{ secret }` for cross-Worker auth.
+
 ## Third-party Durable Object libraries
 
 A kind is any class with a `(ctx, env)` constructor. Durable Object framework
@@ -588,11 +1002,12 @@ Tips that apply to your own tests:
 For the library's own suites: `npm test` (library) and
 `npm run test:examples` (the example apps under `examples/`).
 
-The `examples/` folder contains eight complete applications (chat rooms with
-rate limiting, collaborative documents, an alarm scheduler, instance
-management, a Lunora-style live table, a token-bucket rate limiter, a game
-lobby, and a shop with cross-kind checkout), each with tests and a DX audit
-report.
+The `examples/` folder contains twelve complete applications: eight kind
+apps (chat rooms with rate limiting, collaborative documents, an alarm
+scheduler, instance management, a Lunora-style live table, a token-bucket
+rate limiter, a game lobby, and a shop with cross-kind checkout) and four
+migration apps (`migrate-app`, `migrate-fleet`, `migrate-lazy`,
+`migrate-gnarly`), each with tests and a DX audit report.
 
 ## License
 
