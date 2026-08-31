@@ -1,9 +1,3 @@
-/**
- * The transitional router in its intended, happy configuration: lazy bucket
- * migration and draining sessions, driven through the Worker's fetch routes
- * exactly as production traffic would arrive. Plus two DX probes that need
- * no failure injection: facade metadata, and the cost of oldRouteTtlMs: 0.
- */
 import {
   createExecutionContext,
   env,
@@ -34,20 +28,16 @@ async function call(path: string, init?: RequestInit): Promise<Response> {
 
 describe("lazy strategy through the worker routes", () => {
   it("migrates an old bucket on first touch, then serves the new instance", async () => {
-    // The legacy fleet: an API key with a configured bucket and some usage.
     await oldBucket("api-alpha").configure(10, 0);
     await oldBucket("api-alpha").take(3); // 7 tokens left on the old side
 
-    // First production request through the facade: migrates inline.
     const first = await call("/limit/api-alpha", { method: "POST" });
     expect(first.status).toBe(200);
     expect(await first.json()).toEqual({ allowed: true, remaining: 6 });
 
-    // The old instance is sealed; the data lives on the new side.
     expect((await oldBucket("api-alpha").__claydoSealed()).sealed).toBe(true);
     expect(await newBuckets().get("api-alpha").remaining()).toBe(6);
 
-    // Subsequent requests serve the new instance.
     const second = await call("/limit/api-alpha", { method: "POST" });
     expect(await second.json()).toEqual({ allowed: true, remaining: 5 });
   });
@@ -63,7 +53,6 @@ describe("lazy strategy through the worker routes", () => {
       allowed: true,
       remaining: 4,
     });
-    // Nothing ever touched the old namespace's instance.
     expect(await oldBucket("fresh-key").__claydoHasData()).toBe(false);
     expect(await newBuckets().get("fresh-key").remaining()).toBe(4);
   });
@@ -94,14 +83,8 @@ describe("drain strategy through the worker routes", () => {
     });
     expect(wrote.status).toBe(200);
 
-    // The write landed on the OLD instance, which is still unsealed.
     expect(await oldSession("sess-old").getValue("lang")).toBe("de");
     expect((await oldSession("sess-old").__claydoSealed()).sealed).toBe(false);
-    // The new-side instance was never initialized (checked without
-    // initializing it — a kind-accessor read would pin the kind!).
-    // NOTE: __claydoKind() is NOT usable for this check: it answers
-    // "session" for a completely untouched instance, because it falls back
-    // to the name prefix. __claydoImportStatus().kind reads storage only.
     const rawNew = env.LIMITER_DO.get(newSessions().idFromName("sess-old"));
     expect(await rawNew.__claydoKind()).toBe("session"); // misleading!
     expect((await rawNew.__claydoImportStatus()).kind).toBeUndefined();
@@ -128,18 +111,15 @@ describe("facade metadata while the route is old", () => {
 
     expect(stub.kind).toBe("bucket");
     expect(stub.name).toBe("meta-1");
-    // .id is the NEW instance's id...
     expect(stub.id.toString()).toBe(
       newBuckets().idFromName("meta-1").toString(),
     );
     expect(stub.id.toString()).not.toBe(
       env.OLD_BUCKETS.idFromName("meta-1").toString(),
     );
-    // ...and .stub is the raw NEW stub...
     expect(stub.stub.id.toString()).toBe(
       newBuckets().idFromName("meta-1").toString(),
     );
-    // ...while every actual call serves the OLD instance.
     expect(await stub.remaining()).toBe(10);
     expect((await oldBucket("meta-1").__claydoSealed()).sealed).toBe(false);
     const rawNew = env.LIMITER_DO.get(newBuckets().idFromName("meta-1"));
@@ -147,12 +127,8 @@ describe("facade metadata while the route is old", () => {
   });
 });
 
-describe("oldRouteTtlMs: 0 cost probe", () => {
-  /**
-   * Wraps the old namespace so every migration probe the facade sends to the
-   * old side is counted. The facade only touches get/idFromName and the
-   * listed stub methods.
-   */
+describe("oldRouteTtlMs: 0 behavior", () => {
+
   function countingNamespace(
     ns: typeof env.OLD_BUCKETS,
     counts: Record<string, number>,
@@ -199,7 +175,6 @@ describe("oldRouteTtlMs: 0 cost probe", () => {
     const calls = 10;
     for (let i = 0; i < calls; i++) {
       expect(await facade.get("ttl-zero").remaining()).toBe(10);
-      // Guarantee the 0ms TTL has visibly elapsed between calls.
       await new Promise((resolve) => setTimeout(resolve, 2));
     }
     const elapsedMs = Date.now() - started;
@@ -209,13 +184,10 @@ describe("oldRouteTtlMs: 0 cost probe", () => {
         `__claydoImportStatus calls, per source), elapsed ~${elapsedMs}ms`,
     );
 
-    // Every call re-resolved: one __claydoSealed + one __claydoHasData
-    // (plus one host-side __claydoImportStatus) per user call.
     expect(counts["remaining"]).toBe(calls);
     expect(counts["__claydoSealed"]).toBeGreaterThanOrEqual(calls - 1);
     expect(counts["__claydoHasData"]).toBeGreaterThanOrEqual(calls - 1);
 
-    // Contrast: the default TTL resolves once for the same traffic.
     const counts30: Record<string, number> = {};
     const cached = migrated(
       countingNamespace(env.OLD_BUCKETS, counts30),

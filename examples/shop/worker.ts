@@ -31,7 +31,7 @@ export class OutOfStockError extends Error {
   }
 }
 
-/** A custom class used by a DX probe: not structured-cloneable over RPC. */
+/** A custom class used by a Test: not structured-cloneable over RPC. */
 export class StockSnapshot {
   constructor(readonly qty: number) {}
 }
@@ -76,7 +76,7 @@ export class Inventory extends DurableObject<Env> {
   }
 
   /**
-   * DX probe instrument: returns a custom class instance, which Workers RPC
+   * Test instrument: returns a custom class instance, which Workers RPC
    * cannot serialize, to exercise the transport-failure wrapping.
    */
   snapshot(): StockSnapshot {
@@ -137,7 +137,7 @@ export class Cart extends DurableObject<Env> {
    *
    * The compensation deliberately catches every error, so it needs no error
    * class or name matching at all — the revived error's typed fields
-   * (post-fix) only matter to callers that want to *report* the failure.
+   * only matter to callers that want to *report* the failure.
    */
   async checkout(): Promise<{ lines: OrderLine[] }> {
     const lines = this.items();
@@ -162,7 +162,7 @@ export class Cart extends DurableObject<Env> {
   }
 
   /**
-   * DX probe instrument: catches the error from a failing cross-kind
+   * Test instrument: catches the error from a failing cross-kind
    * `reserve()` INSIDE the cart DO and reports what actually arrived.
    */
   async probeReserveFailure(productId: string, qty: number): Promise<{
@@ -225,7 +225,6 @@ export default {
           return Response.json(await cart.checkout());
         } catch (error) {
           // `instanceof OutOfStockError` does not survive RPC (by design);
-          // the blessed pattern is matching on `error.name`. Post-fix, the
           // typed fields DO survive, so the response can carry them —
           // though they arrive untyped and need the cast below.
           const e = error as Error & Partial<OutOfStockError>;

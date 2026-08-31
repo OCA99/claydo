@@ -1,8 +1,3 @@
-/**
- * Adversarial DX probes. Each test deliberately misuses the library (or
- * stresses it) and asserts on the exact observed behavior, so the verbatim
- * error messages quoted in DX-REPORT.md stay honest.
- */
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { kind, kinds, union, type KindNameOf } from "../../../src/index";
@@ -12,7 +7,7 @@ async function messageOf(response: Response): Promise<string> {
   return response.text();
 }
 
-describe("probe: concurrent first contact", () => {
+describe("concurrent first contact", () => {
   it("survives 10 concurrent first RPC calls to a fresh instance", async () => {
     const shard = kind(env.APP_DO, "shard").get("probe-concurrent-rpc");
     const results = await Promise.all(
@@ -42,17 +37,14 @@ describe("probe: concurrent first contact", () => {
   });
 });
 
-describe("probe: raw namespace access without the kind prefix", () => {
+describe("raw namespace access without the kind prefix", () => {
   it("silently reaches a DIFFERENT instance than kind().get()", async () => {
     const viaHelper = kind(env.APP_DO, "shard").get("room-raw");
     await viaHelper.insert("room-raw", "helper-data");
 
-    // The realistic mistake: same logical name, raw namespace, no prefix.
     const rawId = env.APP_DO.idFromName("room-raw");
     expect(rawId.toString()).not.toBe(viaHelper.id.toString());
 
-    // First contact through raw fetch: no stored kind, no prefix, no hint.
-    // The 400 now explains the raw-access trap and names the instance.
     const raw = env.APP_DO.get(rawId);
     const response = await raw.fetch("https://do/");
     expect(response.status).toBe(400);
@@ -68,34 +60,30 @@ describe("probe: raw namespace access without the kind prefix", () => {
   it("raw access WITH the manual prefix works but skips the hint", async () => {
     await kind(env.APP_DO, "shard").get("room-raw-2").insert("room-raw-2", "x");
     const raw = env.APP_DO.get(env.APP_DO.idFromName("shard:room-raw-2"));
-    // Raw fetch resolves the kind from storage/prefix; here it hits Shard.fetch.
     const response = await raw.fetch("https://do/");
     expect(response.status).toBe(426); // Shard's own "expected a websocket upgrade"
   });
 });
 
-describe("probe: logical names containing a colon", () => {
+describe("logical names containing a colon", () => {
   it("round-trips get/list/instanceName for 'tenant:42'", async () => {
     const shard = kind(env.APP_DO, "shard").get("tenant:42");
     await shard.insert("tenant:42", "colon-safe");
     expect(await shard.list("tenant:42")).toHaveLength(1);
-    // instanceName splits on the FIRST colon only, so the rest survives.
     expect(await shard.roomName()).toBe("tenant:42");
-    // Distinct from a shard named plain "tenant".
     expect(kind(env.APP_DO, "shard").idFromName("tenant:42").toString()).not.toBe(
       kind(env.APP_DO, "shard").idFromName("tenant").toString(),
     );
   });
 
   it("a logical name that starts with ANOTHER kind's name is fine through the helper", async () => {
-    // Full name is "shard:session:9" — prefix parse stops at the first colon.
     const shard = kind(env.APP_DO, "shard").get("session:9");
     await shard.insert("session:9", "not-a-session");
     expect(await shard.roomName()).toBe("session:9");
   });
 });
 
-describe("probe: fromId() no longer initializes", () => {
+describe("fromId() does not initialize", () => {
   it("RPC through fromId() on a fresh instance fails with an actionable error", async () => {
     const id = env.APP_DO.newUniqueId();
     const orphan = kind(env.APP_DO, "shard").fromId(id);
@@ -130,7 +118,7 @@ describe("probe: fromId() no longer initializes", () => {
     expect(await again.list("r")).toHaveLength(1);
   });
 
-  it("kind-mismatch errors now name the instance", async () => {
+  it("kind-mismatch errors name the instance", async () => {
     const shard = kind(env.APP_DO, "shard").get("probe-mismatch");
     await shard.insert("probe-mismatch", "x");
     const wrong = kind(env.APP_DO, "session").fromId(shard.id);
@@ -141,7 +129,7 @@ describe("probe: fromId() no longer initializes", () => {
   });
 });
 
-describe("probe: stubs across async boundaries", () => {
+describe("stubs across async boundaries", () => {
   it("works after a setTimeout", async () => {
     const shard = kind(env.APP_DO, "shard").get("probe-settimeout");
     await new Promise((resolve) => setTimeout(resolve, 25));
@@ -157,14 +145,12 @@ describe("probe: stubs across async boundaries", () => {
   });
 });
 
-describe("probe: non-method members and reserved-name shadowing", () => {
-  it("hides public fields from the stub type; the runtime error now explains it's a property", async () => {
+describe("non-method members and reserved-name shadowing", () => {
+  it("hides public fields from the stub type; the runtime error explains it's a property", async () => {
     const probe = kind(env.APP_DO, "probe").get("probe-field");
     // @ts-expect-error TS2339: Property 'version' does not exist on type 'KindStub<Probe>'.
     void probe.version;
 
-    // With `as any`, property access still returns an async FUNCTION, not the
-    // value — but calling it now yields a self-explanatory error:
     const leaked = (probe as any).version;
     expect(typeof leaked).toBe("function"); // still truthy, still looks defined
     await expect(leaked()).rejects.toThrow(
@@ -174,15 +160,13 @@ describe("probe: non-method members and reserved-name shadowing", () => {
     );
   });
 
-  it("union() now rejects kind classes with reserved method names at creation time", () => {
+  it("union() rejects kind classes with reserved method names at creation time", () => {
     class BadKind {
       constructor(_ctx: DurableObjectState, _env: unknown) {}
       name(): string {
         return "shadowed";
       }
     }
-    // This used to be silently shadowed (stub.name() typechecked, then threw
-    // TypeError at runtime). Now it fails fast, at class-creation time:
     expect(() => union({ bad: BadKind })).toThrowError(
       "claydo: kind 'bad' (class BadKind) defines a method " +
         "named 'name'. The stub reserves 'id', 'name', 'kind', 'stub' for " +
@@ -190,9 +174,8 @@ describe("probe: non-method members and reserved-name shadowing", () => {
     );
   });
 
-  it("KindStub no longer types metadata keys as callable", async () => {
+  it("KindStub does not type metadata keys as callable", async () => {
     const shard = kind(env.APP_DO, "shard").get("probe-meta-type");
-    // stub.name is plain metadata now — string | undefined, not callable.
     const name: string | undefined = shard.name;
     expect(name).toBe("probe-meta-type");
     // @ts-expect-error TS2722: Cannot invoke an object which is possibly 'undefined'.
@@ -200,7 +183,7 @@ describe("probe: non-method members and reserved-name shadowing", () => {
   });
 });
 
-describe("probe: RPC return value serialization", () => {
+describe("RPC return value serialization", () => {
   it("Map survives", async () => {
     const probe = kind(env.APP_DO, "probe").get("probe-serialize");
     const map = await probe.returnMap();
@@ -222,7 +205,7 @@ describe("probe: RPC return value serialization", () => {
     expect(new DataView(buffer).getUint32(0)).toBe(42);
   });
 
-  it("a custom class instance fails at the RPC layer — now WITH kind+method context", async () => {
+  it("a custom class instance fails at the RPC layer — with kind+method context", async () => {
     const probe = kind(env.APP_DO, "probe").get("probe-serialize");
     let thrown: unknown;
     try {
@@ -231,8 +214,6 @@ describe("probe: RPC return value serialization", () => {
       thrown = error;
     }
     expect(thrown).toBeInstanceOf(Error);
-    // Fixed (was my issue #1): the transport failure is wrapped with the
-    // kind and method name, and the original DataCloneError rides as `cause`.
     expect((thrown as Error).message).toBe(
       "claydo: call to probe.returnCustomClass() failed: " +
         'Could not serialize object of type "Widget". This type does not support serialization.',
@@ -243,25 +224,20 @@ describe("probe: RPC return value serialization", () => {
   });
 });
 
-describe("probe: typos and runtime kind names", () => {
+describe("typos and runtime kind names", () => {
   it("typo through `as any` fails at runtime with the library's error", async () => {
     const shard = kind(env.APP_DO, "shard").get("probe-typo");
     await expect((shard as any).isnert("probe-typo", "x")).rejects.toThrow(
       "claydo: kind 'shard' has no method 'isnert'.",
     );
-    // Without `as any`, TS catches it (verbatim):
     // @ts-expect-error TS2551: Property 'isnert' does not exist on type 'KindStub<Shard>'. Did you mean 'insert'?
     void shard.isnert;
   });
 
-  it("a runtime-built kind name is now typeable with KindNameOf (no lying cast)", async () => {
+  it("a runtime-built kind name is typeable with KindNameOf (no lying cast)", async () => {
     const dynamic: string = ["sha", "rd"].join("");
-    // A bare string is still rejected — and still with the opaque alias
-    // (verbatim; kind() itself did NOT gain better diagnostics, kinds() did):
     // @ts-expect-error TS2345: Argument of type 'string' is not assignable to parameter of type 'KindNameOf<DurableObjectNamespace<LiveTableDO>>'.
     kind(env.APP_DO, dynamic);
-    // Fixed (was my issue #4): the sanctioned spelling — one honest cast to
-    // the exported name union, then narrow:
     const k = dynamic as KindNameOf<typeof env.APP_DO>;
     if (k !== "shard") throw new Error("routing bug");
     const shard = kind(env.APP_DO, k).get("probe-dynamic");
@@ -282,13 +258,12 @@ describe("probe: typos and runtime kind names", () => {
     await app.shard.get("probe-kinds").insert("probe-kinds", "via-kinds");
     expect(await app.session.get("probe-kinds").recent()).toEqual([]);
     expect(await app.shard.get("probe-kinds").list("probe-kinds")).toHaveLength(1);
-    // A typo'd kind is now a property error with a fix-it:
-    // @ts-expect-error TS2551: Property 'shrad' does not exist on type '{ shard: KindAccessor<Shard>; session: KindAccessor<Session>; probe: KindAccessor<Probe>; }'. Did you mean 'shard'?
+    // @ts-expect-error TS2551: Property 'shrad' does not exist on type '{ shard: KindAccessor<Shard>; session: KindAccessor<Session>; KindAccessor<Probe>; }'. Did you mean 'shard'?
     void app.shrad;
   });
 });
 
-describe("probe: big payloads (~100KB)", () => {
+describe("big payloads (~100KB)", () => {
   const big = "x".repeat(100_000);
 
   it("100KB through RPC (argument and return)", async () => {

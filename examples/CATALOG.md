@@ -34,7 +34,5 @@ SQLite database behind one supervisor class, binding, and migration.
 | `migrate-gnarly` | `gnarly` | Data-fidelity audit | FTS5, generated columns, blobs, rowids, sequences |
 | `migrate-lazy` | `bucket`, `session` | First-touch migration | Lazy/manual/drain routing, concurrent ownership |
 
-Each example folder contains a worker, a wrangler config, tests that run in
-workerd, and a `DX-REPORT.md` with an audit of the developer experience,
-written while building the example. Each report has a facet-native update
-that distinguishes current behavior from historical pre-facet findings.
+Each example folder contains a Worker, a Wrangler configuration, and tests
+that run in workerd.

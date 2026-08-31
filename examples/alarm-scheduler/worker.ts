@@ -106,7 +106,7 @@ export class Scheduler extends DurableObject<Env> {
   }
 
   /**
-   * DX-probe helper: aborts the Durable Object so the next access hits a
+   *  aborts the Durable Object so the next access hits a
    * cold instance (fresh constructor, kind resolved from storage again).
    * The in-flight RPC call dies with the abort, so callers must catch.
    */
@@ -115,14 +115,14 @@ export class Scheduler extends DurableObject<Env> {
     throw new Error("unreachable");
   }
 
-  /** DX-probe helper: wipes all storage, including the library's kind key. */
+  /**  wipes all storage, including the library's kind key. */
   async wipeStorage(): Promise<void> {
     await this.ctx.storage.deleteAll();
     Scheduler.#ensureSchema(this.ctx);
   }
 
   async alarm(): Promise<void> {
-    // DX probe hook: a job named "poison" makes alarm() throw, so tests can
+    // Test hook: a job named "poison" makes alarm() throw, so tests can
     // observe how kind-alarm errors surface. Checked before the due filter
     // so a forced `runDurableObjectAlarm` triggers it deterministically.
     const poisoned = this.ctx.storage.sql

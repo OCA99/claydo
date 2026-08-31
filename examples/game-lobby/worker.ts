@@ -189,11 +189,11 @@ export class AppDO extends union({
 }) {}
 
 /**
- * DX probe: a SECOND union host class in the same Worker, with its own
+ * Test surface: a SECOND union host class in the same Worker, with its own
  * binding, to check that two namespaces coexist without type confusion.
  */
 export class Metrics extends DurableObject<Env> {
-  /** Plain property, used by a DX probe: stubs proxy methods only. */
+  /** Plain property, used by a Test surface: stubs proxy methods only. */
   version = 2;
 
   async bump(counter: string): Promise<number> {

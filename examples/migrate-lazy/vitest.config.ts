@@ -9,8 +9,5 @@ export default defineConfig({
       },
     }),
   ],
-  // No onUnhandledError filter anymore: the route cache's promise chain
-  // gained a rejection handler, so failed resolutions no longer leak
-  // unhandled rejections (DX-REPORT.md issue 5, verified fixed).
   test: { include: ["examples/migrate-lazy/test/**/*.test.ts"] },
 });

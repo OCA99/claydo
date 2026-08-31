@@ -24,7 +24,7 @@ export interface LimitResult {
  * as `kind(env.APP_DO, "limiter").get(userId)`.
  */
 export class Limiter extends DurableObject<Env> {
-  /** DX audit probe: a plain (non-method) public property. */
+
   windowMs = WINDOW_MS;
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -106,7 +106,6 @@ export class Chat extends Server<Env> {
 
   async onMessage(connection: Connection, message: WSMessage): Promise<void> {
     if (typeof message !== "string") return;
-    // DX audit probe: what does a throw inside a WebSocket handler look like
     // to the client and the test runner?
     if (message === "/throw") {
       throw new Error("chat kind: deliberate failure inside onMessage");

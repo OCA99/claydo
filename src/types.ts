@@ -74,8 +74,7 @@ interface LoopbackHostNamespace {
  * Facet-local replacement for `storage.deleteAll()`.
  *
  * workerd currently rejects native `deleteAll()` from a facet with an
- * internal actor-parent assertion. Drop user schema and KV explicitly until
- * the platform implementation is fixed.
+ * internal actor-parent assertion. Drop user schema and KV explicitly.
  */
 async function deleteAllFacetStorage(
   storage: DurableObjectStorage,

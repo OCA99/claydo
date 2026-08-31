@@ -56,7 +56,6 @@ describe("collaborative document", () => {
     await kind(env.APP_DO, "doc")
       .get("persist")
       .applyOp({ type: "insert", pos: 0, text: "durable" });
-    // A brand-new accessor and stub must observe the same state.
     const fresh = kind(env.APP_DO, "doc").get("persist");
     expect(await fresh.getText()).toBe("durable");
     expect((await fresh.getStats()).opCount).toBe(1);
@@ -72,7 +71,6 @@ describe("collaborative document", () => {
       alarmScheduled: true,
     });
 
-    // runDurableObjectAlarm needs the RAW stub, not the kind stub.
     const raw = env.APP_DO.get(env.APP_DO.idFromName("doc:compact"));
     expect(await runDurableObjectAlarm(raw)).toBe(true);
 
@@ -84,10 +82,8 @@ describe("collaborative document", () => {
     });
     expect(await doc.getText()).toBe("stateful");
 
-    // No alarm is pending anymore.
     expect(await runDurableObjectAlarm(raw)).toBe(false);
 
-    // New ops after compaction keep working and reschedule the alarm.
     await doc.applyOp({ type: "insert", pos: 8, text: "!" });
     expect(await doc.getStats()).toMatchObject({
       opCount: 1,

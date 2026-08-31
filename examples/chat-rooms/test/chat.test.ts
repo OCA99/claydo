@@ -20,7 +20,6 @@ describe("chat rooms (partyserver kind)", () => {
     const bob = await connect("lobby", "bob");
     const bobWelcome = await bob.next();
     expect(bobWelcome.type).toBe("welcome");
-    // getConnections() has no ordering guarantee, so compare as a set.
     expect([...(bobWelcome.users as string[])].sort()).toEqual([
       "alice",
       "bob",
@@ -51,8 +50,6 @@ describe("chat rooms (partyserver kind)", () => {
     await b.next(); // welcome
     a.ws.send("only in a");
     expect(await a.next()).toMatchObject({ type: "chat", text: "only in a" });
-    // Room b must not receive the message: send a marker through b and
-    // assert that it is the next message b sees.
     b.ws.send("marker");
     expect(await b.next()).toMatchObject({ type: "chat", text: "marker" });
     a.close();
@@ -73,7 +70,6 @@ describe("chat rooms (partyserver kind)", () => {
     eve.ws.send("one too many");
     expect(await eve.next()).toMatchObject({ type: "rate-limited" });
 
-    // The same limiter instance is visible from the outside through kind().
     const limiter = kind(env.APP_DO, "limiter").get("eve");
     expect(await limiter.peek()).toEqual({ used: LIMIT, remaining: 0 });
     eve.close();
@@ -104,8 +100,6 @@ describe("chat rooms (partyserver kind)", () => {
     const client = await connect("prefixed", "nina");
     await client.next(); // welcome
     const info = await kind(env.APP_DO, "chat").get("prefixed").roomInfo();
-    // Papercut: PartyServer reads ctx.id.name, so the room believes its
-    // name is "chat:prefixed", not "prefixed".
     expect(info).toEqual({ name: "chat:prefixed", connections: 1 });
     client.close();
   });

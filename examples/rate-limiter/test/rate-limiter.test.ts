@@ -25,7 +25,6 @@ describe("token bucket: exhaustion", () => {
     const denied = await bucket.take();
     expect(denied.allowed).toBe(false);
     expect(denied.remaining).toBe(0);
-    // 1 token missing at 1 token/sec → about a second (>0 always).
     expect(denied.retryAfterMs).toBeGreaterThan(0);
     expect(denied.retryAfterMs).toBeLessThanOrEqual(1000);
   });
@@ -36,7 +35,6 @@ describe("token bucket: exhaustion", () => {
     expect((await bucket.take(7)).remaining).toBe(3);
     const denied = await bucket.take(5);
     expect(denied.allowed).toBe(false);
-    // 2 tokens missing at 1/sec → about 2 seconds.
     expect(denied.retryAfterMs).toBeGreaterThan(1000);
     expect(denied.retryAfterMs).toBeLessThanOrEqual(2000);
   });
@@ -57,7 +55,6 @@ describe("token bucket: refill over time", () => {
     await bucket.advanceClock(60_000); // way past capacity
     const afterLong = await bucket.take();
     expect(afterLong.allowed).toBe(true);
-    // Refill clamps at capacity: 2 tokens max, minus this take → 1 left.
     expect(afterLong.remaining).toBe(1);
   });
 
@@ -67,7 +64,6 @@ describe("token bucket: refill over time", () => {
     await bucket.take();
     const denied = await bucket.take();
     expect(denied.allowed).toBe(false);
-    // 1 token missing at 2/sec → about 500ms.
     expect(denied.retryAfterMs).toBeGreaterThan(0);
     expect(denied.retryAfterMs).toBeLessThanOrEqual(500);
   });
@@ -96,10 +92,8 @@ describe("token bucket: instance independence", () => {
 describe("token bucket: config persistence", () => {
   it("persists config in SQLite and reads it back through a fresh stub", async () => {
     await buckets().get("key-persist").configure(42, 7);
-    // A brand-new accessor and stub for the same logical key.
     const again = kind(env.APP_DO, "bucket").get("key-persist");
     expect(await again.config()).toEqual({ capacity: 42, refillPerSec: 7 });
-    // The kind pin also persisted: raw access resolves it from storage.
     const raw = env.APP_DO.get(buckets().idFromName("key-persist"));
     expect(await raw.__claydoKind()).toBe("bucket");
   });
@@ -117,7 +111,6 @@ describe("token bucket: config persistence", () => {
 describe("token bucket: concurrency", () => {
   it("handles 10 concurrent first-contact takes without over-issuing", async () => {
     const bucket = buckets().get("key-concurrent");
-    // Default capacity is 10 → exactly 10 should be allowed.
     const results = await Promise.all(
       Array.from({ length: 10 }, () => bucket.take()),
     );
@@ -127,7 +120,7 @@ describe("token bucket: concurrency", () => {
 });
 
 describe("error propagation through the stub", () => {
-  it("keeps name, message, custom fields AND the remote stack (new); instanceof still lost by design", async () => {
+  it("keeps name, message, custom fields AND the remote stack; instanceof is lost by design", async () => {
     const bucket = buckets().get("key-bad-config");
     let thrown: unknown;
     try {
@@ -140,14 +133,11 @@ describe("error propagation through the stub", () => {
     expect(err.message).toBe(
       "configure(capacity, refillPerSec) requires positive numbers, got (-1, 0)",
     );
-    // NEW: own enumerable fields survive the RPC hop.
     expect(err.code).toBe("ERR_BAD_BUCKET_CONFIG");
-    // NEW: the remote stack survives, followed by a marker line, then local frames.
     expect(err.stack).toContain("Bucket.configure");
     expect(err.stack).toContain(
       "at [remote call bucket.configure() via claydo]",
     );
-    // Unchanged (documented as by-design): the class does not survive.
     expect(err).not.toBeInstanceOf(RangeError);
   });
 });
@@ -159,10 +149,8 @@ describe("resetStorage keeps the kind pinned", () => {
     expect(await bucket.config()).toEqual({ capacity: 42, refillPerSec: 7 });
 
     await bucket.reset();
-    // Config is gone, back to defaults; the bucket still works.
     expect(await bucket.config()).toEqual({ capacity: 10, refillPerSec: 1 });
     expect((await bucket.take()).allowed).toBe(true);
-    // The kind pin survived the deleteAll (this is what resetStorage adds).
     const raw = env.APP_DO.get(buckets().idFromName("key-reset"));
     expect(await raw.__claydoKind()).toBe("bucket");
   });

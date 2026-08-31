@@ -4,14 +4,13 @@ import { kind } from "../../../src/index";
 
 export interface DocClient {
   ws: WebSocket;
-  /** Resolves with the next JSON message, FIFO. Rejects after a timeout. */
+
   next(): Promise<Record<string, unknown>>;
-  /** Close codes / error events observed on the client socket. */
+
   events: string[];
   close(): void;
 }
 
-/** Connects a WebSocket client to a document. */
 export async function connect(doc: string): Promise<DocClient> {
   const response = await kind(env.APP_DO, "doc")
     .get(doc)

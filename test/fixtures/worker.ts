@@ -234,11 +234,7 @@ export class PartyRoom extends Server<Env> {
   }
 }
 
-/**
- * The class that used to be its own binding. It serves as the kind
- * implementation after migration, and — wrapped with exportable() — as the
- * old binding's class during migration.
- */
+/** Shared implementation for the migration source and target kind. */
 export class Tally extends DurableObject<Env> {
   readonly #capturedStorage: DurableObjectStorage;
 

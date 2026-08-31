@@ -6,10 +6,6 @@ import worker, { OutOfStockError } from "../worker";
 const carts = () => kind(env.APP_DO, "cart");
 const inventories = () => kind(env.APP_DO, "inventory");
 
-/**
- * Storage persists across tests in this file, so every test gets its own
- * product/user namespace via a unique prefix.
- */
 let seq = 0;
 function ids() {
   const p = `t${seq++}`;
@@ -64,8 +60,6 @@ describe("cart checkout", () => {
 
   it("failed checkout releases already-reserved stock (compensation)", async () => {
     const { user, widget, gadget } = ids();
-    // 'gadget' sorts before 'widget', so checkout reserves gadget first,
-    // then fails on widget and must release the gadget reservation.
     await inventories().get(gadget).restock(10);
     await inventories().get(widget).restock(1);
 
@@ -77,10 +71,8 @@ describe("cart checkout", () => {
       `out of stock: product '${widget}' has 1 left, cannot reserve 3`,
     );
 
-    // Compensation restored everything.
     expect(await inventories().get(gadget).stock()).toBe(10);
     expect(await inventories().get(widget).stock()).toBe(1);
-    // The cart still holds the items for a retry.
     expect(await cart.items()).toHaveLength(2);
   });
 
@@ -107,8 +99,6 @@ describe("worker end to end", () => {
       env,
     );
     expect(response.status).toBe(409);
-    // Post-fix: the typed fields survive DO -> DO -> worker, so the HTTP
-    // response can carry structured data instead of parsing the message.
     expect(await response.json()).toEqual({
       error: "OutOfStockError",
       message: `out of stock: product '${widget}' has 0 left, cannot reserve 2`,
@@ -118,16 +108,8 @@ describe("worker end to end", () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Adversarial DX probes: what does a custom error class look like after one
-// and after two RPC hops? Post-fix, the envelope carries the original stack
-// and own enumerable serializable fields; `instanceof` still does not
-// survive (by design — match on `error.name`). Verbatim findings are quoted
-// in DX-REPORT.md.
-// ---------------------------------------------------------------------------
-
-describe("dx probes: cross-kind error propagation", () => {
-  it("PROBE one hop (test -> inventory): name, message, FIELDS and remote stack survive", async () => {
+describe("edge cases: cross-kind error propagation", () => {
+  it("one hop (test -> inventory): name, message, FIELDS and remote stack survive", async () => {
     const { widget } = ids();
     const inv = inventories().get(widget);
     await inv.restock(1);
@@ -143,14 +125,10 @@ describe("dx probes: cross-kind error propagation", () => {
       `out of stock: product '${widget}' has 1 left, cannot reserve 3`,
     );
     expect(caught instanceof Error).toBe(true);
-    // Post-fix: the typed fields survive the hop (own enumerable props).
     expect(e.productId).toBe(widget);
     expect(e.requested).toBe(3);
     expect(e.available).toBe(1);
-    // Class identity still does not survive, by design.
     expect(caught instanceof OutOfStockError).toBe(false);
-    // Post-fix stack: the remote throw site leads, then the hop marker,
-    // then the local frames.
     const stack = e.stack ?? "";
     const throwSite = stack.indexOf("at Inventory.reserve");
     const marker = stack.indexOf(
@@ -163,7 +141,7 @@ describe("dx probes: cross-kind error propagation", () => {
     expect(local).toBeGreaterThan(marker);
   });
 
-  it("PROBE inside the cart DO: the catch site now sees fields and the remote stack", async () => {
+  it("inside the cart DO: the catch site sees fields and the remote stack", async () => {
     const { user, widget } = ids();
     await inventories().get(widget).restock(1);
     const report = await carts().get(user).probeReserveFailure(widget, 5);
@@ -173,16 +151,14 @@ describe("dx probes: cross-kind error propagation", () => {
       constructorName: "Error",
       name: "OutOfStockError",
       message: `out of stock: product '${widget}' has 1 left, cannot reserve 5`,
-      // Post-fix: fields arrive inside the catching DO.
       productIdField: widget,
       availableField: 1,
     });
-    // The first stack frame at the catch site is the real throw site.
     expect(report.stackHead).toContain("OutOfStockError: out of stock");
     expect(report.stackHead).toContain("at Inventory.reserve");
   });
 
-  it("PROBE two hops (test -> cart -> inventory): full causal chain preserved", async () => {
+  it("two hops (test -> cart -> inventory): full causal chain preserved", async () => {
     const { user, widget } = ids();
     await inventories().get(widget).restock(1);
     const cart = carts().get(user);
@@ -200,16 +176,9 @@ describe("dx probes: cross-kind error propagation", () => {
       `out of stock: product '${widget}' has 1 left, cannot reserve 4`,
     );
     expect(caught instanceof OutOfStockError).toBe(false); // still by design
-    // Post-fix: fields survive BOTH hops (re-wrapped at each hop).
     expect(e.productId).toBe(widget);
     expect(e.requested).toBe(4);
     expect(e.available).toBe(1);
-    // Post-fix stack is a causal chain, innermost first:
-    //   Inventory.reserve (worker.ts)
-    //   ... at [remote call inventory.reserve() via claydo]
-    //   Cart.checkout (worker.ts)
-    //   ... at [remote call cart.checkout() via claydo]
-    //   <test frames>
     const stack = e.stack ?? "";
     const throwSite = stack.indexOf("at Inventory.reserve");
     const innerMarker = stack.indexOf(
@@ -227,14 +196,12 @@ describe("dx probes: cross-kind error propagation", () => {
     expect(local).toBeGreaterThan(outerMarker);
   });
 
-  it("PROBE transport failure: non-serializable return values are wrapped with call context", async () => {
+  it("transport failure: non-serializable return values are wrapped with call context", async () => {
     const { widget } = ids();
     const inv = inventories().get(widget);
     await inv.restock(1);
     let caught: unknown;
     try {
-      // snapshot() returns a custom class instance, which Workers RPC
-      // cannot serialize.
       await inv.snapshot();
     } catch (error) {
       caught = error;

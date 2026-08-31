@@ -17,7 +17,7 @@
  * additionally evicts it from memory, but it kills the in-flight RPC, so the
  * caller cannot get a return value from the same call. The registry here
  * uses deleteAll-then-forget; a separate `nuke()` method demonstrates the
- * abort variant for the DX report.
+ * abort variant for comparison.
  */
 import { DurableObject, kind, resetStorage, union } from "../../src/index";
 
@@ -32,7 +32,7 @@ export type CounterRecord = {
 };
 
 export class Counter extends DurableObject<Env> {
-  /** DX probe: a plain public property, to see how the stub reports it. */
+  /** Test surface: a plain public property, to see how the stub reports it. */
   flavor = "vanilla";
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -86,13 +86,13 @@ export class Counter extends DurableObject<Env> {
     throw new Error("unreachable");
   }
 
-  /** DX probe: evict the instance from memory without touching storage. */
+  /** Test surface: evict the instance from memory without touching storage. */
   crash(): never {
     this.ctx.abort("counter crashed on purpose");
     throw new Error("unreachable");
   }
 
-  /** DX probe: a return value that structured clone cannot serialize. */
+  /** Test surface: a return value that structured clone cannot serialize. */
   weird(): object {
     class Unserializable {
       value = 42;
@@ -117,7 +117,7 @@ export class Registry extends DurableObject<Env> {
   async createCounter(label: string): Promise<CounterRecord> {
     const existing = this.#find(label);
     if (existing !== undefined) {
-      // A named error with an own enumerable field, to probe how much error
+      // A named error with an own enumerable field, to verify how much error
       // fidelity survives the RPC envelope.
       const error = new Error(`registry: label '${label}' already exists`);
       error.name = "DuplicateLabelError";
@@ -125,7 +125,7 @@ export class Registry extends DurableObject<Env> {
       throw error;
     }
     // Create the instance from INSIDE the DO. unique() only mints an id;
-    // the first RPC pins the kind in the new instance's storage.
+    // the first RPC pins the kind in supervisor storage.
     const counter = kind(this.env.APP_DO, "counter").unique();
     await counter.increment(0); // touch it so the kind is persisted
     const record: CounterRecord = {
@@ -191,7 +191,7 @@ export class Registry extends DurableObject<Env> {
   }
 }
 
-/** DX probe: a kind whose constructor throws. What does the caller see? */
+/** Test surface: a kind whose constructor throws. What does the caller see? */
 export class BrokenKind {
   constructor(_ctx: DurableObjectState, _env: Env) {
     throw new Error("BrokenKind constructor exploded: missing config");
@@ -205,7 +205,7 @@ export class BrokenKind {
 export class AppDO extends union({
   registry: Registry,
   counter: Counter,
-  // DX probe: the same class registered under a second kind name. Instances
+  // Test surface: the same class registered under a second kind name. Instances
   // are disjoint (different name prefix -> different ids), and the pinned
   // kind string differs, so "tally" counters are not "counter" counters.
   tally: Counter,

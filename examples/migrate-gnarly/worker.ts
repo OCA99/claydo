@@ -1,5 +1,5 @@
 /**
- * migrate-gnarly — a hostile-data fixture for auditing `claydo/migrate`.
+ * migrate-gnarly — a hostile-data stress fixture for `claydo/migrate`.
  *
  * One "kitchen sink" Durable Object class (`GnarlyImpl`) doubles as the OLD
  * binding (wrapped with `exportable()`) and as the destination kind on the
@@ -479,7 +479,7 @@ export class GnarlyImpl extends DurableObject<Env> {
     return { total: 2000 };
   }
 
-  // ----------------------- extra probe: rowid alias NOT in first position
+  // ----------------------- case: rowid alias NOT in first position
 
   seedAliasSecond(): number {
     const sql = this.ctx.storage.sql;

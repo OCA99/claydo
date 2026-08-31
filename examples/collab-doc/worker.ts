@@ -22,8 +22,7 @@ export const COMPACT_AFTER_MS = 30_000;
 function apply(text: string, op: Op): string {
   if (op.type === "insert") {
     if (!Number.isInteger(op.pos) || op.pos < 0 || op.pos > text.length) {
-      // Structured fields on the error double as a DX probe: the updated
-      // library forwards own enumerable serializable fields over RPC.
+      // Structured fields verify enumerable error metadata over RPC.
       throw Object.assign(
         new Error(
           `collab-doc: insert position ${op.pos} out of range 0..${text.length}`,
@@ -44,7 +43,7 @@ function apply(text: string, op: Op): string {
   return text.slice(0, op.pos) + text.slice(op.pos + op.len);
 }
 
-/** DX audit probe: a class instance with methods, returned from an RPC. */
+
 export class SnapshotHandle {
   constructor(readonly version: number) {}
   describe(): string {
@@ -81,7 +80,6 @@ export class Doc extends DurableObject<Env> {
     ctx.storage.sql.exec(
       `INSERT OR IGNORE INTO snapshot (id, version, text) VALUES (0, 0, '')`,
     );
-    // DX audit probe: the README says not to call instanceName() in the
     // constructor because ctx.id.name is not available there. Verify.
     try {
       this.#ctorNameProbe = `value: ${String(instanceName(ctx))}`;
@@ -152,7 +150,6 @@ export class Doc extends DurableObject<Env> {
       ws.send(JSON.stringify({ type: "error", message: "invalid JSON" }));
       return;
     }
-    // DX audit probe: what does an uncaught throw inside webSocketMessage
     // look like to the client and the test runner?
     if (parsed.type === "boom") {
       throw new Error("doc kind: deliberate failure inside webSocketMessage");
@@ -207,12 +204,12 @@ export class Doc extends DurableObject<Env> {
     return { seq, text: this.#currentText() };
   }
 
-  /** DX audit probe: what instanceName(ctx) returned in the constructor. */
+
   constructorNameProbe(): string {
     return this.#ctorNameProbe;
   }
 
-  /** DX audit probe: returns a non-serializable class instance over RPC. */
+
   getHandle(): SnapshotHandle {
     const version = this.ctx.storage.sql
       .exec<{ version: number }>(`SELECT version FROM snapshot WHERE id = 0`)
@@ -220,7 +217,7 @@ export class Doc extends DurableObject<Env> {
     return new SnapshotHandle(version);
   }
 
-  /** DX audit probe: returns a function over RPC. */
+
   getCallback(): () => void {
     return () => {};
   }

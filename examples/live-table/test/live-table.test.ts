@@ -7,7 +7,6 @@ import { describe, expect, it } from "vitest";
 import { kind } from "../../../src/index";
 import worker, { type InsertDelta, type MessageRow } from "../worker";
 
-/** Opens a WebSocket subscription to a room shard and buffers deltas. */
 async function subscribe(room: string) {
   const shard = kind(env.APP_DO, "shard").get(room);
   const response = await shard.fetch("https://do/subscribe", {
@@ -58,7 +57,6 @@ describe("shard kind: insert and list", () => {
     expect(a.id.toString()).not.toBe(b.id.toString());
     await a.insert("room-a", "only-in-a");
     await b.insert("room-b", "only-in-b");
-    // Sequences restart per instance: proof the SQLite databases are separate.
     expect(await a.list("room-a")).toEqual([
       { room: "room-a", body: "only-in-a", seq: 1 },
     ]);
@@ -92,7 +90,6 @@ describe("shard kind: live subscriptions", () => {
     const subOther = await subscribe("room-quiet");
     const shard = kind(env.APP_DO, "shard").get("room-noisy");
     await shard.insert("room-noisy", "noise");
-    // Give any (wrong) delivery a chance to arrive.
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(subOther.received).toEqual([]);
     subOther.close();

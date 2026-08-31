@@ -2,18 +2,12 @@ import { env, runDurableObjectAlarm } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
 import { kind } from "../../../src/index";
 
-// GUARD: the repository's root vitest config has no `include` filter, so a
-// bare `npx vitest run` from the repo root sweeps up this file and runs it
-// against the WRONG worker (test/fixtures/worker.ts, which has no
-// `scheduler` kind). Detect that and skip. Run this suite with:
-//   npx vitest run --config examples/alarm-scheduler/vitest.config.ts
 const hostedHere =
   (await env.APP_DO.get(
     env.APP_DO.idFromName("scheduler:__config-probe"),
   ).__claydoKind()) === "scheduler";
 const describeHosted = describe.skipIf(!hostedHere);
 
-/** Convenience: the raw stub for a named scheduler instance. */
 function rawSchedulerStub(name: string) {
   return env.APP_DO.get(env.APP_DO.idFromName(`scheduler:${name}`));
 }
@@ -26,7 +20,6 @@ describeHosted("scheduling basics", () => {
     await s.schedule("sooner", { delayMs: 10_000 });
     const jobs = await s.list();
     expect(jobs.map((j) => j.name)).toEqual(["sooner", "later"]);
-    // The single DO alarm is armed for the earliest job.
     const alarmAt = await s.alarmTime();
     expect(alarmAt).toBe(jobs[0]!.at);
   });
@@ -49,7 +42,6 @@ describeHosted("scheduling basics", () => {
     expect(await s.cancel("drop")).toBe(true);
     expect(await s.cancel("never-existed")).toBe(false);
     expect((await s.list()).map((j) => j.name)).toEqual(["keep"]);
-    // The alarm re-armed for the remaining job.
     expect(await s.alarmTime()).toBe(now + 20_000);
   });
 
@@ -66,7 +58,6 @@ describeHosted("scheduling basics", () => {
   it("jobs survive stub recreation", async () => {
     const now = Date.now();
     await kind(env.APP_DO, "scheduler").get("survive").schedule("a", now + 9_000);
-    // A brand new accessor + stub sees the same SQLite state.
     const again = kind(env.APP_DO, "scheduler").get("survive");
     expect((await again.list()).map((j) => j.name)).toEqual(["a"]);
   });
@@ -81,9 +72,6 @@ describeHosted("scheduling basics", () => {
 
 describeHosted("alarm multiplexing", () => {
   it("fires jobs in order, re-arming after each one", async () => {
-    // NOTE: in the workers vitest pool, alarms whose time has arrived fire
-    // for real. Past-dated jobs race any manual runDurableObjectAlarm call,
-    // so this test schedules short real delays and waits for natural firing.
     const s = kind(env.APP_DO, "scheduler").get("order");
     const now = Date.now();
     await s.schedule("third", now + 90);
@@ -108,7 +96,6 @@ describeHosted("alarm multiplexing", () => {
     ]);
     expect(await s.list()).toEqual([]);
     expect(await s.alarmTime()).toBeNull();
-    // No alarm remains; the runner reports nothing to do.
     expect(await runDurableObjectAlarm(rawSchedulerStub("order"))).toBe(false);
   });
 
@@ -116,8 +103,6 @@ describeHosted("alarm multiplexing", () => {
     const s = kind(env.APP_DO, "scheduler").get("early");
     const at = Date.now() + 60_000;
     await s.schedule("future", at);
-    // runDurableObjectAlarm forces the alarm to run even though the alarm
-    // time is in the future; the scheduler must tolerate a spurious wake.
     expect(await runDurableObjectAlarm(rawSchedulerStub("early"))).toBe(true);
     expect(await s.fired()).toEqual([]);
     expect((await s.list()).map((j) => j.name)).toEqual(["future"]);
@@ -128,17 +113,10 @@ describeHosted("alarm multiplexing", () => {
     const s = kind(env.APP_DO, "scheduler").get("cold");
     await s.schedule("wake-up", { delayMs: 150 });
 
-    // Force the instance out of memory. The in-flight RPC dies with the
-    // abort, so the client stub call rejects with the abort reason.
     await expect(s.crash()).rejects.toThrow("scheduler crashed on purpose");
 
-    // Facet-native claydo keeps the supervisor stub stable: abort evicts
-    // only the kind facet, so this same public stub reaches its replacement.
     expect((await s.list()).map((job) => job.name)).toEqual(["wake-up"]);
 
-    // The alarm now arrives at a cold instance, with no client hint on the
-    // alarm path: the host must resolve `scheduler` from storage. Use a
-    // FRESH stub to observe the result.
     const fresh = kind(env.APP_DO, "scheduler").get("cold");
     await vi.waitFor(
       async () => {
@@ -150,16 +128,10 @@ describeHosted("alarm multiplexing", () => {
   });
 });
 
-describeHosted("DX probes (adversarial)", () => {
-  it("PROBE: a throwing kind alarm() surfaces through runDurableObjectAlarm", async () => {
+describeHosted("edge cases (adversarial)", () => {
+  it("a throwing kind alarm() surfaces through runDurableObjectAlarm", async () => {
     const s = kind(env.APP_DO, "scheduler").get("poison");
-    // The scheduler treats a job named "poison" as a deliberate crash.
-    // Schedule it far in the future so it cannot fire naturally, then force
-    // it: this is the only deterministic way to observe the alarm error.
     await s.schedule("poison", Date.now() + 60_000);
-    // POST-FIX: forwarded-handler errors are logged with kind + instance
-    // context before rethrowing, so natural firings (whose errors never
-    // reach a caller) leave an attributable trace.
     const errorSpy = vi.spyOn(console, "error");
     await expect(
       runDurableObjectAlarm(rawSchedulerStub("poison")),
@@ -170,46 +142,37 @@ describeHosted("DX probes (adversarial)", () => {
       expect.objectContaining({ message: "poison job exploded" }),
     );
     errorSpy.mockRestore();
-    // The job was not consumed, so production would retry with backoff.
-    // Cancel to leave the instance clean.
     expect((await s.list()).map((j) => j.name)).toEqual(["poison"]);
     await s.cancel("poison");
   });
 
-  it("PROBE: typo'd method through the stub (as any) fails at runtime", async () => {
+  it("typo'd method through the stub (as any) fails at runtime", async () => {
     const s = kind(env.APP_DO, "scheduler").get("typo");
     await expect((s as any).schedul("x", 1)).rejects.toThrow(
       "claydo: kind 'scheduler' has no method 'schedul'.",
     );
   });
 
-  it("PROBE: runDurableObjectAlarm rejects the library's proxy stub", async () => {
+  it("runDurableObjectAlarm rejects the library's proxy stub", async () => {
     const s = kind(env.APP_DO, "scheduler").get("wrong-stub");
     await s.schedule("j", Date.now() + 60_000);
-    // A real user's first instinct: pass the typed stub. It is a Proxy, not
-    // a DurableObjectStub, so the test helper rejects it.
     await expect(
       runDurableObjectAlarm(s as unknown as DurableObjectStub),
     ).rejects.toThrow(
       "Failed to execute 'runDurableObjectAlarm': parameter 1 is not of type 'DurableObjectStub'.",
     );
-    // The escape hatch works.
     expect(await runDurableObjectAlarm(s.stub)).toBe(true);
   });
 
-  it("PROBE: deleteAll() on a NAMED instance loses data but not identity", async () => {
+  it("deleteAll() on a NAMED instance loses data but not identity", async () => {
     const s = kind(env.APP_DO, "scheduler").get("wipe-named");
     await s.schedule("gone", Date.now() + 60_000);
     await s.wipeStorage();
 
-    // Facet-native deleteAll() clears only the isolated kind database.
-    // wipeStorage() recreates its schema before returning.
     expect(await s.list()).toEqual([]);
     const fresh = kind(env.APP_DO, "scheduler").get("wipe-named");
     expect(await fresh.list()).toEqual([]);
     expect(await fresh.fired()).toEqual([]);
-    // The facet adapter clears the supervisor-owned alarm together with the
-    // facet database, so no orphaned alarm remains.
     expect(await fresh.alarmTime()).toBeNull();
     expect(await runDurableObjectAlarm(rawSchedulerStub("wipe-named"))).toBe(
       false,
@@ -217,7 +180,7 @@ describeHosted("DX probes (adversarial)", () => {
     expect(await rawSchedulerStub("wipe-named").__claydoKind()).toBe("scheduler");
   });
 
-  it("PROBE: deleteAll() on a UNIQUE facet cannot erase kind identity", async () => {
+  it("deleteAll() on a UNIQUE facet cannot erase kind identity", async () => {
     const s = kind(env.APP_DO, "scheduler").unique();
     expect(s.name).toBeUndefined(); // unique stubs have no logical name
     const id = s.id.toString();
@@ -225,26 +188,16 @@ describeHosted("DX probes (adversarial)", () => {
     await s.wipeStorage();
     await expect(s.crash()).rejects.toThrow("scheduler crashed on purpose");
 
-    // The kind pin lives in isolated supervisor storage. Wiping kind data
-    // cannot erase it, and the virtualized deleteAll() clears the alarm.
     const raw = env.APP_DO.get(env.APP_DO.idFromString(id));
     expect(await raw.__claydoKind()).toBe("scheduler");
     expect(await runDurableObjectAlarm(raw)).toBe(false);
 
-    // fromId() reaches the same empty but healthy instance after restart.
     const again = kind(env.APP_DO, "scheduler").fromId(id);
     expect(await again.list()).toEqual([]);
     expect(await raw.__claydoKind()).toBe("scheduler");
-    // resetStorage(ctx) and this.ctx.storage.deleteAll() share these safe
-    // facet-native semantics.
   });
 
-  it("PROBE: unique() alarm on a never-hinted instance cannot happen via the API", async () => {
-    // Could a unique() instance set an alarm BEFORE its kind is persisted?
-    // Not through this library: the host persists the kind before it even
-    // constructs the kind class, and raw fetch() without a hint is rejected
-    // before any user code runs. Demonstrate the rejection (the 400 now
-    // names the instance and explains the unique-ID initialization path):
+  it("unique() alarm on a never-hinted instance cannot happen via the API", async () => {
     const raw = env.APP_DO.get(env.APP_DO.newUniqueId());
     const response = await raw.fetch("https://do/");
     expect(response.status).toBe(400);

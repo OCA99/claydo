@@ -11,7 +11,6 @@ import worker, { Game, type GameState } from "../worker";
 const lobby = () => kind(env.APP_DO, "lobby").get("main");
 const games = () => kind(env.APP_DO, "game");
 
-/** Raw (unwrapped) stub for a game instance, as `cloudflare:test` wants it. */
 function rawStub(id: string) {
   return env.APP_DO.get(env.APP_DO.idFromString(id));
 }
@@ -22,7 +21,6 @@ describe("lobby -> game flow", () => {
     expect(id).toMatch(/^[0-9a-f]{64}$/);
 
     const game = games().fromId(id);
-    // alice: 0, 1, 2 wins the top row.
     await game.move("alice", 0);
     await game.move("bob", 4);
     await game.move("alice", 1);
@@ -32,7 +30,6 @@ describe("lobby -> game flow", () => {
     expect(final.status).toBe("finished");
     expect(final.winner).toBe("alice");
     expect(final.endReason).toBe("win");
-    // The board is readable through state() from a second stub.
     const again = await games().fromId(id).state();
     expect(again.board[0]).toBe("alice");
   });
@@ -40,7 +37,6 @@ describe("lobby -> game flow", () => {
   it("lists matches from lobby SQLite", async () => {
     const a = await lobby().createMatch(["alice", "bob"]);
     const b = await lobby().createMatch(["carol", "dave"]);
-    // Storage persists across tests in this file, so assert relative order.
     const ids = (await lobby().listMatches()).map((m) => m.id);
     expect(ids.indexOf(a)).toBeGreaterThanOrEqual(0);
     expect(ids.indexOf(b)).toBe(ids.indexOf(a) + 1);
@@ -54,7 +50,6 @@ describe("lobby -> game flow", () => {
     await expect(game.move("bob", 4)).rejects.toThrow(
       "not your turn: it is 'alice' to move",
     );
-    // Rejected moves do not change state.
     expect((await game.state()).board.every((c) => c === null)).toBe(true);
   });
 
@@ -76,9 +71,6 @@ describe("turn-timeout alarm", () => {
     const id = await lobby().createMatch(["alice", "bob"]);
     await games().fromId(id).move("alice", 0);
 
-    // Fire the pending alarm through a FRESH raw stub (alarm only, no typed
-    // call first): kind resolution must come from persisted storage because
-    // unique-id instances have no name prefix.
     const ran = await runDurableObjectAlarm(rawStub(id));
     expect(ran).toBe(true);
 
@@ -87,7 +79,6 @@ describe("turn-timeout alarm", () => {
     expect(state.winner).toBe("alice"); // bob was on turn and timed out
     expect(state.endReason).toBe("timeout");
 
-    // The game refuses further moves.
     await expect(games().fromId(id).move("alice", 1)).rejects.toThrow(
       "game is finished; no more moves accepted",
     );
@@ -124,7 +115,6 @@ describe("websocket spectators", () => {
 
     await game.move("alice", 4);
     await game.move("bob", 0);
-    // Give the broadcast a tick to arrive.
     await new Promise((resolve) => setTimeout(resolve, 50));
 
     expect(messages).toHaveLength(2);
@@ -192,22 +182,16 @@ describe("worker routes end to end", () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Adversarial DX probes. Each asserts the failure mode observed while
-// auditing the library; verbatim messages are quoted in DX-REPORT.md.
-// ---------------------------------------------------------------------------
-
-describe("dx probes", () => {
-  it("PROBE: kind mismatch — game id opened through the lobby accessor", async () => {
+describe("edge cases", () => {
+  it("kind mismatch — game id opened through the lobby accessor", async () => {
     const id = await lobby().createMatch(["alice", "bob"]);
     const wrong = kind(env.APP_DO, "lobby").fromId(id);
-    // Post-fix: the message now names the exact instance.
     await expect(wrong.listMatches()).rejects.toThrow(
       `claydo: instance '${id}' is kind 'game', but the caller expected kind 'lobby'.`,
     );
   });
 
-  it("PROBE: fromId() never initializes an instance (post-fix behavior)", async () => {
+  it("fromId() never initializes an instance", async () => {
     const freshId = env.APP_DO.newUniqueId().toString();
     const ghost = kind(env.APP_DO, "game").fromId(freshId);
     const expected =
@@ -216,44 +200,33 @@ describe("dx probes", () => {
       `initializes an instance. Create the instance first with ` +
       `kind(ns, 'game').get(name) or .unique(), then reach it by id.`;
     await expect(ghost.state()).rejects.toThrow(expected);
-    // fetch() through a fromId() stub refuses to initialize too.
     const response = await ghost.fetch("https://do/");
     expect(response.status).toBe(400);
     expect(await response.text()).toBe(expected);
-    // The refusal left no kind pinned: a later legitimate unique()-style
-    // initialization path would still be possible (nothing was persisted).
     const raw = env.APP_DO.get(env.APP_DO.idFromString(freshId));
     expect(await raw.__claydoKind()).toBeUndefined();
   });
 
-  it("PROBE: unique() id round-trip through lobby SQLite", async () => {
+  it("unique() id round-trip through lobby SQLite", async () => {
     const id = await lobby().createMatch(["alice", "bob"]);
-    // The id came back as a string (stub.id.toString()) and went through
-    // SQLite; fromId() accepts the string directly, no casting needed.
     const stored = (await lobby().listMatches()).find((m) => m.id === id)!;
     const game = games().fromId(stored.id);
     expect((await game.state()).players).toEqual(["alice", "bob"]);
-    // fromId() stubs have no logical name.
     expect(game.name).toBeUndefined();
   });
 
-  it("PROBE: renamed kind in the registry orphans existing instances", async () => {
-    // Simulate deploying a registry where 'game' was renamed to 'match':
-    // an existing instance has kind 'game' persisted in storage, but the
-    // running registry no longer contains it. We fake the persisted side by
-    // writing a stale kind into a fresh instance's storage.
+  it("renamed kind in the registry orphans existing instances", async () => {
     const raw = env.APP_DO.get(env.APP_DO.newUniqueId());
     await runInDurableObject(raw, async (_instance, state) => {
       await state.storage.put(KIND_STORAGE_KEY, "match");
     });
     const viaGame = kind(env.APP_DO, "game").fromId(raw.id.toString());
-    // Post-fix: the message now names the affected instance.
     await expect(viaGame.state()).rejects.toThrow(
       `claydo: unknown kind 'match' on instance '${raw.id.toString()}'. Registered kinds: lobby, game.`,
     );
   });
 
-  it("PROBE: registering a kind name with a colon throws at union() time", () => {
+  it("registering a kind name with a colon throws at union() time", () => {
     expect(() =>
       union({ "bad:kind": Game }),
     ).toThrowErrorMatchingInlineSnapshot(
@@ -261,26 +234,24 @@ describe("dx probes", () => {
     );
   });
 
-  it("PROBE: two union() classes coexist in one worker", async () => {
+  it("two union() classes coexist in one worker", async () => {
     const metrics = kind(env.METRICS_DO, "metrics").get("global");
     expect(await metrics.bump("games")).toBe(1);
     expect(await metrics.bump("games")).toBe(2);
-    // The other namespace's kinds are not reachable here: 'game' is not in
-    // MetricsDO's registry (TypeScript rejects it; runtime check below).
     const confused = kind(env.METRICS_DO as any, "game").get("x");
     await expect((confused as any).state()).rejects.toThrow(
       "claydo: unknown kind 'game' on instance 'game:x'. Registered kinds: metrics.",
     );
   });
 
-  it("PROBE: calling a plain property through the stub explains itself", async () => {
+  it("calling a plain property through the stub explains itself", async () => {
     const metrics = kind(env.METRICS_DO, "metrics").get("props");
     await expect((metrics as any).version()).rejects.toThrow(
       "claydo: 'version' on kind 'metrics' is a property, not a method (type: number). The stub only proxies methods; add a getter method to read it.",
     );
   });
 
-  it("PROBE: union() now rejects kind classes with reserved method names at class-creation time", () => {
+  it("union() rejects kind classes with reserved method names at class-creation time", () => {
     class BadKind {
       constructor(_ctx: DurableObjectState, _env: unknown) {}
       name(): string {
@@ -294,7 +265,7 @@ describe("dx probes", () => {
     );
   });
 
-  it("PROBE: the kinds() accessor works end to end", async () => {
+  it("the kinds() accessor works end to end", async () => {
     const app = kinds(env.APP_DO);
     const id = await app.lobby.get("main").createMatch(["erin", "frank"]);
     const state = await app.game.fromId(id).state();
@@ -302,7 +273,7 @@ describe("dx probes", () => {
     expect(state.status).toBe("active");
   });
 
-  it("PROBE: typo'd method name via `as any`", async () => {
+  it("typo'd method name via `as any`", async () => {
     const id = await lobby().createMatch(["alice", "bob"]);
     const game = games().fromId(id);
     await expect((game as any).moev("alice", 0)).rejects.toThrow(
@@ -310,11 +281,10 @@ describe("dx probes", () => {
     );
   });
 
-  it("PROBE: raw access to an uninitialized unique instance", async () => {
+  it("raw access to an uninitialized unique instance", async () => {
     const raw = env.APP_DO.get(env.APP_DO.newUniqueId());
     const response = await raw.fetch("https://do/");
     expect(response.status).toBe(400);
-    // Post-fix: names the instance and the unique-id initialization path.
     expect(await response.text()).toBe(
       `claydo: instance '${raw.id.toString()}' has no kind yet. ` +
         `Unique-ID instances initialize on their first call through kind(ns, '<kind>').unique().`,

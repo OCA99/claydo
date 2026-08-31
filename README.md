@@ -62,9 +62,6 @@ supervisor's alarm. Kind code does not need a separate scheduler API.
 npm install claydo
 ```
 
-Version 0.2 is a greenfield facet architecture. It does not adopt data in
-place from the experimental pre-facet 0.1 design; see `CHANGELOG.md`.
-
 Use a current Workers compatibility date. Facets and `ctx.exports` must be
 available in the runtime; the examples use `2026-08-01`.
 
@@ -558,7 +555,7 @@ entry points.
 - `migrate-app`, `migrate-fleet`, `migrate-gnarly`, and `migrate-lazy`.
 
 Every kind example imports `DurableObject` from claydo and runs in facets.
-Every folder includes Workers-runtime tests and a DX report.
+Every folder includes Workers-runtime tests.
 
 ## Current platform notes
 

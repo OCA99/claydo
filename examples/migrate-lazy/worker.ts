@@ -111,7 +111,7 @@ export class Bucket extends DurableObject<Env> {
     return Math.floor(this.#refilled().tokens);
   }
 
-  /** Raw deleteAll, used by a probe to attempt "wipe the new instance". */
+  /** Raw deleteAll, used by tests to attempt "wipe the new instance". */
   async nuke(): Promise<void> {
     await this.ctx.storage.deleteAll();
   }

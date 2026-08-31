@@ -107,16 +107,12 @@ export class Session extends DurableObject<Env> {
   }
 }
 
-/** A custom class that structured clone does not know. Used by DX probes. */
+/** A custom class that structured clone does not know. Used by serialization tests. */
 export class Widget {
   constructor(public label: string) {}
 }
 
-/**
- * DX-probe kind. Not part of the "product"; it exists so the test suite can
- * poke at RPC serialization, non-method properties, and reserved-name
- * shadowing. Adding it required no wrangler change — nice.
- */
+/** Test-only kind for RPC and serialization edge cases. */
 export class Probe extends DurableObject<Env> {
   /** A public non-method field, to see how the stub treats it. */
   version = 7;
@@ -145,10 +141,6 @@ export class Probe extends DurableObject<Env> {
   echoLength(payload: string): number {
     return payload.length;
   }
-
-  // NOTE: this class used to define a method named `name()` to probe stub
-  // metadata shadowing. The library now rejects that at union() time — see
-  // the "union() rejects reserved method names" probe test.
 }
 
 export class LiveTableDO extends union({

@@ -1,15 +1,3 @@
-/**
- * The GameCo consolidation journey, end to end:
- *
- *  1. Seed both legacy bindings with realistic data.
- *  2. Migrate a room mid-WebSocket-session and observe the client's fate.
- *  3. Migrate every registry match (newUniqueId -> `migrated:<oldId>`).
- *  4. Alarm continuity for a pending turn timeout.
- *  5. Cutover rehearsal: plain accessors everywhere, facade retired.
- *
- * Storage is isolated per test FILE; the tests in this file share state and
- * run in order (each step builds on the previous one).
- */
 import {
   env,
   SELF,
@@ -32,15 +20,11 @@ function oldMatch(id: string) {
   return env.OLD_MATCHES.get(env.OLD_MATCHES.idFromString(id));
 }
 
-// ---------------------------------------------------------------------------
-// WebSocket probe helper (patterns copied from the repo's chat example).
-// ---------------------------------------------------------------------------
-
 interface SocketProbe {
   ws: WebSocket;
-  /** Next JSON message, FIFO. Rejects after a timeout. */
+
   next(timeoutMs?: number): Promise<Record<string, unknown>>;
-  /** Messages received but not yet consumed by next(). */
+
   buffered(): number;
   closes: { code: number; reason: string; wasClean: boolean }[];
   errors: string[];
@@ -98,7 +82,6 @@ function attach(response: Response): SocketProbe {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-/** Asserts a rejection without leaving an unhandled-rejection report. */
 async function expectRejects(
   run: () => Promise<unknown>,
   pattern: RegExp,
@@ -112,8 +95,10 @@ async function expectRejects(
   expect.unreachable(`expected rejection matching ${pattern}`);
 }
 
-/** Polls until the probe has a close event, or times out. */
-async function waitForClose(probe: SocketProbe, timeoutMs = 2_000): Promise<void> {
+async function waitForClose(
+  probe: SocketProbe,
+  timeoutMs = 2_000,
+): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (probe.closes.length === 0 && Date.now() < deadline) {
     await sleep(50);
@@ -126,22 +111,17 @@ async function wsViaWorker(path: string): Promise<Response> {
   });
 }
 
-// Shared journey state (tests in this file run sequentially).
 const ROOM = "lobby";
 const matches: { oldId: string; players: string[] }[] = [];
 let timeoutMatchId = "";
 let timeoutDeadline = 0;
 
 describe("GameCo consolidation journey", () => {
-  // -------------------------------------------------------------------------
-  // 1. Seeding
-  // -------------------------------------------------------------------------
 
   it("1a. seeds the legacy room binding with history over RPC and WebSocket", async () => {
     const old = oldRoom(ROOM);
     expect(await old.post("system", "welcome to the lobby")).toBe(1);
 
-    // A real client session against the OLD binding directly (pre-claydo).
     const alice = attach(
       await old.fetch(`https://old.gameco/rooms/${ROOM}?_pk=alice`, {
         headers: { Upgrade: "websocket" },
@@ -175,8 +155,6 @@ describe("GameCo consolidation journey", () => {
       matches.push({ oldId, players });
     }
 
-    // Play a move on each match through the /matches route (registry lookup
-    // routes to the OLD binding, nothing is migrated yet).
     for (const match of matches) {
       const move = await SELF.fetch(
         `https://gameco.example/matches/${match.oldId}/move`,
@@ -210,10 +188,6 @@ describe("GameCo consolidation journey", () => {
     expect(timeoutDeadline).toBeGreaterThan(Date.now());
   });
 
-  // -------------------------------------------------------------------------
-  // 2. The live WebSocket disconnection story
-  // -------------------------------------------------------------------------
-
   let liveSocket: SocketProbe;
 
   it("2a. a live session connects through the facade and lands on the old room", async () => {
@@ -224,11 +198,10 @@ describe("GameCo consolidation journey", () => {
       sender: "alice",
       body: "anyone up for a match?",
     });
-    // Keep the socket open across the migration in the next test.
     liveSocket = alice;
   });
 
-  it("2b. migrating the room mid-session: sealing closes the socket with 1012 (post-fix)", async () => {
+  it("2b. migrating the room mid-session: sealing closes the socket with 1012", async () => {
     const summary = await migrateInstance({
       from: oldRoom(ROOM),
       to: app().room,
@@ -237,8 +210,6 @@ describe("GameCo consolidation journey", () => {
     expect(summary.skipped).toBe(false);
     expect(summary.rows["messages"]).toBe(3);
 
-    // POST-FIX: the seal closes hibernatable WebSockets, so the client gets
-    // a real close event it can react to (previously: silently dead).
     await waitForClose(liveSocket);
     expect(liveSocket.closes).toEqual([
       {
@@ -250,19 +221,12 @@ describe("GameCo consolidation journey", () => {
     expect(liveSocket.ws.readyState).toBe(WebSocket.READY_STATE_CLOSED);
     expect(liveSocket.buffered()).toBe(0);
 
-    // History arrived complete on the new side.
     expect((await app().room.get(ROOM).history()).length).toBe(3);
   });
 
   it("2c. reconnecting through the facade immediately after migration succeeds (410 retried internally)", async () => {
-    // The worker's facade cached the "old" route for this room (ttl 60 s).
-    // POST-FIX: the facade's fetch() path sees the old instance's marked
-    // 410 (x-claydo-sealed) and retries the upgrade on the new side, so the
-    // reconnect lands a 101 with no client-visible error and no TTL wait.
     const alice = attach(await wsViaWorker(`/rooms/${ROOM}/ws?_pk=alice`));
     alice.ws.send("back online");
-    // Note the client-visible change that remains: the broadcast payload's
-    // room field is now the prefixed host name.
     expect(await alice.next()).toEqual({
       room: "room:lobby",
       sender: "alice",
@@ -287,9 +251,6 @@ describe("GameCo consolidation journey", () => {
       "back online",
     ]);
 
-    // A direct hit on the sealed old instance (a client with a stale URL):
-    // POST-FIX the body is generic — no internal DO id — and the response
-    // carries the x-claydo-sealed marker routers retry on.
     const gone = await oldRoom(ROOM).fetch("https://old.gameco/rooms/lobby");
     expect(gone.status).toBe(410);
     expect(gone.headers.get("x-claydo-sealed")).toBe("1");
@@ -300,10 +261,6 @@ describe("GameCo consolidation journey", () => {
     expect(text).not.toMatch(/Durable Object id/);
   });
 
-  // -------------------------------------------------------------------------
-  // 3. The partyserver `this.name` data-compat probe
-  // -------------------------------------------------------------------------
-
   it("3a. history rows written before and after migration disagree on the room name", async () => {
     const rows = await app().room.get(ROOM).history();
     expect(rows.map((m) => m.room)).toEqual([
@@ -312,27 +269,18 @@ describe("GameCo consolidation journey", () => {
       "lobby",
       "room:lobby",
     ]);
-    // The natural `WHERE room = this.name` query silently loses the entire
-    // pre-migration history:
     const filtered = await app().room.get(ROOM).historyForThisRoom();
     expect(filtered.length).toBe(1);
     expect(filtered[0]!.body).toBe("back online");
   });
 
-  it("3b. identity probes: this.name changed, instanceName() gives the logical name, __ps_name was overwritten", async () => {
+  it("3b. identity: this.name changed, instanceName() gives the logical name, __ps_name was overwritten", async () => {
     const label = await app().room.get(ROOM).label();
     expect(label.doName).toBe("room:lobby");
     expect(label.logical).toBe("lobby");
 
-    // partyserver persisted __ps_name: "lobby" on the OLD instance; the
-    // migration copied it, and partyserver's init overwrote it with the
-    // prefixed name on first contact.
     expect(await app().room.get(ROOM).storedPartyName()).toBe("room:lobby");
   });
-
-  // -------------------------------------------------------------------------
-  // 4. Unique-id matches migrate to migrated:<oldId> names
-  // -------------------------------------------------------------------------
 
   it("4a. migrates every registry match through the admin driver", async () => {
     for (const match of matches) {
@@ -350,8 +298,6 @@ describe("GameCo consolidation journey", () => {
       expect(summary.rows["moves"]).toBe(1);
     }
 
-    // Idempotency: the driver re-run is a no-op, and (post-fix) the skip
-    // carries an explicit reason backed by the move marker on the old side.
     const again = await SELF.fetch(
       `https://gameco.example/admin/migrate-match/${matches[0]!.oldId}`,
       { method: "POST" },
@@ -368,14 +314,12 @@ describe("GameCo consolidation journey", () => {
 
   it("4b. old id -> new name lookups work through the worker and directly", async () => {
     for (const match of matches) {
-      // Through the worker's registry route:
       const viaWorker = await SELF.fetch(
         `https://gameco.example/matches/${match.oldId}/state`,
       );
       const state = await viaWorker.json<MatchState>();
       expect(state.players).toEqual(match.players);
       expect(state.moves).toBe(1);
-      // Directly through the plain accessor with the documented name:
       const direct = await app()
         .match.get(migratedName(match.oldId))
         .state();
@@ -384,8 +328,6 @@ describe("GameCo consolidation journey", () => {
   });
 
   it("4c. the old unique-id string is useless against the new namespace", async () => {
-    // The 'obvious' shortcut — fromId(oldId) on the new accessor — cannot
-    // work: DO ids embed their namespace. Capture the actual failure.
     expect(() => app().match.fromId(matches[0]!.oldId)).toThrowError(
       /Durable Object ID is not valid for this namespace/,
     );
@@ -394,17 +336,10 @@ describe("GameCo consolidation journey", () => {
   it("4d. the old sealed match rejects RPC; fetch() answers 410 even without a fetch() on the class", async () => {
     const old = oldMatch(matches[0]!.oldId);
     await expectRejects(() => old.state(), /is sealed/);
-    // POST-FIX: exportable() answers the sealed 410 itself, so classes that
-    // never defined fetch() still tell HTTP clients where they stand.
-    // (Previously this was a bare runtime type error.)
     const gone = await old.fetch("https://old.gameco/");
     expect(gone.status).toBe(410);
     expect(gone.headers.get("x-claydo-sealed")).toBe("1");
   });
-
-  // -------------------------------------------------------------------------
-  // 5. Alarm continuity
-  // -------------------------------------------------------------------------
 
   it("5a. the pending turn-timeout alarm fires on the migrated instance", async () => {
     const raw = env.APP_DO.get(
@@ -419,22 +354,14 @@ describe("GameCo consolidation journey", () => {
     expect(state.turnDeadline).toBe(timeoutDeadline);
   });
 
-  it("5b. the OLD instance's alarm was deleted when the move was recorded (post-fix)", async () => {
+  it("5b. the OLD instance's alarm was deleted when the move was recorded", async () => {
     const old = oldMatch(timeoutMatchId);
-    // POST-FIX: recording the move marker deletes the old alarm, so the
-    // sealed husk never wakes again (previously: armed forever, no-op fires).
     expect(await runDurableObjectAlarm(old)).toBe(false);
-    // `instance.ctx` is the seal-guarded state; the harness-provided state
-    // is the real one, which tests may use for introspection.
     const oldFired = await runInDurableObject(old, async (_instance, state) =>
       state.storage.get<number>("timeout-fired-at"),
     );
     expect(oldFired).toBeUndefined();
   });
-
-  // -------------------------------------------------------------------------
-  // 6. Cutover rehearsal
-  // -------------------------------------------------------------------------
 
   it("6a. a second room migrates through the worker's admin driver (bulk pattern)", async () => {
     await oldRoom("arcade").post("system", "insert coin");
@@ -448,7 +375,6 @@ describe("GameCo consolidation journey", () => {
   });
 
   it("6b. the post-cutover code path (plain accessors, no facade) serves everything", async () => {
-    // Rooms: history and a live WebSocket session, via the plain accessor.
     const history = await SELF.fetch(
       `https://gameco.example/rooms/${ROOM}/history?phase=cutover`,
     );
@@ -469,7 +395,6 @@ describe("GameCo consolidation journey", () => {
       "insert coin",
     ]);
 
-    // Matches already run on plain accessors after markMigrated.
     for (const match of matches) {
       const state = await app().match.get(migratedName(match.oldId)).state();
       expect(state.players).toEqual(match.players);

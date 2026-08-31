@@ -1169,8 +1169,8 @@ export function instanceName(ctx: DurableObjectState): string | undefined {
 }
 
 /**
- * Clears all kind storage. The kind pin lives in the isolated supervisor,
- * so unlike the pre-facet architecture, a normal `deleteAll()` is safe.
+ * Clears facet-local kind storage. The isolated supervisor keeps kind
+ * identity intact.
  */
 export async function resetStorage(ctx: DurableObjectState): Promise<void> {
   await ctx.storage.deleteAll();

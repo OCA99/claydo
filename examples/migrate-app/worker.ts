@@ -79,7 +79,7 @@ export class RoomServer extends Server<Env> {
     // `this.name` is the DO instance name. On the old binding it is the
     // plain room name ("lobby"); under the claydo host it carries the kind
     // prefix ("room:lobby"). Persisting it in rows is exactly what a real
-    // team does — and it is the data-compat probe for this audit.
+    // team does — and it is the data-compatibility case.
     this.ctx.storage.sql.exec(
       `INSERT INTO messages (room, sender, body, at) VALUES (?, ?, ?, ?)`,
       this.name,
@@ -114,11 +114,7 @@ export class RoomServer extends Server<Env> {
       .toArray();
   }
 
-  /**
-   * The "obvious" query a team would write: filter rows by `this.name`.
-   * After migration `this.name` changes from "lobby" to "room:lobby", so
-   * this silently stops seeing pre-migration rows. Audit probe.
-   */
+
   historyForThisRoom(): RoomMessage[] {
     return this.ctx.storage.sql
       .exec<RoomMessage>(
@@ -128,7 +124,7 @@ export class RoomServer extends Server<Env> {
       .toArray();
   }
 
-  /** Identity probe: what does this instance think it is called? */
+  /** Returns the Durable Object and logical names. */
   label(): { doName: string; logical: string | null } {
     return { doName: this.name, logical: instanceName(this.ctx) ?? null };
   }
@@ -137,12 +133,7 @@ export class RoomServer extends Server<Env> {
     return this.ctx.storage.get<string>("__ps_name");
   }
 
-  /**
-   * Uses partyserver's synchronous `getConnections()` helper. Works as a
-   * kind. Under `exportable()` the seal guard turns every prototype method
-   * async, so `this.getConnections()` returns a Promise and the `for..of`
-   * throws — an audit probe for the wrapper's collateral damage.
-   */
+
   connectionCount(): number {
     let count = 0;
     for (const _ of this.getConnections()) count += 1;
@@ -151,7 +142,6 @@ export class RoomServer extends Server<Env> {
 }
 
 // ---------------------------------------------------------------------------
-// Kind: matches (plain DO, historically addressed by newUniqueId()).
 // ---------------------------------------------------------------------------
 
 export interface MatchState {
@@ -218,17 +208,14 @@ export class MatchImpl extends DurableObject<Env> {
     };
   }
 
-  /** Audit helper for a deliberately wrong-shape migration. */
+  /** Reads message rows for the wrong-shape migration test. */
   messageRows(): number {
     return this.ctx.storage.sql
       .exec<{ n: number }>(`SELECT count(*) AS n FROM messages`)
       .one().n;
   }
 
-  /**
-   * Audit probe: a table whose INTEGER PRIMARY KEY (the rowid alias) is not
-   * the first declared column. Only created on instances that call this.
-   */
+
   async logTurn(at: number, note: string): Promise<void> {
     this.ctx.storage.sql.exec(
       `CREATE TABLE IF NOT EXISTS turn_log (

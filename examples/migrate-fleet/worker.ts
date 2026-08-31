@@ -28,12 +28,7 @@ export type SessionEvent = {
   at: number;
 };
 
-/**
- * The "finished" session class: SQLite (an AUTOINCREMENT `events` table and
- * a plain `tags` table), KV preferences under `pref:` keys, and an alarm.
- * This is the class that used to run as its own binding; after migration it
- * serves as the kind implementation, unchanged.
- */
+/** Session implementation shared by the source binding and target kind. */
 export class SessionImpl extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -130,7 +125,7 @@ export class SessionImpl extends DurableObject<Env> {
   }
 }
 
-/** A second kind that is registered but NOT importable, for gating probes. */
+/** A registered kind that is not importable. */
 export class AuditLog extends DurableObject<Env> {
   async append(line: string): Promise<void> {
     const lines = (await this.ctx.storage.get<string[]>("lines")) ?? [];

@@ -4,12 +4,11 @@ import { kind } from "../../../src/index";
 
 export interface ChatClient {
   ws: WebSocket;
-  /** Resolves with the next JSON message, FIFO. Rejects after a timeout. */
+
   next(): Promise<Record<string, unknown>>;
   close(): void;
 }
 
-/** Connects a chat client. `user` becomes the PartyServer connection id. */
 export async function connect(room: string, user: string): Promise<ChatClient> {
   const response = await kind(env.APP_DO, "chat")
     .get(room)
