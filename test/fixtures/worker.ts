@@ -118,9 +118,19 @@ export class Reminder extends DurableObject<Env> {
     await this.ctx.storage.deleteAll();
   }
 
+  async alarmTime(): Promise<number | null> {
+    return this.ctx.storage.getAlarm();
+  }
+
   async alarmInsideTransaction(): Promise<void> {
     await this.ctx.storage.transaction(async (txn) => {
       await txn.setAlarm(Date.now() + 60_000);
+    });
+  }
+
+  alarmInsideSyncTransaction(): void {
+    this.ctx.storage.transactionSync(() => {
+      void this.ctx.storage.setAlarm(Date.now() + 60_000);
     });
   }
 }

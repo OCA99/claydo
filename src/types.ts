@@ -127,31 +127,46 @@ export function facetContext(
     );
   }
   const host = exported.get(ctx.id);
+  let syncTransactionDepth = 0;
+  const assertAlarmOutsideSyncTransaction = (): void => {
+    if (syncTransactionDepth > 0) {
+      throw new Error(
+        "claydo: alarm operations inside storage.transactionSync() cannot " +
+          "be atomic across facet and supervisor storage. Commit the " +
+          "transaction, then call the alarm method.",
+      );
+    }
+  };
   const storage = new Proxy(ctx.storage, {
     get(target, property) {
       if (property === "setAlarm") {
-        return async (
+        return (
           scheduledTime: number | Date,
           options?: DurableObjectSetAlarmOptions,
         ): Promise<void> => {
+          assertAlarmOutsideSyncTransaction();
           const timestamp =
             scheduledTime instanceof Date
               ? scheduledTime.getTime()
               : scheduledTime;
-          await host.__claydoSetAlarm(props.kind, timestamp, options);
+          return host.__claydoSetAlarm(props.kind, timestamp, options);
         };
       }
       if (property === "getAlarm") {
         return (
           options?: DurableObjectGetAlarmOptions,
-        ): Promise<number | null> =>
-          host.__claydoGetAlarm(props.kind, options);
+        ): Promise<number | null> => {
+          assertAlarmOutsideSyncTransaction();
+          return host.__claydoGetAlarm(props.kind, options);
+        };
       }
       if (property === "deleteAlarm") {
         return (
           options?: DurableObjectSetAlarmOptions,
-        ): Promise<void> =>
-          host.__claydoDeleteAlarm(props.kind, options);
+        ): Promise<void> => {
+          assertAlarmOutsideSyncTransaction();
+          return host.__claydoDeleteAlarm(props.kind, options);
+        };
       }
       if (property === "transaction") {
         return <T>(
@@ -187,10 +202,20 @@ export function facetContext(
             ),
           );
       }
+      if (property === "transactionSync") {
+        return <T>(closure: () => T): T =>
+          target.transactionSync(() => {
+            syncTransactionDepth += 1;
+            try {
+              return closure();
+            } finally {
+              syncTransactionDepth -= 1;
+            }
+          });
+      }
       if (property === "deleteAll") {
         return async (): Promise<void> => {
           await deleteAllFacetStorage(target);
-          await host.__claydoDeleteAlarm(props.kind);
         };
       }
       const value = Reflect.get(target, property, target);

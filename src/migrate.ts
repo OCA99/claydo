@@ -754,11 +754,11 @@ export function exportable<I extends object>(
       const floor = BigInt(-Number.MAX_SAFE_INTEGER);
       const ceiling = BigInt(Number.MAX_SAFE_INTEGER);
       if (
-        BigInt(range.minRowid) < floor ||
+        BigInt(range.minRowid) <= floor ||
         BigInt(range.maxRowid) > ceiling
       ) {
         return (
-          `table '${table}' has rowids outside JavaScript's safe integer ` +
+          `table '${table}' has rowids outside the exportable safe integer ` +
           `range (${range.minRowid}..${range.maxRowid}). Re-key those rows ` +
           `before migrating; unsafe 64-bit rowids cannot be copied exactly.`
         );

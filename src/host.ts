@@ -79,7 +79,7 @@ interface FacetRuntimeStub {
   ): Promise<ClaydoCallResult>;
   __claydoAlarm(alarmInfo?: AlarmInfoWire): Promise<void>;
   __claydoApplyImport(chunk: ExportChunk, seq: number): Promise<boolean>;
-  __claydoPrepareImportClone(): Promise<void>;
+  __claydoRemoveImportCheckpoint(): Promise<void>;
   fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response>;
 }
 
@@ -89,6 +89,15 @@ type AlarmInfoWire = Pick<
 >;
 
 const IMPORT_FACET_PREFIX = "import:";
+const IMPORT_RECEIPT_KEY = "__claydo:import-receipt";
+
+interface ImportReceipt {
+  kind: string;
+  token: string;
+  seq: number;
+  applied: { kv: number; rows: Record<string, number> };
+  cleanupPending: boolean;
+}
 
 function importFacetName(kind: string): string {
   return `${IMPORT_FACET_PREFIX}${kind}`;
@@ -196,7 +205,7 @@ export function union<R extends KindRegistry>(
     #implLoading?: Promise<object & KindHandlers>;
     readonly #methodCache = new Map<
       string,
-      ((...args: unknown[]) => unknown) | null
+      (...args: unknown[]) => unknown
     >();
     readonly #facetClasses = new Map<string, DurableObjectClass>();
     #importTail: Promise<void> = Promise.resolve();
@@ -237,7 +246,7 @@ export function union<R extends KindRegistry>(
       return exported;
     }
 
-    #namedFacet(kind: string, name: string): FacetRuntimeStub {
+    #facets(): DurableObjectFacets {
       const facets = (
         this.ctx as DurableObjectState & {
           facets?: DurableObjectFacets;
@@ -250,6 +259,11 @@ export function union<R extends KindRegistry>(
             "2026-08-01) and current Workers runtime.",
         );
       }
+      return facets;
+    }
+
+    #namedFacet(kind: string, name: string): FacetRuntimeStub {
+      const facets = this.#facets();
       let configured = this.#facetClasses.get(name);
       if (configured === undefined) {
         const hostClass = this.#hostClass();
@@ -401,6 +415,10 @@ export function union<R extends KindRegistry>(
             `${Object.keys(kinds).join(", ")}.`,
         );
       }
+      // A crash after supervisor publication can leave the staging
+      // checkpoint in the cloned live facet. Remove it before user code can
+      // observe storage.
+      this.ctx.storage.kv.delete(IMPORT_CHECKPOINT_KEY);
       const impl = new Kind(this.ctx, this.env) as object & KindHandlers;
       // Recommended claydo kinds already receive this context from their
       // base class. Reinstalling it also makes normal DurableObject and
@@ -448,10 +466,10 @@ export function union<R extends KindRegistry>(
         }
         let fn = this.#methodCache.get(method);
         if (fn === undefined) {
-          fn = prototypeMethod(impl, method) ?? null;
-          this.#methodCache.set(method, fn);
+          fn = prototypeMethod(impl, method);
+          if (fn !== undefined) this.#methodCache.set(method, fn);
         }
-        if (fn === null) {
+        if (fn === undefined) {
           const value = (impl as Record<string, unknown>)[method];
           if (method in impl && typeof value !== "function") {
             throw new Error(
@@ -598,14 +616,23 @@ export function union<R extends KindRegistry>(
       const persisted = await this.ctx.storage.get<unknown>([
         KIND_STORAGE_KEY,
         IMPORT_STATE_KEY,
+        IMPORT_RECEIPT_KEY,
       ]);
       const state = persisted.get(IMPORT_STATE_KEY) as ImportState | undefined;
       const kind =
         (persisted.get(KIND_STORAGE_KEY) as string | undefined) ?? this.#kind;
-      if (kind !== undefined && state === undefined) {
-        // Finalization may have committed before an interruption prevented
-        // best-effort staging cleanup.
-        this.ctx.facets.delete(importFacetName(kind));
+      const receipt = persisted.get(IMPORT_RECEIPT_KEY) as
+        | ImportReceipt
+        | undefined;
+      if (
+        kind !== undefined &&
+        state === undefined &&
+        receipt?.cleanupPending === true
+      ) {
+        await this.#facet(kind).__claydoRemoveImportCheckpoint();
+        this.#facets().delete(importFacetName(kind));
+        receipt.cleanupPending = false;
+        await this.ctx.storage.put(IMPORT_RECEIPT_KEY, receipt);
       }
       return {
         kind,
@@ -671,8 +698,8 @@ export function union<R extends KindRegistry>(
       // A previous failed import may have left an unreferenced facet after a
       // runtime interruption. Facet deletion is isolated and cannot touch
       // supervisor metadata or another kind.
-      this.ctx.facets.delete(kindFacetName(kind));
-      this.ctx.facets.delete(importFacetName(kind));
+      this.#facets().delete(kindFacetName(kind));
+      this.#facets().delete(importFacetName(kind));
       const fresh: ImportState = {
         kind,
         seq: 0,
@@ -716,20 +743,26 @@ export function union<R extends KindRegistry>(
       this.#checkImportEnabled(kind);
       const state = await this.ctx.storage.get<ImportState>(IMPORT_STATE_KEY);
       if (state === undefined) {
-        const pinned = await this.ctx.storage.get<string>(KIND_STORAGE_KEY);
+        const persisted = await this.ctx.storage.get<unknown>([
+          KIND_STORAGE_KEY,
+          IMPORT_RECEIPT_KEY,
+        ]);
+        const pinned = persisted.get(KIND_STORAGE_KEY) as string | undefined;
+        const receipt = persisted.get(IMPORT_RECEIPT_KEY) as
+          | ImportReceipt
+          | undefined;
         if (
           pinned === kind &&
           chunk.cursor === null &&
-          chunk.totals !== undefined
+          receipt?.kind === kind &&
+          receipt.token === token &&
+          receipt.seq === seq
         ) {
           return {
             seq,
             alreadyApplied: true,
             done: true,
-            applied: {
-              kv: chunk.totals.kv,
-              rows: { ...chunk.totals.rows },
-            },
+            applied: receipt.applied,
           };
         }
         throw new Error(
@@ -784,11 +817,12 @@ export function union<R extends KindRegistry>(
           state.applied.rows[table] ??= 0;
         }
       }
-      await this.#importFacet(kind).__claydoPrepareImportClone();
       // Traffic is blocked by IMPORT_STATE_KEY, so replacing a clone left by
-      // an interrupted finalization is safe and makes this step idempotent.
-      this.ctx.facets.delete(kindFacetName(kind));
-      this.ctx.facets.clone(importFacetName(kind), kindFacetName(kind));
+      // an interrupted finalization is safe. The staging checkpoint remains
+      // present until supervisor publication commits, so a replay cannot
+      // re-run final DDL.
+      this.#facets().delete(kindFacetName(kind));
+      this.#facets().clone(importFacetName(kind), kindFacetName(kind));
       // Kind visibility, import-state removal, and alarm transfer commit
       // atomically in supervisor storage after the facet verifies its final
       // chunk. A crash cannot expose a live kind without its alarm or leave
@@ -796,6 +830,13 @@ export function union<R extends KindRegistry>(
       await this.ctx.storage.transaction(async (txn) => {
         await txn.put(KIND_STORAGE_KEY, kind);
         await txn.delete(IMPORT_STATE_KEY);
+        await txn.put(IMPORT_RECEIPT_KEY, {
+          kind,
+          token,
+          seq,
+          applied: state.applied,
+          cleanupPending: true,
+        } satisfies ImportReceipt);
         if (typeof chunk.alarm === "number") {
           await txn.setAlarm(Math.max(chunk.alarm, Date.now() + 1000));
         } else {
@@ -803,7 +844,15 @@ export function union<R extends KindRegistry>(
         }
       });
       this.#kind = kind;
-      this.ctx.facets.delete(importFacetName(kind));
+      await this.#facet(kind).__claydoRemoveImportCheckpoint();
+      this.#facets().delete(importFacetName(kind));
+      await this.ctx.storage.put(IMPORT_RECEIPT_KEY, {
+        kind,
+        token,
+        seq,
+        applied: state.applied,
+        cleanupPending: false,
+      } satisfies ImportReceipt);
       return {
         seq,
         alreadyApplied: !facetApplied,
@@ -825,8 +874,8 @@ export function union<R extends KindRegistry>(
             `Use wipeTarget() to force.`,
         );
       }
-      this.ctx.facets.delete(kindFacetName(state.kind));
-      this.ctx.facets.delete(importFacetName(state.kind));
+      this.#facets().delete(kindFacetName(state.kind));
+      this.#facets().delete(importFacetName(state.kind));
       await this.ctx.storage.delete(IMPORT_STATE_KEY);
       await this.ctx.storage.deleteAlarm();
       return true;
@@ -863,8 +912,8 @@ export function union<R extends KindRegistry>(
           (value): value is string => value !== undefined,
         ),
       )) {
-        this.ctx.facets.delete(kindFacetName(kind));
-        this.ctx.facets.delete(importFacetName(kind));
+        this.#facets().delete(kindFacetName(kind));
+        this.#facets().delete(importFacetName(kind));
       }
       await this.ctx.storage.deleteAll();
       await this.ctx.storage.deleteAlarm();
@@ -972,9 +1021,9 @@ export function union<R extends KindRegistry>(
       }
     }
 
-    async __claydoPrepareImportClone(): Promise<void> {
+    async __claydoRemoveImportCheckpoint(): Promise<void> {
       if (this.#facetProps === undefined) {
-        throw new Error("claydo: import staging is only available in a facet.");
+        throw new Error("claydo: import cleanup is only available in a facet.");
       }
       this.ctx.storage.kv.delete(IMPORT_CHECKPOINT_KEY);
     }

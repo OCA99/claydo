@@ -259,6 +259,7 @@ describe("migrateInstance", () => {
     await raw.__claydoBeginImport("tally", token);
     let cursor: ExportChunk["cursor"] = null;
     let seq = 0;
+    let finalChunk: ExportChunk | undefined;
     for (;;) {
       const chunk = (await old.__claydoExport(
         undefined,
@@ -267,6 +268,7 @@ describe("migrateInstance", () => {
       )) as ExportChunk;
       seq += 1;
       if (chunk.cursor === null) {
+        finalChunk = chunk;
         const [first, duplicate] = await Promise.all([
           raw.__claydoImport("tally", chunk, seq, token),
           raw.__claydoImport("tally", chunk, seq, token),
@@ -283,11 +285,20 @@ describe("migrateInstance", () => {
       cursor = chunk.cursor;
     }
     expect(await tally().get("m4-final-race").total()).toBe(5);
-    await old.__claydoSeal(
-      undefined,
-      "tally:m4-final-race",
-      "tally:m4-final-race",
+    await raw.__claydoReset("tally:m4-final-race");
+    await tally().get("m4-final-race").bump("racing-traffic", 1);
+    await expectRejects(
+      () =>
+        raw.__claydoImport(
+          "tally",
+          finalChunk!,
+          seq,
+          token,
+        ),
+      /no import is reserved/,
     );
+    expect(await tally().get("m4-final-race").total()).toBe(1);
+    await old.__claydoUnseal();
   });
 
   it("blocks traffic on the target while an import is in progress", async () => {
@@ -764,6 +775,23 @@ describe("data fidelity extensions", () => {
     const preview = await previewInstance({ from: old });
     expect(preview.blockers.join(" ")).toMatch(
       /table 'alias_huge'.*safe integer range/,
+    );
+    expect((await old.__claydoSealed()).sealed).toBe(false);
+  });
+
+  it("rejects the exclusive lower pagination boundary", async () => {
+    const old = legacy("g8");
+    await old.bump("x");
+    await runInDurableObject(old, async (_instance, state) => {
+      state.storage.sql.exec(`CREATE TABLE floor_rowid (value TEXT)`);
+      state.storage.sql.exec(
+        `INSERT INTO floor_rowid(rowid, value)
+         VALUES (-9007199254740991, 'at floor')`,
+      );
+    });
+    const preview = await previewInstance({ from: old });
+    expect(preview.blockers.join(" ")).toMatch(
+      /table 'floor_rowid'.*exportable safe integer range/,
     );
     expect((await old.__claydoSealed()).sealed).toBe(false);
   });

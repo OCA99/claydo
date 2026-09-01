@@ -82,6 +82,7 @@ export class Counter extends DurableObject<Env> {
    */
   async nuke(): Promise<never> {
     await this.ctx.storage.deleteAll();
+    await this.ctx.storage.sync();
     this.ctx.abort("counter nuked");
     throw new Error("unreachable");
   }

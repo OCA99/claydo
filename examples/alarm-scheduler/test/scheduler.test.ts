@@ -173,10 +173,11 @@ describeHosted("edge cases (adversarial)", () => {
     const fresh = kind(env.APP_DO, "scheduler").get("wipe-named");
     expect(await fresh.list()).toEqual([]);
     expect(await fresh.fired()).toEqual([]);
-    expect(await fresh.alarmTime()).toBeNull();
+    expect(await fresh.alarmTime()).toBeTypeOf("number");
     expect(await runDurableObjectAlarm(rawSchedulerStub("wipe-named"))).toBe(
-      false,
+      true,
     );
+    expect(await fresh.alarmTime()).toBeNull();
     expect(await rawSchedulerStub("wipe-named").__claydoKind()).toBe("scheduler");
   });
 
@@ -190,7 +191,7 @@ describeHosted("edge cases (adversarial)", () => {
 
     const raw = env.APP_DO.get(env.APP_DO.idFromString(id));
     expect(await raw.__claydoKind()).toBe("scheduler");
-    expect(await runDurableObjectAlarm(raw)).toBe(false);
+    expect(await runDurableObjectAlarm(raw)).toBe(true);
 
     const again = kind(env.APP_DO, "scheduler").fromId(id);
     expect(await again.list()).toEqual([]);

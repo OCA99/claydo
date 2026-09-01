@@ -214,11 +214,11 @@ async clear(): Promise<void> {
 }
 ```
 
-Claydo atomically drops the facet's user tables and KV entries and clears the
-supervisor alarm. Like native `deleteAll()`, execution then continues in the
-same object: writes and alarms created after the awaited call are preserved.
-Kind identity remains in supervisor storage, including for unique-ID
-instances.
+Claydo atomically drops the facet's user tables and KV entries. Like native
+`deleteAll()`, the pending alarm is preserved and execution continues in the
+same object; writes and alarm changes after the awaited call are also
+preserved. Kind identity remains in supervisor storage, including for
+unique-ID instances.
 
 `resetStorage(this.ctx)` is an equivalent convenience helper.
 

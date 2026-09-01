@@ -345,22 +345,21 @@ describe("alarms", () => {
     });
   });
 
-  it("reset atomically removes the supervisor alarm", async () => {
+  it("deleteAll preserves the pending supervisor alarm", async () => {
     const reminder = kind(env.APP_DO, "reminder").get("alarm-reset");
     await reminder.remind("must not fire");
+    const scheduled = await reminder.alarmTime();
     await reminder.wipe();
-    expect(
-      await runDurableObjectAlarm(
-        env.APP_DO.get(env.APP_DO.idFromName("reminder:alarm-reset")),
-      ),
-    ).toBe(false);
-    expect(await reminder.fired()).toBeNull();
+    expect(await reminder.alarmTime()).toBe(scheduled);
   });
 
   it("rejects non-atomic alarm operations inside storage transactions", async () => {
     const reminder = kind(env.APP_DO, "reminder").get("alarm-transaction");
     await expect(reminder.alarmInsideTransaction()).rejects.toThrow(
       /alarm operations inside storage\.transaction\(\) cannot be atomic/,
+    );
+    await expect(reminder.alarmInsideSyncTransaction()).rejects.toThrow(
+      /alarm operations inside storage\.transactionSync\(\) cannot be atomic/,
     );
   });
 });
