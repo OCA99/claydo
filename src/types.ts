@@ -82,6 +82,37 @@ export function isFacetProps(props: unknown): props is FacetProps {
 }
 
 /**
+ * Internal: the header the typed stub sets on `fetch()` so the supervisor
+ * can verify the caller's expected kind before routing.
+ */
+export const KIND_HEADER = "x-claydo-kind";
+
+/**
+ * The one reserved key in a kind's key-value store. It holds the facet's
+ * identity, so the facet can select its role even when the runtime starts
+ * it without props (for example on a hibernation wake). `deleteAll()`
+ * preserves it.
+ */
+export const FACET_IDENTITY_KEY = "__claydo";
+
+/** Internal: the persisted facet identity record. */
+export interface FacetIdentity {
+  readonly v: 1;
+  readonly kind: string;
+  readonly host: string;
+}
+
+/** Internal: true when `value` is a persisted facet identity. */
+export function isFacetIdentity(value: unknown): value is FacetIdentity {
+  const candidate = value as Partial<FacetIdentity> | undefined;
+  return (
+    candidate?.v === 1 &&
+    typeof candidate.kind === "string" &&
+    typeof candidate.host === "string"
+  );
+}
+
+/**
  * Internal: the serializable subset of `AlarmInvocationInfo` that crosses
  * the supervisor-to-facet RPC hop when an alarm fires.
  */

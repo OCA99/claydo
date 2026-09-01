@@ -7,6 +7,8 @@ import {
   type UnionOptions,
 } from "./supervisor";
 import {
+  FACET_IDENTITY_KEY,
+  isFacetIdentity,
   isFacetProps,
   RESERVED_STUB_KEYS,
   type AlarmInfo,
@@ -45,8 +47,7 @@ export function union<R extends KindRegistry>(
       // Role selection happens exactly once, before any other code runs.
       // No facet props: supervisor. Valid facet props: facet. Anything
       // else is a configuration error, never a silent role guess.
-      const props = (ctx as { props?: unknown }).props;
-      const facetProps = readFacetProps(props);
+      const facetProps = readFacetProps(ctx);
       super(ctx, env);
       this.#core =
         facetProps === undefined
@@ -174,15 +175,27 @@ export function union<R extends KindRegistry>(
 
 /**
  * Interprets the props of a starting instance. Returns the facet props, or
- * `undefined` for the supervisor role. The runtime gives unconfigured
- * instances an empty props object, so absent, null, and empty props all
- * mean supervisor. Props that claydo did not write are a configuration
- * error, never a silent role guess.
+ * `undefined` for the supervisor role.
+ *
+ * The runtime gives unconfigured instances an empty props object, so
+ * absent, null, and empty props normally mean supervisor. Empty props on
+ * an instance whose storage holds a persisted facet identity mean the
+ * runtime started an existing facet without replaying its startup props
+ * (for example on a hibernation wake); the identity restores the facet
+ * role. Props that claydo did not write are a configuration error, never
+ * a silent role guess.
  */
-function readFacetProps(props: unknown): FacetProps | undefined {
-  if (props === undefined || props === null) return undefined;
-  if (typeof props === "object" && Object.keys(props).length === 0) {
-    return undefined;
+function readFacetProps(ctx: DurableObjectState): FacetProps | undefined {
+  const props = (ctx as { props?: unknown }).props;
+  const empty =
+    props === undefined ||
+    props === null ||
+    (typeof props === "object" && Object.keys(props).length === 0);
+  if (empty) {
+    const identity = ctx.storage.kv.get<unknown>(FACET_IDENTITY_KEY);
+    return isFacetIdentity(identity)
+      ? { claydoFacet: true, kind: identity.kind, host: identity.host }
+      : undefined;
   }
   if (isFacetProps(props)) return props;
   throw claydoError(

@@ -1,8 +1,9 @@
 import type { SupervisorInstance } from "./supervisor";
-import type {
-  KindRegistry,
-  ReservedLifecycleMethod,
-  ReservedStubKey,
+import {
+  KIND_HEADER,
+  type KindRegistry,
+  type ReservedLifecycleMethod,
+  type ReservedStubKey,
 } from "./types";
 
 /**
@@ -13,10 +14,18 @@ type ReservedKey = ReservedLifecycleMethod | ReservedStubKey | `__${string}`;
 
 /**
  * A typed stub for one kind instance. Every public prototype method of the
- * kind class becomes an async method on the stub. Errors thrown by the
- * kind propagate natively: `name`, `message`, `stack`, and own enumerable
- * fields such as `code` survive the hop; `instanceof` custom classes does
- * not, so match on `error.name` or `error.code`.
+ * kind class becomes an async method on the stub.
+ *
+ * Prototype methods only: arrow-function instance fields
+ * (`method = async () => {...}`) appear callable in this type, because
+ * TypeScript cannot distinguish them from prototype methods, but they
+ * reject at runtime with `CLAYDO_NO_METHOD`. Declare methods as regular
+ * class methods.
+ *
+ * Errors thrown by the kind propagate natively: `name`, `message`,
+ * `stack`, and own enumerable fields such as `code` survive the hop;
+ * `instanceof` custom classes does not, so match on `error.name` or
+ * `error.code`.
  */
 export type KindStub<T> = {
   [K in Exclude<keyof T, ReservedKey | symbol | number> as T[K] extends (
@@ -153,10 +162,14 @@ function makeStub<T>(
 ): KindStub<T> {
   // Named instances carry their kind in the instance name, and fromId()
   // requires an already-initialized instance, so only unique() stubs must
-  // set the kind before a fetch() can route.
+  // set the kind before a fetch() can route. A rejected attempt clears the
+  // memo, so a transient failure never poisons later fetches.
   let initialized: Promise<string> | undefined;
   const ensureInitialized = (): Promise<string> =>
-    (initialized ??= stub.__claydoInit(kindName));
+    (initialized ??= stub.__claydoInit(kindName).catch((error: unknown) => {
+      initialized = undefined;
+      throw error;
+    }));
   const meta: Record<string, unknown> = {
     id: stub.id,
     name,
@@ -167,7 +180,9 @@ function makeStub<T>(
       init?: RequestInit,
     ): Promise<Response> => {
       if (mode === "unique") await ensureInitialized();
-      return stub.fetch(input as RequestInfo, init);
+      const request = new Request(input as RequestInfo, init);
+      request.headers.set(KIND_HEADER, kindName);
+      return stub.fetch(request);
     },
   };
   return new Proxy(meta, {

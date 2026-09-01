@@ -1,8 +1,11 @@
 import { claydoError } from "./errors";
 import {
+  FACET_IDENTITY_KEY,
+  isFacetIdentity,
   RESERVED_LIFECYCLE_METHODS,
   RESERVED_STUB_KEYS,
   type AlarmInfo,
+  type FacetIdentity,
   type FacetProps,
   type KindHandlers,
   type KindRegistry,
@@ -61,9 +64,41 @@ function deleteAllFacetStorage(
       );
     }
     for (const [key] of [...storage.kv.list()]) {
+      if (key === FACET_IDENTITY_KEY) continue;
       storage.kv.delete(key);
     }
   });
+}
+
+/**
+ * Returns an error that survives RPC serialization. Errors whose own
+ * fields all clone pass through unchanged; an error with a non-cloneable
+ * field (an open socket, a function) is rebuilt with its name, message,
+ * stack, and every cloneable own field, so the caller always receives the
+ * real error instead of an opaque serialization failure.
+ */
+function wireSafeError(error: unknown): unknown {
+  if (!(error instanceof Error)) return error;
+  const fields = new Map<string, unknown>();
+  let dirty = false;
+  for (const key of Object.keys(error)) {
+    try {
+      const value = (error as unknown as Record<string, unknown>)[key];
+      structuredClone(value);
+      fields.set(key, value);
+    } catch {
+      // A throwing getter or a non-cloneable value: drop the field.
+      dirty = true;
+    }
+  }
+  if (!dirty) return error;
+  const safe = new Error(error.message);
+  safe.name = error.name;
+  if (error.stack !== undefined) safe.stack = error.stack;
+  for (const [key, value] of fields) {
+    (safe as unknown as Record<string, unknown>)[key] = value;
+  }
+  return safe;
 }
 
 /**
@@ -186,6 +221,23 @@ function prototypeMethod(
 }
 
 /**
+ * Finds the property descriptor of `name` anywhere on `instance` or its
+ * prototype chain, without invoking getters.
+ */
+function findDescriptor(
+  instance: object,
+  name: string,
+): PropertyDescriptor | undefined {
+  let target: object | null = instance;
+  while (target !== null && target !== Object.prototype) {
+    const descriptor = Object.getOwnPropertyDescriptor(target, name);
+    if (descriptor !== undefined) return descriptor;
+    target = Object.getPrototypeOf(target);
+  }
+  return undefined;
+}
+
+/**
  * The facet role of a union instance. One isolated kind facet: it
  * constructs the kind implementation, forwards lifecycle events to it, and
  * dispatches RPC methods on it.
@@ -210,6 +262,21 @@ export class FacetCore {
     this.#env = env;
     this.#props = props;
     this.#kinds = kinds;
+    // Persist the facet's identity under the one reserved key in the
+    // kind's key-value store, so the facet can select its role even when
+    // the runtime starts it without props.
+    const identity = ctx.storage.kv.get<unknown>(FACET_IDENTITY_KEY);
+    if (
+      !isFacetIdentity(identity) ||
+      identity.kind !== props.kind ||
+      identity.host !== props.host
+    ) {
+      ctx.storage.kv.put(FACET_IDENTITY_KEY, {
+        v: 1,
+        kind: props.kind,
+        host: props.host,
+      } satisfies FacetIdentity);
+    }
     adaptFacetStorage(ctx, props.kind, () => this.#hostBridge());
     // The kind implementation gets a clean context: the props are a claydo
     // detail, not part of the kind's contract.
@@ -283,6 +350,18 @@ export class FacetCore {
         { actualKind: this.#props.kind, expectedKind: kind },
       );
     }
+    try {
+      return await this.#dispatch(kind, method, args);
+    } catch (error) {
+      throw wireSafeError(error);
+    }
+  }
+
+  async #dispatch(
+    kind: string,
+    method: string,
+    args: unknown[],
+  ): Promise<unknown> {
     const impl = await this.#load();
     if (
       typeof method !== "string" ||
@@ -300,21 +379,31 @@ export class FacetCore {
       if (fn !== undefined) this.#methods.set(method, fn);
     }
     if (fn === undefined) {
-      const value = (impl as Record<string, unknown>)[method];
-      if (method in impl && typeof value !== "function") {
+      // Diagnose through descriptors: a getter must not run on a failed
+      // dispatch, and its exception must not replace this error.
+      const descriptor = findDescriptor(impl, method);
+      if (descriptor !== undefined) {
+        if (descriptor.get !== undefined || descriptor.set !== undefined) {
+          throw claydoError(
+            "CLAYDO_NO_METHOD",
+            `'${method}' on kind '${kind}' is an accessor property, not a ` +
+              `method. The stub only proxies methods; add a regular ` +
+              `method to read it.`,
+          );
+        }
+        if (typeof descriptor.value === "function") {
+          throw claydoError(
+            "CLAYDO_NO_METHOD",
+            `'${method}' on kind '${kind}' is a function-valued instance ` +
+              `field, not a prototype method. Workers RPC exposes ` +
+              `prototype methods only; declare it as a class method.`,
+          );
+        }
         throw claydoError(
           "CLAYDO_NO_METHOD",
           `'${method}' on kind '${kind}' is a property, not a method ` +
-            `(type: ${typeof value}). The stub only proxies methods; ` +
-            `add a getter method to read it.`,
-        );
-      }
-      if (method in impl && typeof value === "function") {
-        throw claydoError(
-          "CLAYDO_NO_METHOD",
-          `'${method}' on kind '${kind}' is a function-valued instance ` +
-            `field, not a prototype method. Workers RPC exposes ` +
-            `prototype methods only.`,
+            `(type: ${typeof descriptor.value}). The stub only proxies ` +
+            `methods; add a getter method to read it.`,
         );
       }
       throw claydoError(
@@ -326,19 +415,27 @@ export class FacetCore {
   }
 
   async deliverAlarm(info: AlarmInfo): Promise<void> {
-    const impl = await this.#load();
-    await impl.alarm?.(info as unknown as AlarmInvocationInfo);
+    try {
+      const impl = await this.#load();
+      await impl.alarm?.(info as unknown as AlarmInvocationInfo);
+    } catch (error) {
+      throw wireSafeError(error);
+    }
   }
 
   async fetch(request: Request): Promise<Response> {
-    const impl = await this.#load();
-    if (typeof impl.fetch !== "function") {
-      return new Response(
-        `claydo: kind '${this.#props.kind}' does not implement fetch().`,
-        { status: 501 },
-      );
+    try {
+      const impl = await this.#load();
+      if (typeof impl.fetch !== "function") {
+        return new Response(
+          `claydo: kind '${this.#props.kind}' does not implement fetch().`,
+          { status: 501 },
+        );
+      }
+      return await impl.fetch(request);
+    } catch (error) {
+      throw wireSafeError(error);
     }
-    return impl.fetch(request);
   }
 
   async webSocketMessage(

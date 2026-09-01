@@ -20,7 +20,7 @@ const room = app.chat.get("lobby");
 The class that `union()` returns plays one of two roles, selected once at construction. Addressed through the binding, it is a thin **supervisor**: it owns the instance's identity and its single native alarm. Started by that supervisor as a facet of the same instance, it is the kind's **facet host**: it runs the kind implementation against the facet's own database. One export covers both roles:
 
 - **Identity is the address.** A named instance is `<kind>:<name>`, so the supervisor derives the kind from the name on every request and persists no routing state. Only unique-ID instances (which have no name to parse) pin their kind in storage — written once at first contact, immutable afterwards.
-- **Storage is the kind's alone.** The facet's SQLite database and key-value store belong entirely to the kind. `claydo` stores nothing in it. `deleteAll()`, schema, and key naming are all yours.
+- **Storage is the kind's alone.** The facet's SQLite database and key-value store belong to the kind. `claydo` keeps exactly one reserved key-value key (`__claydo`, the facet's identity) and touches nothing else. `deleteAll()`, schema, and key naming are all yours.
 - **One consistency domain per instance.** The supervisor, its bookkeeping, and the kind's facet live inside one Durable Object. There is no cross-instance protocol anywhere in the library.
 - **Errors are native.** Kind methods throw across the stub exactly like Workers RPC: `name`, `message`, `stack`, and own fields such as `code` survive. `claydo`'s own errors carry a stable `code` for programmatic handling.
 
@@ -144,7 +144,7 @@ export class Checkout extends DurableObject<Env> {
 
 ## Storage
 
-Each kind instance owns a private SQLite database and key-value store, isolated by the facet. `claydo` writes nothing into it, and no other kind can reach it.
+Each kind instance owns a private SQLite database and key-value store, isolated by the facet. No other kind can reach it, and `claydo` keeps exactly one reserved key in it: the key-value key `__claydo` holds the facet's identity, so the runtime can restart the facet in the right role even without its startup props. `deleteAll()` preserves it; treat the `__claydo` key name as reserved.
 
 `ctx.storage.deleteAll()` inside a kind clears the kind's tables, views, and key-value data in one synchronous transaction. As with native Durable Objects, it does not delete a pending alarm, and it does not re-run your constructor: if the instance keeps serving, re-create your schema after the call.
 
@@ -171,9 +171,10 @@ async alarm(info?: AlarmInvocationInfo): Promise<void> {
 
 The contract:
 
-- **At-least-once, not exactly-once.** The alarm entry is cleared only after your `alarm()` handler returns. A handler failure keeps the entry and retries through the platform's native retry (`info.isRetry`, `info.retryCount`). Write handlers to tolerate replay.
-- **Scheduling is not atomic with your data writes.** Alarm state lives with the instance, outside the kind's database. The safe pattern is: persist the job first, then schedule; on fire, read the job and tolerate a replay. Alarm calls inside `storage.transaction()` or `storage.transactionSync()` throw `CLAYDO_ALARM_IN_TRANSACTION` instead of losing atomicity silently.
+- **At-least-once, not exactly-once.** The alarm entry is consumed only after your `alarm()` handler returns. A handler failure keeps the entry and retries through the platform's native retry (`info.isRetry`, `info.retryCount`). Write handlers to tolerate replay.
+- **Native in-handler semantics.** Inside `alarm()`, `getAlarm()` reads `null` — the fired alarm is already consumed, exactly like a native Durable Object — so guard-based periodic chains (`if (await getAlarm() === null) setAlarm(next)`) work unchanged.
 - **Re-scheduling inside the handler works.** A handler that calls `setAlarm()` keeps the new time.
+- **Scheduling is not atomic with your data writes.** Alarm state lives with the instance, outside the kind's database. The safe pattern is: persist the job first, then schedule; on fire, read the job and tolerate a replay. Alarm calls inside `storage.transaction()` or `storage.transactionSync()` throw `CLAYDO_ALARM_IN_TRANSACTION` instead of losing atomicity silently. The guard tracks open transactions, not call scope: an alarm call issued concurrently with an open transaction (for example through `Promise.all`) is also rejected — sequence the alarm call after the transaction commits.
 
 ## WebSockets
 
@@ -218,7 +219,9 @@ try {
 }
 ```
 
-HTTP status codes from the supervisor's `fetch()`: `404` when the instance cannot resolve a kind, `501` when the kind has no `fetch()` handler.
+HTTP status codes from the supervisor's `fetch()`: `404` when the instance cannot resolve a kind, `409` when the stub's expected kind does not match the instance, `501` when the kind has no `fetch()` handler. The typed stub asserts its expected kind through one internal request header (`x-claydo-kind`), so a wrong-kind `fetch()` fails like a wrong-kind RPC call instead of reaching the other kind.
+
+Errors that carry non-cloneable own fields (an open socket, a function) still arrive: claydo drops only the fields that cannot cross the RPC hop and keeps the error's `name`, `message`, `stack`, and every cloneable field.
 
 ## Third-party Durable Object classes
 
@@ -253,7 +256,7 @@ Type guard for claydo errors, and the constructor claydo uses internally (export
 
 ## Rules and limits
 
-- **Prototype methods only.** The stub proxies public prototype methods. Plain properties and function-valued instance fields are not callable; both fail with `CLAYDO_NO_METHOD` and an explanation.
+- **Prototype methods only.** The stub proxies public prototype methods. Plain properties, accessor properties, and function-valued instance fields are not callable; all fail with `CLAYDO_NO_METHOD` and an explanation. Note that arrow-function fields (`increment = async () => {...}`) type-check as stub methods — TypeScript cannot distinguish them from prototype methods — but fail at the first call. Declare methods as regular class methods.
 - **Reserved names.** `ctx`, `env`, `id`, `name`, `kind`, `stub`, and `then` are stub metadata; `union()` rejects kinds that define them as methods. `fetch`, `alarm`, and the `webSocket*` handlers are lifecycle methods, invoked by the platform rather than the stub. Names starting with `__` are internal.
 - **Arguments and return values** must serialize under Workers RPC rules (structured clone plus RPC extensions).
 - **One kind per instance.** An instance's kind is fixed by its name or its first contact and never changes.

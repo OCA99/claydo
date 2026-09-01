@@ -194,6 +194,25 @@ describe("error fidelity across the stub", () => {
     const error = await caught(app.counter.get("errors").unserializable());
     expect(error.message).toMatch(/serial|clone|function/i);
   });
+
+  it("delivers errors that carry non-cloneable fields", async () => {
+    const error = await caught(app.vault.get("errors").openWithHostileError());
+    expect(error.message).toBe("locked with baggage");
+    expect((error as unknown as { code: string }).code).toBe("VAULT_LOCKED");
+    expect(
+      (error as unknown as { onRetry?: unknown }).onRetry,
+    ).toBeUndefined();
+  });
+
+  it("diagnoses accessor properties without invoking the getter", async () => {
+    const counter = app.counter.get("errors") as unknown as {
+      dangerZone(): Promise<void>;
+    };
+    const error = await caught(counter.dangerZone());
+    expect((error as ClaydoError).code).toBe("CLAYDO_NO_METHOD");
+    expect(error.message).toContain("accessor property");
+    expect(error.message).not.toContain("the getter ran");
+  });
 });
 
 describe("kinds without a DurableObject base", () => {

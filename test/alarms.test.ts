@@ -52,13 +52,31 @@ describe("kind alarms", () => {
       (value) => value !== undefined,
     )) as {
       payload: string;
+      insideAlarm: number | null;
       scheduledTime: number;
       isRetry: boolean;
     };
     expect(fired.payload).toBe("hello");
     expect(fired.scheduledTime).toBe(at);
     expect(fired.isRetry).toBe(false);
+    // Inside its own handler, the kind reads no pending alarm, like a
+    // native Durable Object.
+    expect(fired.insideAlarm).toBeNull();
     expect(await reminder.alarmTime()).toBeNull();
+  });
+
+  it("keeps a guard-based periodic alarm chain alive", async () => {
+    const reminder = app.reminder.get("alarm-chain");
+    await reminder.chainEvery(120_000);
+    await reminder.remindAt(Date.now() + 25, "tick");
+    await eventually(
+      () => reminder.fired(),
+      (value) => value !== undefined,
+    );
+    // The handler saw getAlarm() === null and re-scheduled the next tick.
+    const next = await reminder.alarmTime();
+    expect(next).not.toBeNull();
+    expect(next!).toBeGreaterThan(Date.now() + 60_000);
   });
 
   it("keeps a re-schedule made inside the alarm handler", async () => {
@@ -142,6 +160,18 @@ describe("deleteAll semantics", () => {
     await reminder.remindAt(at, "survives");
     await reminder.wipe();
     expect(await reminder.alarmTime()).toBe(at);
+  });
+
+  it("keeps only the reserved identity key in the kind's key-value store", async () => {
+    const counter = app.counter.get("wipe-reserved");
+    await counter.putKv("note", "gone after wipe");
+    expect((await counter.listKvKeys()).sort()).toEqual([
+      "__claydo",
+      "note",
+    ]);
+    await counter.wipe();
+    // deleteAll() preserves the identity marker; everything else is gone.
+    expect(await counter.listKvKeys()).toEqual(["__claydo"]);
   });
 
   it("does not leak claydo state into kind storage", async () => {

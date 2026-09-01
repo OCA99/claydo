@@ -59,6 +59,15 @@ export class Counter extends DurableObject<Env> {
     return this.ctx.storage.kv.get(key);
   }
 
+  async listKvKeys(): Promise<string[]> {
+    return [...this.ctx.storage.kv.list()].map(([key]) => key);
+  }
+
+  /** An accessor property; reading it throws. */
+  get dangerZone(): never {
+    throw new Error("the getter ran");
+  }
+
   async listTables(): Promise<string[]> {
     return this.ctx.storage.sql
       .exec<{ name: string }>(
@@ -112,6 +121,13 @@ export class Vault extends DurableObject<Env> {
     // eslint-disable-next-line no-throw-literal
     throw "not an Error instance";
   }
+
+  async openWithHostileError(): Promise<never> {
+    throw Object.assign(new Error("locked with baggage"), {
+      code: "VAULT_LOCKED",
+      onRetry: () => "not cloneable",
+    });
+  }
 }
 
 /** A kind that schedules and receives alarms. */
@@ -123,8 +139,11 @@ export class Reminder extends DurableObject<Env> {
 
   async alarm(alarmInfo?: AlarmInvocationInfo): Promise<void> {
     const payload = this.ctx.storage.kv.get<string>("payload");
+    // Native semantics: inside the handler, the fired alarm is consumed.
+    const insideAlarm = await this.ctx.storage.getAlarm();
     this.ctx.storage.kv.put("fired", {
       payload,
+      insideAlarm,
       scheduledTime: alarmInfo?.scheduledTime,
       isRetry: alarmInfo?.isRetry,
       retryCount: alarmInfo?.retryCount,
@@ -134,6 +153,18 @@ export class Reminder extends DurableObject<Env> {
       this.ctx.storage.kv.delete("reschedule");
       await this.ctx.storage.setAlarm(again);
     }
+    // The guard-based periodic idiom: re-schedule only when no alarm is
+    // pending.
+    const chainEvery = this.ctx.storage.kv.get<number>("chain");
+    if (chainEvery !== undefined) {
+      if ((await this.ctx.storage.getAlarm()) === null) {
+        await this.ctx.storage.setAlarm(Date.now() + chainEvery);
+      }
+    }
+  }
+
+  async chainEvery(intervalMs: number): Promise<void> {
+    this.ctx.storage.kv.put("chain", intervalMs);
   }
 
   async rescheduleOnFire(time: number): Promise<void> {

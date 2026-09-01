@@ -47,6 +47,14 @@ describe("fetch routing", () => {
     const response = await raw.fetch("https://do/anything");
     expect(response.status).toBe(404);
   });
+
+  it("answers 409 for a fetch under the wrong kind", async () => {
+    await app.counter.get("http-mismatch").increment();
+    const id = app.counter.idFromName("http-mismatch").toString();
+    const response = await app.vault.fromId(id).fetch("https://do/value");
+    expect(response.status).toBe(409);
+    expect(await response.text()).toContain("expected kind 'vault'");
+  });
 });
 
 describe("WebSockets", () => {

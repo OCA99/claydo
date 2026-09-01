@@ -1,5 +1,10 @@
 import { claydoError, type ClaydoErrorCode } from "./errors";
-import type { AlarmInfo, FacetProps, KindRegistry } from "./types";
+import {
+  KIND_HEADER,
+  type AlarmInfo,
+  type FacetProps,
+  type KindRegistry,
+} from "./types";
 
 /** Options for `union()`. */
 export interface UnionOptions {
@@ -18,6 +23,18 @@ const KIND_KEY = "kind";
 
 /** The storage key prefix of one kind's scheduled alarm. */
 const ALARM_PREFIX = "alarm:";
+
+/**
+ * One kind's alarm entry. A plain number is a scheduled alarm. While the
+ * kind's `alarm()` handler runs, the entry becomes a firing marker: the
+ * kind's `getAlarm()` reads `null` during its own handler (native Durable
+ * Object semantics), but the entry persists so a handler failure retries.
+ */
+type AlarmEntry = number | { time: number; firing: true };
+
+function alarmTime(entry: AlarmEntry): number {
+  return typeof entry === "number" ? entry : entry.time;
+}
 
 /** The instance type of the class that `union()` returns. */
 export interface SupervisorInstance<R extends KindRegistry>
@@ -293,9 +310,10 @@ export class SupervisorCore {
 
   /** Re-arms the native alarm to the earliest scheduled kind alarm. */
   async #rearm(txn: DurableObjectTransaction): Promise<void> {
-    const entries = await txn.list<number>({ prefix: ALARM_PREFIX });
+    const entries = await txn.list<AlarmEntry>({ prefix: ALARM_PREFIX });
     let min: number | undefined;
-    for (const time of entries.values()) {
+    for (const entry of entries.values()) {
+      const time = alarmTime(entry);
       if (min === undefined || time < min) min = time;
     }
     if (min === undefined) {
@@ -318,11 +336,13 @@ export class SupervisorCore {
     alarmOptions?: DurableObjectGetAlarmOptions,
   ): Promise<number | null> {
     await this.#assertKind(kind);
-    const time = await this.#ctx.storage.get<number>(
+    const entry = await this.#ctx.storage.get<AlarmEntry>(
       `${ALARM_PREFIX}${kind}`,
       alarmOptions,
     );
-    return time ?? null;
+    // A firing entry reads as no alarm: inside its own alarm() handler a
+    // kind sees `null`, exactly like a native Durable Object.
+    return entry === undefined || typeof entry !== "number" ? null : entry;
   }
 
   async deleteKindAlarm(kind: string): Promise<void> {
@@ -344,11 +364,12 @@ export class SupervisorCore {
    * holds the time that just fired.
    */
   async alarm(alarmInfo?: AlarmInvocationInfo): Promise<void> {
-    const entries = await this.#ctx.storage.list<number>({
+    const entries = await this.#ctx.storage.list<AlarmEntry>({
       prefix: ALARM_PREFIX,
     });
     const now = Date.now();
     const due = [...entries]
+      .map(([key, entry]) => [key, alarmTime(entry)] as const)
       .filter(([, time]) => time <= now)
       .sort(([, a], [, b]) => a - b);
     for (const [key, time] of due) {
@@ -361,30 +382,50 @@ export class SupervisorCore {
         await this.#ctx.storage.delete(key);
         continue;
       }
+      // Mark the entry as firing before dispatch: the kind's own
+      // getAlarm() reads null while its handler runs. The entry itself
+      // persists, so a handler failure keeps the alarm and retries
+      // through the platform's native retry.
+      await this.#ctx.storage.put(key, { time, firing: true } as AlarmEntry);
       const info: AlarmInfo = {
         scheduledTime: time,
         isRetry: alarmInfo?.isRetry ?? false,
         retryCount: alarmInfo?.retryCount ?? 0,
       };
       await this.#facet(kind).__claydoAlarm(info);
+      // Consume the firing marker only if the handler did not schedule a
+      // new alarm (a re-schedule overwrites the entry with a number).
       await this.#ctx.storage.transaction(async (txn) => {
-        const current = await txn.get<number>(key);
-        if (current === time) await txn.delete(key);
+        const current = await txn.get<AlarmEntry>(key);
+        if (
+          current !== undefined &&
+          typeof current !== "number" &&
+          current.time === time
+        ) {
+          await txn.delete(key);
+        }
       });
     }
     await this.#ctx.storage.transaction(async (txn) => this.#rearm(txn));
   }
 
   async fetch(request: Request): Promise<Response> {
+    // The typed stub asserts its expected kind in a header, so a
+    // wrong-kind fetch fails exactly like a wrong-kind RPC call.
+    const hint = request.headers.get(KIND_HEADER) ?? undefined;
     let kind: string;
     try {
-      kind = await this.#resolveKind(undefined, false);
+      kind = await this.#resolveKind(hint, false);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const code = (error as { code?: ClaydoErrorCode }).code;
-      return new Response(message, {
-        status: code === "CLAYDO_UNINITIALIZED" ? 404 : 500,
-      });
+      const status =
+        code === "CLAYDO_UNINITIALIZED"
+          ? 404
+          : code === "CLAYDO_KIND_MISMATCH"
+            ? 409
+            : 500;
+      return new Response(message, { status });
     }
     return this.#facet(kind).fetch(request);
   }
