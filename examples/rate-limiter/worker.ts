@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { kind, resetStorage, union } from "../../src/index";
+import { kinds, union } from "../../src/index";
 
 export interface Env {
   APP_DO: DurableObjectNamespace<RateLimiterDO>;
@@ -26,7 +26,8 @@ type BucketRow = {
 /**
  * A token bucket. One instance per API key (the instance name is the key).
  * Refill is computed on demand from elapsed time — no alarms. Config and
- * level live in SQLite, so they survive eviction and restarts.
+ * level live in the instance's own SQLite database, so they survive
+ * eviction and restarts.
  */
 export class Bucket extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
@@ -49,7 +50,7 @@ export class Bucket extends DurableObject<Env> {
   /** Sets the config and refills the bucket to the new capacity. */
   async configure(capacity: number, refillPerSec: number): Promise<void> {
     if (capacity <= 0 || refillPerSec <= 0) {
-      // The `code` field is own-enumerable, so it should survive the RPC hop.
+      // `code` is an own enumerable field, so it survives Workers RPC.
       throw Object.assign(
         new RangeError(
           `configure(capacity, refillPerSec) requires positive numbers, got (${capacity}, ${refillPerSec})`,
@@ -101,18 +102,18 @@ export class Bucket extends DurableObject<Env> {
   }
 
   /**
-   * Wipes this bucket back to defaults. Uses the library's resetStorage()
-   * so the kind pin survives the deleteAll; the SQL schema does not, so we
-   * recreate it here.
+   * Wipes this bucket back to defaults. deleteAll() clears only this
+   * kind's tables and key-value data; the SQL schema goes with them, so
+   * recreate it.
    */
   async reset(): Promise<void> {
-    await resetStorage(this.ctx);
+    await this.ctx.storage.deleteAll();
     Bucket.#ensureSchema(this.ctx);
   }
 
   /**
-   * Test hook: shifts this bucket's clock forward. Persisted in KV storage so
-   * refill tests need no real timers.
+   * Test hook: shifts this bucket's clock forward. Persisted in KV storage
+   * so refill tests need no real timers.
    */
   async advanceClock(ms: number): Promise<void> {
     const skew = (await this.ctx.storage.get<number>("clockSkewMs")) ?? 0;
@@ -126,7 +127,9 @@ export class Bucket extends DurableObject<Env> {
 
   #row(): BucketRow | undefined {
     return this.ctx.storage.sql
-      .exec<BucketRow>(`SELECT capacity, refill_per_sec, tokens, updated_ms FROM bucket WHERE id = 1`)
+      .exec<BucketRow>(
+        `SELECT capacity, refill_per_sec, tokens, updated_ms FROM bucket WHERE id = 1`,
+      )
       .toArray()[0];
   }
 
@@ -150,6 +153,7 @@ export class Bucket extends DurableObject<Env> {
 }
 
 export class RateLimiterDO extends union({ bucket: Bucket }) {}
+export const RateLimiterDOFacet = RateLimiterDO.Facet;
 
 export default {
   async fetch(
@@ -162,7 +166,7 @@ export default {
     if (parts[0] !== "limits" || parts[1] === undefined) {
       return new Response("not found", { status: 404 });
     }
-    const bucket = kind(env.APP_DO, "bucket").get(parts[1]);
+    const bucket = kinds(env.APP_DO).bucket.get(parts[1]);
 
     if (parts[2] === "config" && request.method === "PUT") {
       const { capacity, refillPerSec } = await request.json<{

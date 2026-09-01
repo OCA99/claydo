@@ -1,6 +1,6 @@
 import { env } from "cloudflare:test";
 import { expect } from "vitest";
-import { kind } from "../../../src/index";
+import { kinds } from "../../../src/index";
 
 export interface ChatClient {
   ws: WebSocket;
@@ -11,8 +11,8 @@ export interface ChatClient {
 
 /** Connects a chat client. `user` becomes the PartyServer connection id. */
 export async function connect(room: string, user: string): Promise<ChatClient> {
-  const response = await kind(env.APP_DO, "chat")
-    .get(room)
+  const response = await kinds(env.APP_DO)
+    .chat.get(room)
     .fetch(`https://do/?_pk=${user}`, { headers: { Upgrade: "websocket" } });
   expect(response.status).toBe(101);
   const ws = response.webSocket!;

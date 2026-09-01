@@ -1,13 +1,25 @@
 import {
   createExecutionContext,
   env,
-  runDurableObjectAlarm,
   waitOnExecutionContext,
 } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { kind } from "../../../src/index";
 import worker from "../worker";
-import { connect } from "./helpers";
+import { app, connect } from "./helpers";
+
+/** Polls until `ok` accepts the read value, or the deadline passes. */
+async function eventually<T>(
+  read: () => Promise<T>,
+  ok: (value: T) => boolean,
+  timeoutMs = 5000,
+): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = await read();
+    if (ok(value) || Date.now() > deadline) return value;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
 
 describe("collaborative document", () => {
   it("converges two WebSocket clients through op broadcast", async () => {
@@ -32,15 +44,13 @@ describe("collaborative document", () => {
       op: { type: "insert", pos: 5, text: " world" },
     });
 
-    expect(await kind(env.APP_DO, "doc").get("conv").getText()).toBe(
-      "hello world",
-    );
+    expect(await app.doc.get("conv").getText()).toBe("hello world");
     a.close();
     b.close();
   });
 
   it("applies deletes and reports stats over RPC", async () => {
-    const doc = kind(env.APP_DO, "doc").get("stats");
+    const doc = app.doc.get("stats");
     await doc.applyOp({ type: "insert", pos: 0, text: "abcdef" });
     await doc.applyOp({ type: "delete", pos: 1, len: 3 });
     expect(await doc.getText()).toBe("aef");
@@ -53,17 +63,17 @@ describe("collaborative document", () => {
   });
 
   it("persists ops across stub recreation", async () => {
-    await kind(env.APP_DO, "doc")
+    await app.doc
       .get("persist")
       .applyOp({ type: "insert", pos: 0, text: "durable" });
     // A brand-new accessor and stub must observe the same state.
-    const fresh = kind(env.APP_DO, "doc").get("persist");
+    const fresh = app.doc.get("persist");
     expect(await fresh.getText()).toBe("durable");
     expect((await fresh.getStats()).opCount).toBe(1);
   });
 
   it("compacts the op log into a snapshot when the alarm fires", async () => {
-    const doc = kind(env.APP_DO, "doc").get("compact");
+    const doc = app.doc.get("compact");
     await doc.applyOp({ type: "insert", pos: 0, text: "state" });
     await doc.applyOp({ type: "insert", pos: 5, text: "ful" });
     expect(await doc.getStats()).toMatchObject({
@@ -72,20 +82,19 @@ describe("collaborative document", () => {
       alarmScheduled: true,
     });
 
-    // runDurableObjectAlarm needs the RAW stub, not the kind stub.
-    const raw = env.APP_DO.get(env.APP_DO.idFromName("doc:compact"));
-    expect(await runDurableObjectAlarm(raw)).toBe(true);
-
-    expect(await doc.getStats()).toEqual({
+    // Pull the compaction alarm forward and wait for it to fire.
+    await doc.compactNow();
+    const compacted = await eventually(
+      () => doc.getStats(),
+      (stats) => stats.snapshotVersion === 1,
+    );
+    expect(compacted).toEqual({
       opCount: 0,
       snapshotVersion: 1,
       textLength: 8,
       alarmScheduled: false,
     });
     expect(await doc.getText()).toBe("stateful");
-
-    // No alarm is pending anymore.
-    expect(await runDurableObjectAlarm(raw)).toBe(false);
 
     // New ops after compaction keep working and reschedule the alarm.
     await doc.applyOp({ type: "insert", pos: 8, text: "!" });
@@ -99,7 +108,7 @@ describe("collaborative document", () => {
   it("pushes RPC-applied ops to connected WebSocket clients", async () => {
     const client = await connect("live");
     expect(await client.next()).toEqual({ type: "init", text: "" });
-    await kind(env.APP_DO, "doc")
+    await app.doc
       .get("live")
       .applyOp({ type: "insert", pos: 0, text: "from rpc" });
     expect(await client.next()).toEqual({
@@ -127,7 +136,7 @@ describe("collaborative document", () => {
   });
 
   it("serves document reads end to end through the worker", async () => {
-    await kind(env.APP_DO, "doc")
+    await app.doc
       .get("e2e")
       .applyOp({ type: "insert", pos: 0, text: "via worker" });
     const ctx = createExecutionContext();

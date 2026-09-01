@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { instanceName, kind, union } from "../../src/index";
+import { kinds, union } from "../../src/index";
 
 export interface Env {
   APP_DO: DurableObjectNamespace<AppDO>;
@@ -19,12 +19,14 @@ export interface DocStats {
 /** How long after the first uncompacted op the compaction alarm fires. */
 export const COMPACT_AFTER_MS = 30_000;
 
-/** Applies one op to a text, throwing on out-of-range positions. */
+/**
+ * Applies one op to a text, throwing on out-of-range positions. The error
+ * carries structured fields (`code`, `pos`); own enumerable fields survive
+ * the RPC hop, so callers can match on `error.code`.
+ */
 function apply(text: string, op: Op): string {
   if (op.type === "insert") {
     if (!Number.isInteger(op.pos) || op.pos < 0 || op.pos > text.length) {
-      // Structured fields on the error double as a DX probe: the updated
-      // library forwards own enumerable serializable fields over RPC.
       throw Object.assign(
         new Error(
           `collab-doc: insert position ${op.pos} out of range 0..${text.length}`,
@@ -45,24 +47,18 @@ function apply(text: string, op: Op): string {
   return text.slice(0, op.pos) + text.slice(op.pos + op.len);
 }
 
-/** DX audit probe: a class instance with methods, returned from an RPC. */
-export class SnapshotHandle {
-  constructor(readonly version: number) {}
-  describe(): string {
-    return `snapshot v${this.version}`;
-  }
-}
-
 /**
- * A collaborative text document. WebSocket clients send ops; the DO appends
- * them to a SQLite op log, applies them to the text, and broadcasts them to
- * the other clients. An alarm periodically compacts the op log into a
- * snapshot row. RPC (`getText`, `getStats`, `applyOp`) works alongside the
- * WebSocket protocol.
+ * A collaborative text document. WebSocket clients send ops; the document
+ * appends them to a SQLite op log, applies them to the text, and broadcasts
+ * them to the other clients. An alarm periodically compacts the op log into
+ * a snapshot row. RPC (`getText`, `getStats`, `applyOp`) works alongside
+ * the WebSocket protocol.
+ *
+ * Each document runs in its own claydo facet, so the op log and snapshot
+ * tables are private to the instance.
  */
 export class Doc extends DurableObject<Env> {
   #text: string | undefined;
-  #ctorNameProbe: string;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -82,13 +78,6 @@ export class Doc extends DurableObject<Env> {
     ctx.storage.sql.exec(
       `INSERT OR IGNORE INTO snapshot (id, version, text) VALUES (0, 0, '')`,
     );
-    // DX audit probe: the README says not to call instanceName() in the
-    // constructor because ctx.id.name is not available there. Verify.
-    try {
-      this.#ctorNameProbe = `value: ${String(instanceName(ctx))}`;
-    } catch (error) {
-      this.#ctorNameProbe = `threw: ${String(error)}`;
-    }
   }
 
   #currentText(): string {
@@ -146,22 +135,17 @@ export class Doc extends DurableObject<Env> {
     message: string | ArrayBuffer,
   ): Promise<void> {
     if (typeof message !== "string") return;
-    let parsed: Op | { type: "boom" };
+    let op: Op;
     try {
-      parsed = JSON.parse(message) as Op | { type: "boom" };
+      op = JSON.parse(message) as Op;
     } catch {
       ws.send(JSON.stringify({ type: "error", message: "invalid JSON" }));
       return;
     }
-    // DX audit probe: what does an uncaught throw inside webSocketMessage
-    // look like to the client and the test runner?
-    if (parsed.type === "boom") {
-      throw new Error("doc kind: deliberate failure inside webSocketMessage");
-    }
     try {
-      const seq = await this.#append(parsed);
+      const seq = await this.#append(op);
       ws.send(JSON.stringify({ type: "ack", seq }));
-      this.#broadcast({ type: "op", seq, op: parsed }, ws);
+      this.#broadcast({ type: "op", seq, op }, ws);
     } catch (error) {
       ws.send(
         JSON.stringify({
@@ -170,6 +154,11 @@ export class Doc extends DurableObject<Env> {
         }),
       );
     }
+  }
+
+  /** Moves the pending compaction forward so it runs immediately. */
+  async compactNow(): Promise<void> {
+    await this.ctx.storage.setAlarm(Date.now());
   }
 
   /** Compacts the op log into the snapshot row. */
@@ -207,29 +196,12 @@ export class Doc extends DurableObject<Env> {
     this.#broadcast({ type: "op", seq, op });
     return { seq, text: this.#currentText() };
   }
-
-  /** DX audit probe: what instanceName(ctx) returned in the constructor. */
-  constructorNameProbe(): string {
-    return this.#ctorNameProbe;
-  }
-
-  /** DX audit probe: returns a non-serializable class instance over RPC. */
-  getHandle(): SnapshotHandle {
-    const version = this.ctx.storage.sql
-      .exec<{ version: number }>(`SELECT version FROM snapshot WHERE id = 0`)
-      .one().version;
-    return new SnapshotHandle(version);
-  }
-
-  /** DX audit probe: returns a function over RPC. */
-  getCallback(): () => void {
-    return () => {};
-  }
 }
 
 export class AppDO extends union({
   doc: Doc,
 }) {}
+export const AppDOFacet = AppDO.Facet;
 
 export default {
   async fetch(
@@ -240,7 +212,7 @@ export default {
     const url = new URL(request.url);
     const match = /^\/doc\/([^/]+)$/.exec(url.pathname);
     if (match !== null && match[1] !== undefined) {
-      return kind(env.APP_DO, "doc").get(match[1]).fetch(request);
+      return kinds(env.APP_DO).doc.get(match[1]).fetch(request);
     }
     return new Response("not found", { status: 404 });
   },

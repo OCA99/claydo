@@ -4,12 +4,14 @@ import {
   waitOnExecutionContext,
 } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { kind } from "../../../src/index";
+import { kinds } from "../../../src/index";
 import worker, { type InsertDelta, type MessageRow } from "../worker";
+
+const app = kinds(env.APP_DO);
 
 /** Opens a WebSocket subscription to a room shard and buffers deltas. */
 async function subscribe(room: string) {
-  const shard = kind(env.APP_DO, "shard").get(room);
+  const shard = app.shard.get(room);
   const response = await shard.fetch("https://do/subscribe", {
     headers: { Upgrade: "websocket" },
   });
@@ -38,7 +40,7 @@ async function subscribe(room: string) {
 
 describe("shard kind: insert and list", () => {
   it("inserts and lists messages through RPC", async () => {
-    const shard = kind(env.APP_DO, "shard").get("room-basic");
+    const shard = app.shard.get("room-basic");
     expect(await shard.insert("room-basic", "hello")).toEqual({ seq: 1 });
     expect(await shard.insert("room-basic", "world")).toEqual({ seq: 2 });
     const rows = await shard.list("room-basic");
@@ -47,14 +49,14 @@ describe("shard kind: insert and list", () => {
   });
 
   it("knows its own room name via instanceName()", async () => {
-    const shard = kind(env.APP_DO, "shard").get("room-named");
+    const shard = app.shard.get("room-named");
     await shard.insert("room-named", "x");
     expect(await shard.roomName()).toBe("room-named");
   });
 
   it("keeps two rooms in independent instances", async () => {
-    const a = kind(env.APP_DO, "shard").get("room-a");
-    const b = kind(env.APP_DO, "shard").get("room-b");
+    const a = app.shard.get("room-a");
+    const b = app.shard.get("room-b");
     expect(a.id.toString()).not.toBe(b.id.toString());
     await a.insert("room-a", "only-in-a");
     await b.insert("room-b", "only-in-b");
@@ -74,7 +76,7 @@ describe("shard kind: live subscriptions", () => {
     const subA = await subscribe(room);
     const subB = await subscribe(room);
 
-    const shard = kind(env.APP_DO, "shard").get(room);
+    const shard = app.shard.get(room);
     await shard.insert(room, "first");
     const [deltaA, deltaB] = await Promise.all([subA.next(), subB.next()]);
     expect(deltaA).toEqual({ type: "insert", room, body: "first", seq: 1 });
@@ -90,7 +92,7 @@ describe("shard kind: live subscriptions", () => {
 
   it("does not leak deltas across rooms", async () => {
     const subOther = await subscribe("room-quiet");
-    const shard = kind(env.APP_DO, "shard").get("room-noisy");
+    const shard = app.shard.get("room-noisy");
     await shard.insert("room-noisy", "noise");
     // Give any (wrong) delivery a chance to arrive.
     await new Promise((resolve) => setTimeout(resolve, 50));
@@ -101,7 +103,7 @@ describe("shard kind: live subscriptions", () => {
 
 describe("session kind", () => {
   it("tracks per-user recency across rooms", async () => {
-    const session = kind(env.APP_DO, "session").get("user-1");
+    const session = app.session.get("user-1");
     await session.touch("alpha");
     await new Promise((resolve) => setTimeout(resolve, 5));
     await session.touch("beta");
@@ -115,14 +117,14 @@ describe("session kind", () => {
   });
 
   it("keeps users independent", async () => {
-    await kind(env.APP_DO, "session").get("user-a").touch("shared-room");
-    const other = kind(env.APP_DO, "session").get("user-b");
+    await app.session.get("user-a").touch("shared-room");
+    const other = app.session.get("user-b");
     expect(await other.recent()).toEqual([]);
   });
 
   it("is a different instance from a shard with the same logical name", async () => {
-    const asShard = kind(env.APP_DO, "shard").idFromName("same-name");
-    const asSession = kind(env.APP_DO, "session").idFromName("same-name");
+    const asShard = app.shard.idFromName("same-name");
+    const asSession = app.session.idFromName("same-name");
     expect(asShard.toString()).not.toBe(asSession.toString());
   });
 });

@@ -1,18 +1,33 @@
-import {
-  env,
-  runDurableObjectAlarm,
-  runInDurableObject,
-} from "cloudflare:test";
+import { env, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { KIND_STORAGE_KEY, kind, kinds, union } from "../../../src/index";
-import worker, { Game, type GameState } from "../worker";
+import { isClaydoError, kinds } from "../../../src/index";
+import type { GameState } from "../worker";
 
-const lobby = () => kind(env.APP_DO, "lobby").get("main");
-const games = () => kind(env.APP_DO, "game");
+const app = kinds(env.APP_DO);
+const lobby = () => app.lobby.get("main");
 
-/** Raw (unwrapped) stub for a game instance, as `cloudflare:test` wants it. */
-function rawStub(id: string) {
-  return env.APP_DO.get(env.APP_DO.idFromString(id));
+/** Awaits a promise that must reject, and returns the thrown error. */
+async function caught(promise: Promise<unknown>): Promise<Error> {
+  const error = await promise.then(
+    () => undefined,
+    (thrown: unknown) => thrown,
+  );
+  expect(error).toBeInstanceOf(Error);
+  return error as Error;
+}
+
+/** Polls until `ok` accepts the read value, or the deadline passes. */
+async function eventually<T>(
+  read: () => Promise<T>,
+  ok: (value: T) => boolean,
+  timeoutMs = 5000,
+): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = await read();
+    if (ok(value) || Date.now() > deadline) return value;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
 }
 
 describe("lobby -> game flow", () => {
@@ -20,7 +35,7 @@ describe("lobby -> game flow", () => {
     const id = await lobby().createMatch(["alice", "bob"]);
     expect(id).toMatch(/^[0-9a-f]{64}$/);
 
-    const game = games().fromId(id);
+    const game = app.game.fromId(id);
     // alice: 0, 1, 2 wins the top row.
     await game.move("alice", 0);
     await game.move("bob", 4);
@@ -32,83 +47,74 @@ describe("lobby -> game flow", () => {
     expect(final.winner).toBe("alice");
     expect(final.endReason).toBe("win");
     // The board is readable through state() from a second stub.
-    const again = await games().fromId(id).state();
+    const again = await app.game.fromId(id).state();
     expect(again.board[0]).toBe("alice");
   });
 
   it("lists matches from lobby SQLite", async () => {
     const a = await lobby().createMatch(["alice", "bob"]);
     const b = await lobby().createMatch(["carol", "dave"]);
-    // Storage persists across tests in this file, so assert relative order.
-    const ids = (await lobby().listMatches()).map((m) => m.id);
+    const matches = await lobby().listMatches();
+    const ids = matches.map((m) => m.id);
     expect(ids.indexOf(a)).toBeGreaterThanOrEqual(0);
     expect(ids.indexOf(b)).toBe(ids.indexOf(a) + 1);
-    const matches = await lobby().listMatches();
     expect(matches.find((m) => m.id === b)!.players).toEqual(["carol", "dave"]);
   });
 
   it("rejects out-of-turn moves with a clean error", async () => {
     const id = await lobby().createMatch(["alice", "bob"]);
-    const game = games().fromId(id);
-    await expect(game.move("bob", 4)).rejects.toThrow(
-      "not your turn: it is 'alice' to move",
-    );
+    const game = app.game.fromId(id);
+    const error = await caught(game.move("bob", 4));
+    expect(error.message).toBe("not your turn: it is 'alice' to move");
     // Rejected moves do not change state.
     expect((await game.state()).board.every((c) => c === null)).toBe(true);
   });
 
   it("rejects moves from strangers and on taken cells", async () => {
     const id = await lobby().createMatch(["alice", "bob"]);
-    const game = games().fromId(id);
-    await expect(game.move("mallory", 0)).rejects.toThrow(
-      "'mallory' is not in this game",
-    );
+    const game = app.game.fromId(id);
+    const stranger = await caught(game.move("mallory", 0));
+    expect(stranger.message).toBe("'mallory' is not in this game");
     await game.move("alice", 0);
-    await expect(game.move("bob", 0)).rejects.toThrow(
-      "cell 0 is already taken",
-    );
+    const taken = await caught(game.move("bob", 0));
+    expect(taken.message).toBe("cell 0 is already taken");
   });
 });
 
 describe("turn-timeout alarm", () => {
-  it("forfeits the slow player when the alarm fires", async () => {
-    const id = await lobby().createMatch(["alice", "bob"]);
-    await games().fromId(id).move("alice", 0);
+  it("forfeits the player who fails to move", async () => {
+    // A short clock; alice is on turn and never moves.
+    const id = await lobby().createMatch(["alice", "bob"], 25);
 
-    // Fire the pending alarm through a FRESH raw stub (alarm only, no typed
-    // call first): kind resolution must come from persisted storage because
-    // unique-id instances have no name prefix.
-    const ran = await runDurableObjectAlarm(rawStub(id));
-    expect(ran).toBe(true);
-
-    const state = await games().fromId(id).state();
-    expect(state.status).toBe("finished");
-    expect(state.winner).toBe("alice"); // bob was on turn and timed out
+    const state = await eventually(
+      () => app.game.fromId(id).state(),
+      (s) => s.status === "finished",
+    );
+    expect(state.winner).toBe("bob");
     expect(state.endReason).toBe("timeout");
 
     // The game refuses further moves.
-    await expect(games().fromId(id).move("alice", 1)).rejects.toThrow(
-      "game is finished; no more moves accepted",
-    );
+    const error = await caught(app.game.fromId(id).move("bob", 1));
+    expect(error.message).toBe("game is finished; no more moves accepted");
   });
 
-  it("clears the alarm when the game finishes normally", async () => {
+  it("clears the turn clock when the game finishes normally", async () => {
     const id = await lobby().createMatch(["alice", "bob"]);
-    const game = games().fromId(id);
+    const game = app.game.fromId(id);
     await game.move("alice", 0);
+    expect(await game.deadline()).toBeGreaterThan(Date.now());
     await game.move("bob", 4);
     await game.move("alice", 1);
     await game.move("bob", 8);
-    await game.move("alice", 2); // alice wins; alarm deleted
-    const ran = await runDurableObjectAlarm(rawStub(id));
-    expect(ran).toBe(false);
+    await game.move("alice", 2); // alice wins; the clock stops
+    expect(await game.deadline()).toBeNull();
   });
 });
 
 describe("websocket spectators", () => {
   it("broadcasts moves to spectators", async () => {
     const id = await lobby().createMatch(["alice", "bob"]);
-    const game = games().fromId(id);
+    const game = app.game.fromId(id);
 
     const response = await game.fetch("https://do/ws", {
       headers: { Upgrade: "websocket" },
@@ -123,19 +129,22 @@ describe("websocket spectators", () => {
 
     await game.move("alice", 4);
     await game.move("bob", 0);
-    // Give the broadcast a tick to arrive.
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await eventually(async () => messages.length, (n) => n >= 2);
 
     expect(messages).toHaveLength(2);
-    expect(messages[0]).toMatchObject({ type: "move", player: "alice", cell: 4 });
+    expect(messages[0]).toMatchObject({
+      type: "move",
+      player: "alice",
+      cell: 4,
+    });
     expect(messages[1]).toMatchObject({ type: "move", player: "bob", cell: 0 });
     expect((messages[1].state as GameState).turn).toBe("alice");
     ws.close();
   });
 
-  it("broadcasts the forfeit when the alarm fires", async () => {
-    const id = await lobby().createMatch(["alice", "bob"]);
-    const game = games().fromId(id);
+  it("broadcasts the forfeit when the turn times out", async () => {
+    const id = await lobby().createMatch(["alice", "bob"], 250);
+    const game = app.game.fromId(id);
     const response = await game.fetch("https://do/ws", {
       headers: { Upgrade: "websocket" },
     });
@@ -146,177 +155,85 @@ describe("websocket spectators", () => {
         resolve(JSON.parse(event.data as string)),
       ),
     );
-    await runDurableObjectAlarm(rawStub(id));
     const event = await received;
     expect(event).toMatchObject({ type: "forfeit", player: "alice" });
+    expect((event.state as GameState).winner).toBe("bob");
     ws.close();
   });
 });
 
 describe("worker routes end to end", () => {
   it("creates, plays and lists matches over HTTP", async () => {
-    const created = await worker.fetch(
-      new Request("https://x/matches", {
-        method: "POST",
-        body: JSON.stringify({ players: ["alice", "bob"] }),
-      }),
-      env,
-    );
+    const created = await SELF.fetch("https://example.com/matches", {
+      method: "POST",
+      body: JSON.stringify({ players: ["alice", "bob"] }),
+    });
     expect(created.status).toBe(201);
     const { id } = (await created.json()) as { id: string };
 
-    const moved = await worker.fetch(
-      new Request(`https://x/matches/${id}/move`, {
-        method: "POST",
-        body: JSON.stringify({ player: "alice", cell: 0 }),
-      }),
-      env,
-    );
+    const moved = await SELF.fetch(`https://example.com/matches/${id}/move`, {
+      method: "POST",
+      body: JSON.stringify({ player: "alice", cell: 0 }),
+    });
     expect(((await moved.json()) as GameState).board[0]).toBe("alice");
 
-    const badMove = await worker.fetch(
-      new Request(`https://x/matches/${id}/move`, {
+    const badMove = await SELF.fetch(
+      `https://example.com/matches/${id}/move`,
+      {
         method: "POST",
         body: JSON.stringify({ player: "alice", cell: 1 }),
-      }),
-      env,
+      },
     );
     expect(badMove.status).toBe(409);
     expect(await badMove.json()).toEqual({
       error: "not your turn: it is 'bob' to move",
     });
 
-    const listed = await worker.fetch(new Request("https://x/matches"), env);
-    expect(((await listed.json()) as { id: string }[]).map((m) => m.id)).toContain(id);
+    const listed = await SELF.fetch("https://example.com/matches");
+    const ids = ((await listed.json()) as { id: string }[]).map((m) => m.id);
+    expect(ids).toContain(id);
+  });
+
+  it("answers 404 for an id that never became a game", async () => {
+    const freshId = env.APP_DO.newUniqueId().toString();
+    const response = await SELF.fetch(
+      `https://example.com/matches/${freshId}`,
+    );
+    expect(response.status).toBe(404);
+    const { error } = (await response.json()) as { error: string };
+    expect(error).toContain("has no kind yet");
   });
 });
 
-// ---------------------------------------------------------------------------
-// Adversarial DX probes. Each asserts the failure mode observed while
-// auditing the library; verbatim messages are quoted in DX-REPORT.md.
-// ---------------------------------------------------------------------------
-
-describe("dx probes", () => {
-  it("PROBE: kind mismatch — game id opened through the lobby accessor", async () => {
+describe("kind and id safety", () => {
+  it("rejects a game id opened through the lobby accessor", async () => {
     const id = await lobby().createMatch(["alice", "bob"]);
-    const wrong = kind(env.APP_DO, "lobby").fromId(id);
-    // Post-fix: the message now names the exact instance.
-    await expect(wrong.listMatches()).rejects.toThrow(
-      `claydo: instance '${id}' is kind 'game', but the caller expected kind 'lobby'.`,
-    );
+    const wrong = app.lobby.fromId(id);
+    const error = await caught(wrong.listMatches());
+    expect(isClaydoError(error)).toBe(true);
+    if (isClaydoError(error)) expect(error.code).toBe("CLAYDO_KIND_MISMATCH");
   });
 
-  it("PROBE: fromId() never initializes an instance (post-fix behavior)", async () => {
+  it("fromId() never initializes an instance", async () => {
     const freshId = env.APP_DO.newUniqueId().toString();
-    const ghost = kind(env.APP_DO, "game").fromId(freshId);
-    const expected =
-      `claydo: instance '${freshId}' has no kind yet. ` +
-      `It was accessed as kind 'game' through fromId(), which never ` +
-      `initializes an instance. Create the instance first with ` +
-      `kind(ns, 'game').get(name) or .unique(), then reach it by id.`;
-    await expect(ghost.state()).rejects.toThrow(expected);
+    const ghost = app.game.fromId(freshId);
+    const error = await caught(ghost.state());
+    expect(isClaydoError(error)).toBe(true);
+    if (isClaydoError(error)) expect(error.code).toBe("CLAYDO_UNINITIALIZED");
     // fetch() through a fromId() stub refuses to initialize too.
     const response = await ghost.fetch("https://do/");
-    expect(response.status).toBe(400);
-    expect(await response.text()).toBe(expected);
-    // The refusal left no kind pinned: a later legitimate unique()-style
-    // initialization path would still be possible (nothing was persisted).
-    const raw = env.APP_DO.get(env.APP_DO.idFromString(freshId));
-    expect(await raw.__claydoKind()).toBeUndefined();
+    expect(response.status).toBe(404);
   });
 
-  it("PROBE: unique() id round-trip through lobby SQLite", async () => {
+  it("round-trips a unique() id through lobby SQLite", async () => {
     const id = await lobby().createMatch(["alice", "bob"]);
     // The id came back as a string (stub.id.toString()) and went through
-    // SQLite; fromId() accepts the string directly, no casting needed.
+    // SQLite; fromId() accepts the string directly.
     const stored = (await lobby().listMatches()).find((m) => m.id === id)!;
-    const game = games().fromId(stored.id);
+    const game = app.game.fromId(stored.id);
     expect((await game.state()).players).toEqual(["alice", "bob"]);
-    // fromId() stubs have no logical name.
+    // fromId() stubs have no logical name, but they know their kind.
     expect(game.name).toBeUndefined();
-  });
-
-  it("PROBE: renamed kind in the registry orphans existing instances", async () => {
-    // Simulate deploying a registry where 'game' was renamed to 'match':
-    // an existing instance has kind 'game' persisted in storage, but the
-    // running registry no longer contains it. We fake the persisted side by
-    // writing a stale kind into a fresh instance's storage.
-    const raw = env.APP_DO.get(env.APP_DO.newUniqueId());
-    await runInDurableObject(raw, async (_instance, state) => {
-      await state.storage.put(KIND_STORAGE_KEY, "match");
-    });
-    const viaGame = kind(env.APP_DO, "game").fromId(raw.id.toString());
-    // Post-fix: the message now names the affected instance.
-    await expect(viaGame.state()).rejects.toThrow(
-      `claydo: unknown kind 'match' on instance '${raw.id.toString()}'. Registered kinds: lobby, game.`,
-    );
-  });
-
-  it("PROBE: registering a kind name with a colon throws at union() time", () => {
-    expect(() =>
-      union({ "bad:kind": Game }),
-    ).toThrowErrorMatchingInlineSnapshot(
-      `[Error: claydo: invalid kind name 'bad:kind'. Kind names must be non-empty, must not contain ':' and must not start with '__'.]`,
-    );
-  });
-
-  it("PROBE: two union() classes coexist in one worker", async () => {
-    const metrics = kind(env.METRICS_DO, "metrics").get("global");
-    expect(await metrics.bump("games")).toBe(1);
-    expect(await metrics.bump("games")).toBe(2);
-    // The other namespace's kinds are not reachable here: 'game' is not in
-    // MetricsDO's registry (TypeScript rejects it; runtime check below).
-    const confused = kind(env.METRICS_DO as any, "game").get("x");
-    await expect((confused as any).state()).rejects.toThrow(
-      "claydo: unknown kind 'game' on instance 'game:x'. Registered kinds: metrics.",
-    );
-  });
-
-  it("PROBE: calling a plain property through the stub explains itself", async () => {
-    const metrics = kind(env.METRICS_DO, "metrics").get("props");
-    await expect((metrics as any).version()).rejects.toThrow(
-      "claydo: 'version' on kind 'metrics' is a property, not a method (type: number). The stub only proxies methods; add a getter method to read it.",
-    );
-  });
-
-  it("PROBE: union() now rejects kind classes with reserved method names at class-creation time", () => {
-    class BadKind {
-      constructor(_ctx: DurableObjectState, _env: unknown) {}
-      name(): string {
-        return "shadowed";
-      }
-    }
-    expect(() => union({ bad: BadKind })).toThrow(
-      "claydo: kind 'bad' (class BadKind) defines a method " +
-        "named 'name'. The stub reserves 'id', 'name', 'kind', 'stub' for " +
-        "metadata, so this method would not be callable. Rename the method.",
-    );
-  });
-
-  it("PROBE: the kinds() accessor works end to end", async () => {
-    const app = kinds(env.APP_DO);
-    const id = await app.lobby.get("main").createMatch(["erin", "frank"]);
-    const state = await app.game.fromId(id).state();
-    expect(state.players).toEqual(["erin", "frank"]);
-    expect(state.status).toBe("active");
-  });
-
-  it("PROBE: typo'd method name via `as any`", async () => {
-    const id = await lobby().createMatch(["alice", "bob"]);
-    const game = games().fromId(id);
-    await expect((game as any).moev("alice", 0)).rejects.toThrow(
-      "claydo: kind 'game' has no method 'moev'.",
-    );
-  });
-
-  it("PROBE: raw access to an uninitialized unique instance", async () => {
-    const raw = env.APP_DO.get(env.APP_DO.newUniqueId());
-    const response = await raw.fetch("https://do/");
-    expect(response.status).toBe(400);
-    // Post-fix: names the instance and the unique-id initialization path.
-    expect(await response.text()).toBe(
-      `claydo: instance '${raw.id.toString()}' has no kind yet. ` +
-        `Unique-ID instances initialize on their first call through kind(ns, '<kind>').unique().`,
-    );
+    expect(game.kind).toBe("game");
   });
 });

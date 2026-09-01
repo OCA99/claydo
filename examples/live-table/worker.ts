@@ -1,12 +1,12 @@
 import { DurableObject } from "cloudflare:workers";
-import { instanceName, kind, union } from "../../src/index";
+import { instanceName, kinds, union } from "../../src/index";
 
 export interface Env {
   APP_DO: DurableObjectNamespace<LiveTableDO>;
 }
 
-// NOTE: must be a `type`, not an `interface` — interfaces get no implicit
-// index signature, so `sql.exec<MessageRow>` rejects them (workers-types).
+// A `type`, not an `interface`: interfaces get no implicit index signature,
+// which `sql.exec<T>` requires (workers-types).
 export type MessageRow = {
   room: string;
   body: string;
@@ -21,9 +21,10 @@ export interface InsertDelta {
 }
 
 /**
- * One shard per room: the shard instance name IS the room key, which is the
- * sharding scheme. Owns a SQLite `messages` table and pushes a JSON delta to
- * every WebSocket subscriber on each insert (live query).
+ * One shard per room: the instance name is the room key, which is the
+ * sharding scheme. Each shard owns a `messages` table in its own SQLite
+ * database and pushes a JSON delta to every WebSocket subscriber on each
+ * insert (live query).
  */
 export class Shard extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
@@ -108,55 +109,11 @@ export class Session extends DurableObject<Env> {
   }
 }
 
-/** A custom class that structured clone does not know. Used by DX probes. */
-export class Widget {
-  constructor(public label: string) {}
-}
-
-/**
- * DX-probe kind. Not part of the "product"; it exists so the test suite can
- * poke at RPC serialization, non-method properties, and reserved-name
- * shadowing. Adding it required no wrangler change — nice.
- */
-export class Probe extends DurableObject<Env> {
-  /** A public non-method field, to see how the stub treats it. */
-  version = 7;
-
-  returnMap(): Map<string, number> {
-    return new Map([
-      ["a", 1],
-      ["b", 2],
-    ]);
-  }
-
-  returnDate(): Date {
-    return new Date(1_700_000_000_000);
-  }
-
-  returnBuffer(): ArrayBuffer {
-    const buffer = new ArrayBuffer(8);
-    new DataView(buffer).setUint32(0, 42);
-    return buffer;
-  }
-
-  returnCustomClass(): Widget {
-    return new Widget("gizmo");
-  }
-
-  echoLength(payload: string): number {
-    return payload.length;
-  }
-
-  // NOTE: this class used to define a method named `name()` to probe stub
-  // metadata shadowing. The library now rejects that at union() time — see
-  // the "union() rejects reserved method names" probe test.
-}
-
 export class LiveTableDO extends union({
   shard: Shard,
   session: Session,
-  probe: Probe,
 }) {}
+export const LiveTableDOFacet = LiveTableDO.Facet;
 
 export default {
   async fetch(
@@ -166,11 +123,12 @@ export default {
   ): Promise<Response> {
     const url = new URL(request.url);
     const parts = url.pathname.split("/").filter(Boolean);
+    const app = kinds(env.APP_DO);
 
     // POST/GET /rooms/:room/messages, GET /rooms/:room/subscribe
     if (parts[0] === "rooms" && parts[1] !== undefined) {
       const room = decodeURIComponent(parts[1]);
-      const shard = kind(env.APP_DO, "shard").get(room);
+      const shard = app.shard.get(room);
       if (parts[2] === "messages" && request.method === "POST") {
         const { body } = await request.json<{ body: string }>();
         const { seq } = await shard.insert(room, body);
@@ -186,8 +144,12 @@ export default {
 
     // POST /me/:user/touch/:room, GET /me/:user/recent
     if (parts[0] === "me" && parts[1] !== undefined) {
-      const session = kind(env.APP_DO, "session").get(parts[1]);
-      if (parts[2] === "touch" && parts[3] !== undefined && request.method === "POST") {
+      const session = app.session.get(parts[1]);
+      if (
+        parts[2] === "touch" &&
+        parts[3] !== undefined &&
+        request.method === "POST"
+      ) {
         await session.touch(decodeURIComponent(parts[3]));
         return Response.json({ ok: true });
       }

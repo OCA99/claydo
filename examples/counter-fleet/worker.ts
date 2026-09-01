@@ -1,26 +1,21 @@
 /**
- * counter-fleet example for claydo.
+ * counter-fleet: an actors-style fleet of counters managed by a registry.
  *
- * Actors-style "manage instances" pattern with TWO kinds in one host class:
+ * Two kinds share one Durable Object class:
  *
- * - `registry`: a singleton (by convention `get("main")`) that creates
- *   counter instances with `kind(env.APP_DO, "counter").unique()` from
- *   INSIDE the Durable Object, stores their ids + labels in its own SQLite,
- *   and exposes createCounter / listCounters / deleteCounter.
- * - `counter`: a tiny per-instance counter with increment / value, plus a
- *   destroy() that wipes its storage.
+ * - `registry`: a singleton by convention (`get("main")`). It creates
+ *   unique counter instances from inside the Durable Object, stores their
+ *   ids with labels in its own SQLite database, and exposes
+ *   create / list / increment / delete.
+ * - `counter`: a per-instance counter with increment / value / destroy.
  *
- * On deletion: there is no true "delete a Durable Object instance" API in
- * Workers. The realistic best effort is `storage.deleteAll()` (+
- * `deleteAlarm()`), after which the instance is an empty shell that is never
- * addressed again once the registry forgets its id. Calling `ctx.abort()`
- * additionally evicts it from memory, but it kills the in-flight RPC, so the
- * caller cannot get a return value from the same call. The registry here
- * uses deleteAll-then-forget; a separate `nuke()` method demonstrates the
- * abort variant for the DX report.
+ * Workers has no API that deletes a Durable Object instance. destroy()
+ * wipes the counter's data with `storage.deleteAll()` and re-creates the
+ * schema, so the instance keeps serving (from zero); the registry then
+ * forgets the id, and nothing addresses the instance again.
  */
 import { DurableObject } from "cloudflare:workers";
-import { kind, resetStorage, union } from "../../src/index";
+import { kind, union } from "../../src/index";
 
 export interface Env {
   APP_DO: DurableObjectNamespace<AppDO>;
@@ -33,18 +28,22 @@ export type CounterRecord = {
 };
 
 export class Counter extends DurableObject<Env> {
-  /** DX probe: a plain public property, to see how the stub reports it. */
+  /** A plain public property. The stub proxies prototype methods only. */
   flavor = "vanilla";
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    ctx.storage.sql.exec(
+    this.#ensureSchema();
+  }
+
+  #ensureSchema(): void {
+    this.ctx.storage.sql.exec(
       `CREATE TABLE IF NOT EXISTS counter (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 0),
         value INTEGER NOT NULL
       )`,
     );
-    ctx.storage.sql.exec(
+    this.ctx.storage.sql.exec(
       `INSERT OR IGNORE INTO counter (singleton, value) VALUES (0, 0)`,
     );
   }
@@ -65,41 +64,13 @@ export class Counter extends DurableObject<Env> {
   }
 
   /**
-   * Best-effort deletion, using the library's `resetStorage()` helper: it
-   * wipes all storage but re-pins the `__claydo:kind` marker, so the instance
-   * never becomes a kind-less husk. The instance keeps existing as an empty
-   * shell; once the registry forgets its id, nothing addresses it again.
-   *
-   * NOTE: the warm in-memory instance still has its SQL tables dropped and
-   * its constructor does not re-run until eviction; only a restart heals it.
+   * Best-effort deletion. `deleteAll()` clears this kind instance's tables
+   * and key-value data but keeps its identity, so the schema is re-created
+   * right away and the instance stays healthy if anything reaches it again.
    */
   async destroy(): Promise<void> {
-    await resetStorage(this.ctx);
-  }
-
-  /**
-   * The old footgun, kept as a DX probe: RAW deleteAll (kills the kind
-   * marker) plus `ctx.abort()`, which never returns and breaks the
-   * in-flight RPC, so the caller always sees an error from this call.
-   */
-  async nuke(): Promise<never> {
     await this.ctx.storage.deleteAll();
-    this.ctx.abort("counter nuked");
-    throw new Error("unreachable");
-  }
-
-  /** DX probe: evict the instance from memory without touching storage. */
-  crash(): never {
-    this.ctx.abort("counter crashed on purpose");
-    throw new Error("unreachable");
-  }
-
-  /** DX probe: a return value that structured clone cannot serialize. */
-  weird(): object {
-    class Unserializable {
-      value = 42;
-    }
-    return new Unserializable();
+    this.#ensureSchema();
   }
 }
 
@@ -119,17 +90,17 @@ export class Registry extends DurableObject<Env> {
   async createCounter(label: string): Promise<CounterRecord> {
     const existing = this.#find(label);
     if (existing !== undefined) {
-      // A named error with an own enumerable field, to probe how much error
-      // fidelity survives the RPC envelope.
+      // A named error with an own field. Both survive the RPC hop, so
+      // callers can match on error.name and read error.label.
       const error = new Error(`registry: label '${label}' already exists`);
       error.name = "DuplicateLabelError";
       (error as Error & { label: string }).label = label;
       throw error;
     }
-    // Create the instance from INSIDE the DO. unique() only mints an id;
-    // the first RPC pins the kind in the new instance's storage.
+    // Create the instance from inside the Durable Object. unique() mints
+    // an id; the first call pins the kind on the new instance.
     const counter = kind(this.env.APP_DO, "counter").unique();
-    await counter.increment(0); // touch it so the kind is persisted
+    await counter.increment(0);
     const record: CounterRecord = {
       label,
       id: counter.id.toString(),
@@ -193,7 +164,11 @@ export class Registry extends DurableObject<Env> {
   }
 }
 
-/** DX probe: a kind whose constructor throws. What does the caller see? */
+/**
+ * A kind whose constructor throws. Kinds need no DurableObject base: any
+ * class with a (ctx, env) constructor works. Callers see a constructor
+ * failure on every call.
+ */
 export class BrokenKind {
   constructor(_ctx: DurableObjectState, _env: Env) {
     throw new Error("BrokenKind constructor exploded: missing config");
@@ -207,12 +182,13 @@ export class BrokenKind {
 export class AppDO extends union({
   registry: Registry,
   counter: Counter,
-  // DX probe: the same class registered under a second kind name. Instances
-  // are disjoint (different name prefix -> different ids), and the pinned
-  // kind string differs, so "tally" counters are not "counter" counters.
+  // The same class under a second kind name. Instances are disjoint:
+  // different name prefixes map to different ids, and each instance is
+  // pinned to one kind, so "tally" counters are not "counter" counters.
   tally: Counter,
   broken: BrokenKind,
 }) {}
+export const AppDOFacet = AppDO.Facet;
 
 export default {
   async fetch(

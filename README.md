@@ -199,7 +199,7 @@ async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) { /* ... */
 
 ## Errors
 
-Kind errors propagate natively. A custom error's `name`, `message`, `stack`, and own enumerable fields survive the stub; `instanceof` does not, so match on `error.name` or `error.code`.
+Kind errors propagate natively. A custom error's `name`, `message`, `stack`, and own enumerable fields survive the stub. Built-in error classes such as `TypeError` and `RangeError` are reconstructed, so `instanceof` holds for them; custom classes are not, so match those on `error.name` or `error.code`.
 
 `claydo`'s own errors have `name: "ClaydoError"` and a stable `code`. Match on the code — messages can change in any release.
 

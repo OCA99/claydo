@@ -10,7 +10,7 @@ export interface Env {
 
 /** A kind with SQLite state, RPC methods, and a fetch handler. */
 export class Counter extends DurableObject<Env> {
-  /** A plain public property, to probe how the stub reports it. */
+  /** A plain public property; the stub reports it as not callable. */
   public label = "counter";
   /** A function-valued instance field; Workers RPC cannot expose it. */
   public fieldFn = () => "field";

@@ -4,9 +4,11 @@ import {
   waitOnExecutionContext,
 } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { kind } from "../../../src/index";
+import { kinds } from "../../../src/index";
 import worker, { LIMIT } from "../worker";
 import { connect } from "./helpers";
+
+const app = kinds(env.APP_DO);
 
 describe("chat rooms (partyserver kind)", () => {
   it("delivers messages and presence between two clients in a room", async () => {
@@ -15,6 +17,7 @@ describe("chat rooms (partyserver kind)", () => {
       type: "welcome",
       room: "chat:lobby",
       users: ["alice"],
+      history: [],
     });
 
     const bob = await connect("lobby", "bob");
@@ -73,13 +76,15 @@ describe("chat rooms (partyserver kind)", () => {
     eve.ws.send("one too many");
     expect(await eve.next()).toMatchObject({ type: "rate-limited" });
 
-    // The same limiter instance is visible from the outside through kind().
-    const limiter = kind(env.APP_DO, "limiter").get("eve");
-    expect(await limiter.peek()).toEqual({ used: LIMIT, remaining: 0 });
+    // The same limiter instance is visible from the outside through kinds().
+    expect(await app.limiter.get("eve").peek()).toEqual({
+      used: LIMIT,
+      remaining: 0,
+    });
     eve.close();
   });
 
-  it("supports reconnecting with the same user id (hibernation-style)", async () => {
+  it("replays history from the room's SQLite database on reconnect", async () => {
     const first = await connect("reconnect", "dan");
     await first.next(); // welcome
     first.ws.send("before reconnect");
@@ -90,6 +95,7 @@ describe("chat rooms (partyserver kind)", () => {
     expect(await second.next()).toMatchObject({
       type: "welcome",
       users: ["dan"],
+      history: [{ user: "dan", text: "before reconnect" }],
     });
     second.ws.send("after reconnect");
     expect(await second.next()).toMatchObject({
@@ -97,28 +103,40 @@ describe("chat rooms (partyserver kind)", () => {
       user: "dan",
       text: "after reconnect",
     });
+    expect(await app.chat.get("reconnect").history()).toEqual([
+      { user: "dan", text: "before reconnect" },
+      { user: "dan", text: "after reconnect" },
+    ]);
     second.close();
   });
 
-  it("exposes this.name inside the Server WITH the kind prefix", async () => {
+  it("sees the kind-prefixed name through PartyServer, the logical name through instanceName()", async () => {
     const client = await connect("prefixed", "nina");
     await client.next(); // welcome
-    const info = await kind(env.APP_DO, "chat").get("prefixed").roomInfo();
-    // Papercut: PartyServer reads ctx.id.name, so the room believes its
-    // name is "chat:prefixed", not "prefixed".
-    expect(info).toEqual({ name: "chat:prefixed", connections: 1 });
+    const info = await app.chat.get("prefixed").roomInfo();
+    // PartyServer reads ctx.id.name, which is the full instance name
+    // "chat:prefixed"; instanceName() strips the kind prefix.
+    expect(info).toEqual({
+      name: "chat:prefixed",
+      room: "prefixed",
+      connections: 1,
+    });
     client.close();
   });
 
   it("answers RPC on a fresh room that never saw a connection", async () => {
-    const info = await kind(env.APP_DO, "chat").get("cold-room").roomInfo();
-    expect(info).toEqual({ name: "chat:cold-room", connections: 0 });
+    const info = await app.chat.get("cold-room").roomInfo();
+    expect(info).toEqual({
+      name: "chat:cold-room",
+      room: "cold-room",
+      connections: 0,
+    });
   });
 
   it("pushes to connected clients from a stub RPC call (broadcast)", async () => {
     const client = await connect("push", "olga");
     await client.next(); // welcome
-    await kind(env.APP_DO, "chat")
+    await app.chat
       .get("push")
       .broadcast(
         JSON.stringify({ type: "chat", user: "system", text: "maintenance" }),
@@ -133,7 +151,7 @@ describe("chat rooms (partyserver kind)", () => {
 
 describe("limiter (plain DurableObject kind)", () => {
   it("counts down and blocks after the limit", async () => {
-    const limiter = kind(env.APP_DO, "limiter").get("solo");
+    const limiter = app.limiter.get("solo");
     for (let i = 1; i <= LIMIT; i++) {
       const result = await limiter.consume();
       expect(result.allowed).toBe(true);
