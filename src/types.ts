@@ -256,9 +256,10 @@ export function facetContext(
       if (property === "deleteAll") return deleteAll;
       if (boundStorage.has(property)) return boundStorage.get(property);
       const value = Reflect.get(target, property, target);
-      const result = typeof value === "function" ? value.bind(target) : value;
-      boundStorage.set(property, result);
-      return result;
+      if (typeof value !== "function") return value;
+      const bound = value.bind(target);
+      boundStorage.set(property, bound);
+      return bound;
     },
   }) as DurableObjectStorage;
   const boundContext = new Map<PropertyKey, unknown>();
@@ -267,9 +268,10 @@ export function facetContext(
       if (property === "storage") return storage;
       if (boundContext.has(property)) return boundContext.get(property);
       const value = Reflect.get(target, property, target);
-      const result = typeof value === "function" ? value.bind(target) : value;
-      boundContext.set(property, result);
-      return result;
+      if (typeof value !== "function") return value;
+      const bound = value.bind(target);
+      boundContext.set(property, bound);
+      return bound;
     },
   }) as DurableObjectState;
   for (const property of [
