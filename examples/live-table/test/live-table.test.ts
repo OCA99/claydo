@@ -29,10 +29,19 @@ async function subscribe(room: string) {
   return {
     ws,
     received,
-    next(): Promise<InsertDelta> {
+    next(timeoutMs = 2000): Promise<InsertDelta> {
       const ready = received.shift();
       if (ready !== undefined) return Promise.resolve(ready);
-      return new Promise((resolve) => waiters.push(resolve));
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(
+          () => reject(new Error("live-table test: no delta arrived")),
+          timeoutMs,
+        );
+        waiters.push((delta) => {
+          clearTimeout(timer);
+          resolve(delta);
+        });
+      });
     },
     close: () => ws.close(),
   };
