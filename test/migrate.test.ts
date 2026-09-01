@@ -213,6 +213,60 @@ describe("migrateInstance", () => {
     expect(await tally().get("m4-checkpoint").total()).toBe(5);
   });
 
+  it("restarts when staging is ahead of supervisor seq zero", async () => {
+    const old = legacy("m4-seq-zero");
+    await old.bump("value", 1);
+    const raw = rawTarget("m4-seq-zero");
+    const token = "seq-zero";
+    await old.__claydoSeal(undefined, undefined, "tally:m4-seq-zero");
+    await raw.__claydoBeginImport("tally", token, undefined, {
+      maxRows: 1,
+      maxBytes: 256 * 1024,
+    });
+    const first = (await old.__claydoExport(undefined, null, {
+      maxRows: 1,
+    })) as ExportChunk;
+    expect(first.rows?.values.length).toBe(1);
+    await runInDurableObject(raw, async (_instance, state) => {
+      const host = (
+        state.exports as unknown as Record<
+          string,
+          (options: { props: unknown }) => DurableObjectClass
+        >
+      ).AppDO!;
+      const stage = state.facets.get("import:tally", () => ({
+        class: host({
+          props: {
+            __claydoFacet: true,
+            kind: "tally",
+            hostExport: "AppDO",
+          },
+        }),
+      })) as unknown as {
+        __claydoApplyImport(
+          chunk: ExportChunk,
+          seq: number,
+        ): Promise<boolean>;
+      };
+      expect(await stage.__claydoApplyImport(first, 1)).toBe(true);
+      const importState = (await state.storage.get(
+        "__claydo:import",
+      )) as ImportState;
+      importState.updatedAtMs = Date.now() - 60_000;
+      await state.storage.put("__claydo:import", importState);
+    });
+    await old.__claydoUnseal();
+    await old.bump("value", 1);
+
+    const summary = await migrateInstance({
+      from: old,
+      to: tally(),
+      name: "m4-seq-zero",
+    });
+    expect(summary.resumed).toBe(false);
+    expect(await tally().get("m4-seq-zero").total()).toBe(2);
+  });
+
   it("re-verifies a failed final chunk on every retry", async () => {
     await seed("m4-verify-retry");
     const old = legacy("m4-verify-retry");
@@ -429,6 +483,21 @@ describe("migrateInstance", () => {
     expect(await tally().get("m8").getNote("color")).toBe("blue");
   });
 
+  it("recovers an interrupted target reset before kind or alarm access", async () => {
+    const target = tally().get("m8-reset-recovery");
+    await target.bump("data", 3);
+    await target.remindAt(Date.now() + 60_000);
+    const raw = rawTarget("m8-reset-recovery");
+    await runInDurableObject(raw, async (_instance, state) => {
+      await state.storage.put("__claydo:reset", { kinds: ["tally"] });
+      await state.storage.deleteAlarm();
+    });
+
+    expect(await raw.__claydoKind()).toBeUndefined();
+    expect(await runDurableObjectAlarm(raw)).toBe(false);
+    expect(await target.total()).toBe(0);
+  });
+
   it("seal and unseal round-trip, and sync self-calls stay intact", async () => {
     const old = legacy("m9");
     await old.bump("a");
@@ -449,6 +518,17 @@ describe("migrateInstance", () => {
       () => old.putThroughCapturedStorage("late", "write"),
       /is sealed/,
     );
+    await old.__claydoUnseal();
+    expect(await old.getRaw("late")).toBeUndefined();
+  });
+
+  it("blocks synchronous KV writes that race a seal", async () => {
+    const old = legacy("m9-sync-kv");
+    await old.bump("x");
+    const write = old.delayedSyncKvPut("late", "write", 50);
+    await scheduler.wait(10);
+    await old.__claydoSeal();
+    await expectRejects(() => write, /is sealed/);
     await old.__claydoUnseal();
     expect(await old.getRaw("late")).toBeUndefined();
   });
@@ -546,6 +626,46 @@ describe("migrateInstance", () => {
     expect(await old.__claydoSealed()).toEqual({ sealed: true });
     expect(await old.__claydoStats()).toMatchObject({ alarm });
     expect(await tally().get("manual-seal").total()).toBe(1);
+  });
+
+  it("repairs a missing move stamp when the target has a verified receipt", async () => {
+    const old = legacy("manual-seal-verified");
+    await old.bump("source", 5);
+    await old.__claydoSeal();
+    const raw = rawTarget("manual-seal-verified");
+    const token = "manual-seal-verified";
+    await raw.__claydoBeginImport("tally", token);
+    let cursor: ExportChunk["cursor"] = null;
+    let seq = 0;
+    for (;;) {
+      const chunk = (await old.__claydoExport(
+        undefined,
+        cursor,
+      )) as ExportChunk;
+      seq += 1;
+      await raw.__claydoImport("tally", chunk, seq, token);
+      if (chunk.cursor === null) break;
+      cursor = chunk.cursor;
+    }
+    expect((await old.__claydoSealed()).movedTo).toBeUndefined();
+    expect((await raw.__claydoImportStatus()).completed).toEqual({
+      kind: "tally",
+      seq,
+    });
+
+    const repaired = await migrateInstance({
+      from: old,
+      to: tally(),
+      name: "manual-seal-verified",
+    });
+    expect(repaired).toMatchObject({
+      skipped: true,
+      reason: "already migrated",
+    });
+    expect((await old.__claydoSealed()).movedTo).toBe(
+      "tally:manual-seal-verified",
+    );
+    expect(await tally().get("manual-seal-verified").total()).toBe(5);
   });
 
   it("lets only one concurrent target claim a source", async () => {
@@ -680,6 +800,11 @@ describe("migrated() router", () => {
     });
     expect(await manual.resolve("r9-stalled")).toBe("stalled");
     await raw.__claydoAbortImport("stalled");
+    await expectRejects(
+      () => manual.get("r9-stalled").total(),
+      /is sealed, but target 'tally:r9-stalled' is not live/,
+    );
+    expect((await raw.__claydoImportStatus()).kind).toBeUndefined();
     await old.__claydoUnseal();
   });
 

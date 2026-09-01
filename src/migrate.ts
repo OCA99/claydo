@@ -25,6 +25,7 @@
 import type { KindAccessor, KindStub } from "./client";
 import { RESERVED_LIFECYCLE_METHODS } from "./types";
 import {
+  DEFAULT_IMPORT_LIMITS,
   IMPORT_STALE_MS,
   IMPORT_CHECKPOINT_KEY,
   RESERVED_STORAGE_KEYS,
@@ -52,8 +53,6 @@ export type {
 export { SEALED_HEADER } from "./migrate-wire";
 
 const KV_BATCH = 128; // storage.put() accepts at most 128 keys.
-const DEFAULT_MAX_ROWS = 500;
-const DEFAULT_MAX_BYTES = 256 * 1024;
 const ROWID_FLOOR = -Number.MAX_SAFE_INTEGER;
 const SEALED_ALARM_DEFER_MS = 60_000;
 const RESERVED_EXPORT_METHODS = new Set<string>(RESERVED_LIFECYCLE_METHODS);
@@ -120,6 +119,7 @@ function guardState(holder: SealHolder): DurableObjectState {
   const storage = new Proxy(real.storage, {
     get(target, prop) {
       if (prop === "sql") return sql;
+      if (prop === "kv") return kv;
       const value = Reflect.get(target, prop, target);
       if (typeof value !== "function") return value;
       return (...args: unknown[]) => {
@@ -130,6 +130,7 @@ function guardState(holder: SealHolder): DurableObjectState {
     },
   }) as DurableObjectStorage;
   const sql = guardObject(real.storage.sql, holder);
+  const kv = guardObject(real.storage.kv, holder);
   return new Proxy(real, {
     get(target, prop) {
       if (prop === "storage") return storage;
@@ -537,8 +538,8 @@ export function exportable<I extends object>(
             `change during the copy.`,
         );
       }
-      const maxRows = limits.maxRows ?? DEFAULT_MAX_ROWS;
-      const maxBytes = limits.maxBytes ?? DEFAULT_MAX_BYTES;
+    const maxRows = limits.maxRows ?? DEFAULT_IMPORT_LIMITS.maxRows;
+    const maxBytes = limits.maxBytes ?? DEFAULT_IMPORT_LIMITS.maxBytes;
       const inspection = this.#userTables();
       const tables = inspection.tables;
       const chunk: ExportChunk = { cursor: null };
@@ -1151,8 +1152,8 @@ export async function migrateInstance(
   const old = options.from as unknown as ExportableStub;
   const secret = options.secret;
   let limits: ImportLimits = {
-    maxRows: options.maxRowsPerChunk ?? DEFAULT_MAX_ROWS,
-    maxBytes: options.maxBytesPerChunk ?? DEFAULT_MAX_BYTES,
+    maxRows: options.maxRowsPerChunk ?? DEFAULT_IMPORT_LIMITS.maxRows,
+    maxBytes: options.maxBytesPerChunk ?? DEFAULT_IMPORT_LIMITS.maxBytes,
   };
   const token = crypto.randomUUID();
   // The operator-facing reference of the target. Recorded as the old
@@ -1182,7 +1183,10 @@ export async function migrateInstance(
         );
       }
       if (oldSeal.movedTo === undefined) {
-        if (oldSeal.target !== targetRef) {
+        const verifiedTarget =
+          oldSeal.target === targetRef ||
+          status.completed?.kind === target.kind;
+        if (!verifiedTarget) {
           throw new Error(
             `claydo: old instance '${options.name}' was sealed without a ` +
               `migration claim, while target '${targetRef}' is independently ` +
@@ -1509,6 +1513,26 @@ export function migrated<T, NS extends DurableObjectNamespace<any>>(
     return false;
   }
 
+  async function migrateOrWait(
+    name: string,
+    oldStub: ExportableOldStub,
+  ): Promise<"new"> {
+    try {
+      await migrateInstance({ from: oldStub, to: accessor, name, secret });
+      return "new";
+    } catch (error) {
+      const code = (error as { code?: unknown } | null)?.code;
+      if (
+        (code === "CLAYDO_IMPORT_OWNED" ||
+          code === "CLAYDO_IMPORTING") &&
+        (await waitForMigration(name))
+      ) {
+        return "new";
+      }
+      throw error;
+    }
+  }
+
   async function resolve(name: string): Promise<"new" | "old"> {
     const target = accessor.get(name);
     const raw = target.stub as unknown as MigrationHostStub;
@@ -1532,8 +1556,7 @@ export function migrated<T, NS extends DurableObjectNamespace<any>>(
         options.strategy === "lazy" &&
         status.importing.ageMs >= IMPORT_STALE_MS
       ) {
-        await migrateInstance({ from: oldStub, to: accessor, name, secret });
-        return "new";
+        return migrateOrWait(name, oldStub);
       }
       // Another worker is migrating this instance right now.
       if (await waitForMigration(name)) return "new";
@@ -1544,10 +1567,7 @@ export function migrated<T, NS extends DurableObjectNamespace<any>>(
           options.strategy === "lazy" &&
           status.importing.ageMs >= IMPORT_STALE_MS
         ) {
-          // The owner disappeared. migrateInstance adopts the stale
-          // reservation and resumes from its facet-local checkpoint.
-          await migrateInstance({ from: oldStub, to: accessor, name, secret });
-          return "new";
+          return migrateOrWait(name, oldStub);
         }
         throw Object.assign(
           new Error(
@@ -1559,23 +1579,19 @@ export function migrated<T, NS extends DurableObjectNamespace<any>>(
       }
     }
     const seal = await oldStub.__claydoSealed(secret);
-    if (seal.sealed) return "new";
+    if (seal.sealed) {
+      throw Object.assign(
+        new Error(
+          `claydo: old instance '${name}' is sealed, but target ` +
+            `'${target.kind}:${name}' is not live. Migration recovery is ` +
+            `required before routing traffic.`,
+        ),
+        { code: "CLAYDO_MIGRATION_STALLED" },
+      );
+    }
     if (!(await oldStub.__claydoHasData(secret))) return "new";
     if (options.strategy === "lazy") {
-      try {
-        await migrateInstance({ from: oldStub, to: accessor, name, secret });
-      } catch (error) {
-        const code = (error as { code?: unknown } | null)?.code;
-        if (
-          (code === "CLAYDO_IMPORT_OWNED" ||
-            code === "CLAYDO_IMPORTING") &&
-          (await waitForMigration(name))
-        ) {
-          return "new";
-        }
-        throw error;
-      }
-      return "new";
+      return migrateOrWait(name, oldStub);
     }
     return "old";
   }

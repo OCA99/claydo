@@ -119,7 +119,7 @@ describe("B. the seal window and polluted targets", () => {
     ]);
   });
 
-  it("a manual seal and independently live target report a conflict", async () => {
+  it("a manual seal blocks routing until the driver migrates it", async () => {
     const NAME = "manual-seal-hole";
     const old = oldRoom(NAME);
     await old.post("system", "stranded one");
@@ -127,26 +127,18 @@ describe("B. the seal window and polluted targets", () => {
     await old.__claydoSeal(); // by hand, no reservation
 
     const facade = migrated(env.OLD_ROOMS, app().room, { strategy: "manual" });
-    expect(await facade.get(NAME).history()).toEqual([]); // empty pin
-
     await expectRejects(
-      () =>
-        migrateInstance({
-          from: old,
-          to: app().room,
-          name: NAME,
-        }),
-      /sealed without a migration claim/,
+      () => facade.get(NAME).history(),
+      /is sealed, but target 'room:manual-seal-hole' is not live/,
     );
 
-    await wipeTarget(app().room, NAME);
-    const rerun = await migrateInstance({
+    const summary = await migrateInstance({
       from: old,
       to: app().room,
       name: NAME,
     });
-    expect(rerun.skipped).toBe(false);
-    expect(rerun.rows["messages"]).toBe(2);
+    expect(summary.skipped).toBe(false);
+    expect(summary.rows["messages"]).toBe(2);
     expect(
       (await facade.get(NAME).history()).map((m) => m.body),
     ).toEqual(["stranded one", "stranded two"]);

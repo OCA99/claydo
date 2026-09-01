@@ -242,6 +242,7 @@ Use the regular API:
 
 ```ts
 async remindAt(timestamp: number): Promise<void> {
+  await this.ctx.storage.put("job", { timestamp });
   await this.ctx.storage.setAlarm(timestamp);
 }
 
@@ -257,10 +258,11 @@ inside `alarm()` uses the same API.
 This means one alarm per **kind instance**, as with regular Durable Objects.
 Different logical instances already have different supervisors.
 
-Alarm operations inside `storage.transaction()` are rejected with an
-explanation: facet data and the supervisor alarm cannot commit in one storage
-transaction. Commit facet data first, then call `this.ctx.storage.setAlarm()`;
-the awaited call preserves that ordering.
+Facet data and supervisor alarms are separate durability domains and cannot
+commit atomically. Persist the job first, then await `setAlarm()`, and make the
+alarm handler tolerate missing or stale jobs. Alarm operations inside
+`storage.transaction()` and `storage.transactionSync()` reject with this
+guidance.
 
 ## WebSockets
 

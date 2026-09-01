@@ -30,6 +30,10 @@ export const SEALED_HEADER = "x-claydo-sealed";
  * A stale import can be adopted (resumed or restarted) by another driver.
  */
 export const IMPORT_STALE_MS = 30_000;
+export const DEFAULT_IMPORT_LIMITS: ImportLimits = {
+  maxRows: 500,
+  maxBytes: 256 * 1024,
+};
 
 /** Export page limits persisted with an import reservation. */
 export interface ImportLimits {
@@ -132,6 +136,8 @@ export interface ImportAck {
 export interface ImportStatus {
   /** The pinned kind, when the instance is live. */
   kind?: string;
+  /** Verified import receipt retained after publication. */
+  completed?: { kind: string; seq: number };
   /** Present while an import is in progress. */
   importing?: {
     kind: string;

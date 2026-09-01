@@ -348,6 +348,15 @@ export class Tally extends DurableObject<Env> {
     await this.#capturedStorage.put(key, value);
   }
 
+  async delayedSyncKvPut(
+    key: string,
+    value: string,
+    delayMs: number,
+  ): Promise<void> {
+    await scheduler.wait(delayMs);
+    this.ctx.storage.kv.put(key, value);
+  }
+
   async getRaw(key: string): Promise<string | undefined> {
     return this.ctx.storage.get<string>(key);
   }

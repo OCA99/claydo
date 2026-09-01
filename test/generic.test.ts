@@ -293,7 +293,7 @@ describe("fetch and websockets", () => {
     const broken = kind(env.APP_DO, "brokenConstructor").get("fetch");
     const response = await broken.fetch("https://do/");
     expect(response.status).toBe(500);
-    expect(await response.text()).toBe("broken constructor");
+    expect(await response.text()).toBe("claydo: kind request failed.");
   });
 
   it("forwards hibernating WebSocket events", async () => {

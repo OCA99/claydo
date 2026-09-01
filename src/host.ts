@@ -1,5 +1,6 @@
 import { DurableObject as CloudflareDurableObject } from "cloudflare:workers";
 import {
+  DEFAULT_IMPORT_LIMITS,
   IMPORT_STALE_MS,
   IMPORT_CHECKPOINT_KEY,
   IMPORT_STATE_KEY,
@@ -74,6 +75,7 @@ interface FacetRuntimeStub {
   ): Promise<ClaydoCallResult>;
   __claydoAlarm(alarmInfo?: AlarmInfoWire): Promise<void>;
   __claydoApplyImport(chunk: ExportChunk, seq: number): Promise<boolean>;
+  __claydoImportCheckpoint(): Promise<number>;
   __claydoRemoveImportCheckpoint(): Promise<void>;
   fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response>;
 }
@@ -542,6 +544,7 @@ export function union<R extends KindRegistry>(
 
     async __claydoKind(): Promise<string | undefined> {
       if (this.#facetProps !== undefined) return this.#facetProps.kind;
+      if (await this.#recoverReset()) return undefined;
       if (this.#kind !== undefined) return this.#kind;
       const stored = await this.ctx.storage.get<string>(KIND_STORAGE_KEY);
       return stored ?? this.#kindFromName();
@@ -641,6 +644,10 @@ export function union<R extends KindRegistry>(
       }
       return {
         kind,
+        completed:
+          receipt === undefined
+            ? undefined
+            : { kind: receipt.kind, seq: receipt.seq },
         importing: state
           ? {
               kind: state.kind,
@@ -667,10 +674,7 @@ export function union<R extends KindRegistry>(
       kind: string,
       token: string,
       secret?: string,
-      limits: ImportLimits = {
-        maxRows: 500,
-        maxBytes: 256 * 1024,
-      },
+      limits: ImportLimits = DEFAULT_IMPORT_LIMITS,
     ): Promise<ImportBegin> {
       this.#checkMigrationAuth(secret);
       this.#checkImportEnabled(kind);
@@ -706,16 +710,20 @@ export function union<R extends KindRegistry>(
         if (state.token !== token && ageMs < IMPORT_STALE_MS) {
           return { ok: false, reason: "owned", ageMs };
         }
+        const checkpoint =
+          await this.#importFacet(kind).__claydoImportCheckpoint();
+        if (checkpoint !== state.seq) state.restartRequired = true;
         state.token = token;
         state.updatedAtMs = Date.now();
         await this.ctx.storage.put(IMPORT_STATE_KEY, state);
+        const hasLimits = state.limits !== undefined;
         return {
           ok: true,
           seq: state.seq,
           cursor: state.cursor,
-          resumed: state.seq > 0,
-          limits: state.limits,
-          restartRequired: state.restartRequired,
+          resumed: state.seq > 0 || checkpoint > 0,
+          limits: hasLimits ? state.limits : DEFAULT_IMPORT_LIMITS,
+          restartRequired: state.restartRequired || !hasLimits,
         };
       }
       // A previous failed import may have left an unreferenced facet after a
@@ -772,6 +780,7 @@ export function union<R extends KindRegistry>(
     ): Promise<ImportAck> {
       this.#checkMigrationAuth(secret);
       this.#checkImportEnabled(kind);
+      await this.#recoverReset();
       const state = await this.ctx.storage.get<ImportState>(IMPORT_STATE_KEY);
       if (state === undefined) {
         const persisted = await this.ctx.storage.get<unknown>([
@@ -911,6 +920,7 @@ export function union<R extends KindRegistry>(
       secret?: string,
     ): Promise<boolean> {
       this.#checkMigrationAuth(secret);
+      await this.#recoverReset();
       const state = await this.ctx.storage.get<ImportState>(IMPORT_STATE_KEY);
       if (state === undefined) return false;
       if (state.token !== token) {
@@ -933,6 +943,7 @@ export function union<R extends KindRegistry>(
       secret?: string,
     ): Promise<void> {
       this.#checkMigrationAuth(secret);
+      await this.#recoverReset();
       if (options.importable === undefined || options.importable === false) {
         throw new Error(
           "claydo: reset requires imports to be enabled on union().",
@@ -1050,6 +1061,13 @@ export function union<R extends KindRegistry>(
       return true;
     }
 
+    async __claydoImportCheckpoint(): Promise<number> {
+      if (this.#facetProps === undefined) {
+        throw new Error("claydo: import checkpoint is only available in a facet.");
+      }
+      return this.ctx.storage.kv.get<number>(IMPORT_CHECKPOINT_KEY) ?? 0;
+    }
+
     #verifyImportTotals(
       totals: NonNullable<ExportChunk["totals"]>,
     ): void {
@@ -1099,9 +1117,12 @@ export function union<R extends KindRegistry>(
           }
           return await impl.fetch(request);
         } catch (error) {
-          const message =
-            error instanceof Error ? error.message : String(error);
-          return new Response(message, { status: 500 });
+          console.error(
+            `claydo: fetch failed on kind '${this.#facetProps.kind}' ` +
+              `instance '${this.#identity()}':`,
+            error,
+          );
+          return new Response("claydo: kind request failed.", { status: 500 });
         }
       }
       let kind: string;
