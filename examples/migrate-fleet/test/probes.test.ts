@@ -52,7 +52,19 @@ describe("crash and resume (with import ownership)", () => {
     const before = await old(name).history();
     await old(name).__claydoSeal();
     const raw = rawHost(`session:${name}`);
-    await raw.__claydoBeginImport("session", "crashed-driver");
+    const begin = await raw.__claydoBeginImport(
+      "session",
+      "crashed-driver",
+      undefined,
+      { maxRows: 1, maxBytes: 256 * 1024 },
+    );
+    if (!begin.ok) expect.unreachable("fresh import must be reserved");
+    await old(name).__claydoSeal(
+      undefined,
+      undefined,
+      `session:${name}`,
+      begin.migrationId,
+    );
     const first = await old(name).__claydoExport(undefined, null, { maxRows: 1 });
     await raw.__claydoImport("session", first, 1, "crashed-driver");
 
@@ -87,7 +99,19 @@ describe("crash and resume (with import ownership)", () => {
     await seed(name);
     await old(name).__claydoSeal();
     const raw = rawHost(`session:${name}`);
-    await raw.__claydoBeginImport("session", "crashed-driver");
+    const begin = await raw.__claydoBeginImport(
+      "session",
+      "crashed-driver",
+      undefined,
+      { maxRows: 1, maxBytes: 256 * 1024 },
+    );
+    if (!begin.ok) expect.unreachable("fresh import must be reserved");
+    await old(name).__claydoSeal(
+      undefined,
+      undefined,
+      `session:${name}`,
+      begin.migrationId,
+    );
     const first = await old(name).__claydoExport(undefined, null, { maxRows: 1 });
     await raw.__claydoImport("session", first, 1, "crashed-driver");
 
@@ -337,7 +361,19 @@ describe("router behavior while an import is in progress", () => {
     await seed(name);
     await old(name).__claydoSeal();
     const raw = rawHost(`session:${name}`);
-    await raw.__claydoBeginImport("session", "crashed-driver");
+    const begin = await raw.__claydoBeginImport(
+      "session",
+      "crashed-driver",
+      undefined,
+      { maxRows: 1, maxBytes: 256 * 1024 },
+    );
+    if (!begin.ok) expect.unreachable("fresh import must be reserved");
+    await old(name).__claydoSeal(
+      undefined,
+      undefined,
+      `session:${name}`,
+      begin.migrationId,
+    );
     const first = await old(name).__claydoExport(undefined, null, { maxRows: 1 });
     await raw.__claydoImport("session", first, 1, "crashed-driver");
 

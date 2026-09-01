@@ -418,6 +418,24 @@ export class Tally extends DurableObject<Env> {
       .map((row) => row.body);
   }
 
+  relationalRows(): { users: number; orders: number } {
+    return {
+      users: this.ctx.storage.sql
+        .exec<{ n: number }>(`SELECT count(*) AS n FROM users`)
+        .one().n,
+      orders: this.ctx.storage.sql
+        .exec<{ n: number }>(`SELECT count(*) AS n FROM orders`)
+        .one().n,
+    };
+  }
+
+  descendingPrimaryKeys(): number[] {
+    return this.ctx.storage.sql
+      .exec<{ id: number }>(`SELECT id FROM descending_ids ORDER BY id`)
+      .toArray()
+      .map((row) => row.id);
+  }
+
   /** A table with STORED and VIRTUAL generated columns. */
   addPriced(name: string, cents: number): void {
     this.ctx.storage.sql.exec(

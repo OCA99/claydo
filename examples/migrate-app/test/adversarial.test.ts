@@ -245,9 +245,10 @@ describe("E. tiny chunks while spamming facade reads", () => {
     expect(summary.skipped).toBe(false);
     expect(summary.rows["messages"]).toBe(TOTAL);
     expect((await app().room.get(NAME).history()).length).toBe(TOTAL);
-    expect(await old.__claydoSealed()).toEqual({
+    expect(await old.__claydoSealed()).toMatchObject({
       sealed: true,
       movedTo: `room:${NAME}`,
+      migrationId: expect.any(String),
     });
   });
 });

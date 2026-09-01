@@ -8,6 +8,7 @@ import {
   type ExportChunk,
   type ImportAck,
   type ImportBegin,
+  type ImportCheckpoint,
   type ImportLimits,
   type ImportState,
   type ImportStatus,
@@ -74,8 +75,12 @@ interface FacetRuntimeStub {
     allowInit?: boolean,
   ): Promise<ClaydoCallResult>;
   __claydoAlarm(alarmInfo?: AlarmInfoWire): Promise<void>;
-  __claydoApplyImport(chunk: ExportChunk, seq: number): Promise<boolean>;
-  __claydoImportCheckpoint(): Promise<number>;
+  __claydoApplyImport(
+    chunk: ExportChunk,
+    seq: number,
+    migrationId: string,
+  ): Promise<boolean>;
+  __claydoImportCheckpoint(): Promise<ImportCheckpoint | undefined>;
   __claydoRemoveImportCheckpoint(): Promise<void>;
   fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response>;
 }
@@ -91,6 +96,7 @@ const RESET_STATE_KEY = "__claydo:reset";
 
 interface ImportReceipt {
   kind: string;
+  migrationId: string;
   token: string;
   seq: number;
   applied: { kv: number; rows: Record<string, number> };
@@ -144,6 +150,7 @@ export interface GenericDurableObjectInstance<R extends KindRegistry>
     token: string,
     secret?: string,
     limits?: ImportLimits,
+    migrationId?: string,
   ): Promise<ImportBegin>;
   __claydoImport(
     kind: string,
@@ -647,7 +654,11 @@ export function union<R extends KindRegistry>(
         completed:
           receipt === undefined
             ? undefined
-            : { kind: receipt.kind, seq: receipt.seq },
+            : {
+                kind: receipt.kind,
+                seq: receipt.seq,
+                migrationId: receipt.migrationId,
+              },
         importing: state
           ? {
               kind: state.kind,
@@ -675,6 +686,19 @@ export function union<R extends KindRegistry>(
       token: string,
       secret?: string,
       limits: ImportLimits = DEFAULT_IMPORT_LIMITS,
+      migrationId = crypto.randomUUID(),
+    ): Promise<ImportBegin> {
+      return this.#withImportLock(() =>
+        this.#beginImport(kind, token, secret, limits, migrationId),
+      );
+    }
+
+    async #beginImport(
+      kind: string,
+      token: string,
+      secret?: string,
+      limits: ImportLimits = DEFAULT_IMPORT_LIMITS,
+      migrationId = crypto.randomUUID(),
     ): Promise<ImportBegin> {
       this.#checkMigrationAuth(secret);
       this.#checkImportEnabled(kind);
@@ -712,8 +736,17 @@ export function union<R extends KindRegistry>(
         }
         const checkpoint =
           await this.#importFacet(kind).__claydoImportCheckpoint();
-        if (checkpoint !== state.seq) state.restartRequired = true;
+        const hasMigrationId = typeof state.migrationId === "string";
+        if (
+          checkpoint?.seq !== state.seq ||
+          checkpoint?.migrationId !== state.migrationId
+        ) {
+          state.restartRequired = true;
+        }
         state.token = token;
+        state.migrationId = hasMigrationId
+          ? state.migrationId
+          : migrationId;
         state.updatedAtMs = Date.now();
         await this.ctx.storage.put(IMPORT_STATE_KEY, state);
         const hasLimits = state.limits !== undefined;
@@ -721,9 +754,11 @@ export function union<R extends KindRegistry>(
           ok: true,
           seq: state.seq,
           cursor: state.cursor,
-          resumed: state.seq > 0 || checkpoint > 0,
+          resumed: state.seq > 0 || (checkpoint?.seq ?? 0) > 0,
           limits: hasLimits ? state.limits : DEFAULT_IMPORT_LIMITS,
-          restartRequired: state.restartRequired || !hasLimits,
+          restartRequired:
+            state.restartRequired || !hasLimits || !hasMigrationId,
+          migrationId: state.migrationId,
         };
       }
       // A previous failed import may have left an unreferenced facet after a
@@ -732,6 +767,7 @@ export function union<R extends KindRegistry>(
       this.#deleteKindFacets(kind);
       const fresh: ImportState = {
         kind,
+        migrationId,
         seq: 0,
         cursor: null,
         applied: { kv: 0, rows: {} },
@@ -748,6 +784,7 @@ export function union<R extends KindRegistry>(
         resumed: false,
         limits,
         restartRequired: false,
+        migrationId,
       };
     }
 
@@ -758,6 +795,12 @@ export function union<R extends KindRegistry>(
       token: string,
       secret?: string,
     ): Promise<ImportAck> {
+      return this.#withImportLock(() =>
+        this.#applyImport(kind, chunk, seq, token, secret),
+      );
+    }
+
+    async #withImportLock<T>(run: () => Promise<T>): Promise<T> {
       const previous = this.#importTail;
       let release!: () => void;
       this.#importTail = new Promise<void>((resolve) => {
@@ -765,7 +808,7 @@ export function union<R extends KindRegistry>(
       });
       await previous;
       try {
-        return await this.#applyImport(kind, chunk, seq, token, secret);
+        return await run();
       } finally {
         release();
       }
@@ -834,6 +877,7 @@ export function union<R extends KindRegistry>(
         facetApplied = await this.#importFacet(kind).__claydoApplyImport(
           chunk,
           seq,
+          state.migrationId,
         );
       } catch (error) {
         if (chunk.cursor === null) {
@@ -886,6 +930,7 @@ export function union<R extends KindRegistry>(
         await txn.delete(IMPORT_STATE_KEY);
         await txn.put(IMPORT_RECEIPT_KEY, {
           kind,
+          migrationId: state.migrationId,
           token,
           seq,
           applied: state.applied,
@@ -902,6 +947,7 @@ export function union<R extends KindRegistry>(
       this.#facets().delete(importFacetName(kind));
       await this.ctx.storage.put(IMPORT_RECEIPT_KEY, {
         kind,
+        migrationId: state.migrationId,
         token,
         seq,
         applied: state.applied,
@@ -916,6 +962,13 @@ export function union<R extends KindRegistry>(
     }
 
     async __claydoAbortImport(
+      token: string,
+      secret?: string,
+    ): Promise<boolean> {
+      return this.#withImportLock(() => this.#abortImport(token, secret));
+    }
+
+    async #abortImport(
       token: string,
       secret?: string,
     ): Promise<boolean> {
@@ -994,15 +1047,26 @@ export function union<R extends KindRegistry>(
     async __claydoApplyImport(
       chunk: ExportChunk,
       seq: number,
+      migrationId: string,
     ): Promise<boolean> {
       if (this.#facetProps === undefined) {
         throw new Error("claydo: import chunks can only apply inside a facet.");
       }
       const current =
-        this.ctx.storage.kv.get<number>(IMPORT_CHECKPOINT_KEY) ?? 0;
-      if (seq <= current) {
+        this.ctx.storage.kv.get<ImportCheckpoint>(IMPORT_CHECKPOINT_KEY);
+      if (
+        current !== undefined &&
+        current.migrationId !== migrationId
+      ) {
+        throw new Error(
+          `claydo: staging facet belongs to migration ` +
+            `'${current.migrationId}', not '${migrationId}'.`,
+        );
+      }
+      if (seq <= (current?.seq ?? 0)) {
         if (chunk.cursor === null && chunk.totals !== undefined) {
           this.#verifyImportTotals(chunk.totals);
+          this.#verifyImportForeignKeys();
         }
         return false;
       }
@@ -1014,6 +1078,9 @@ export function union<R extends KindRegistry>(
             `'${IMPORT_CHECKPOINT_KEY}'. Rename it before migrating.`,
         );
       }
+      // Parent and child tables can arrive in different chunks. Enforce
+      // referential integrity after the complete snapshot is present.
+      this.ctx.storage.sql.exec("PRAGMA foreign_keys = OFF");
       this.ctx.storage.transactionSync(() => {
         const sql = this.ctx.storage.sql;
         for (const table of chunk.tables ?? []) {
@@ -1025,11 +1092,17 @@ export function union<R extends KindRegistry>(
             rowid === "__rowid__"
               ? ["rowid", ...columns.slice(1).map(quoteIdent)]
               : columns.map(quoteIdent);
-          const statement =
-            `INSERT INTO ${quoteIdent(table)} (${cols.join(", ")}) ` +
-            `VALUES (${cols.map(() => "?").join(", ")})`;
-          for (const row of values) {
-            sql.exec(statement, ...(row as SqlValue[]));
+          const rowsPerStatement = Math.max(
+            1,
+            Math.floor(100 / cols.length),
+          );
+          for (let offset = 0; offset < values.length; offset += rowsPerStatement) {
+            const batch = values.slice(offset, offset + rowsPerStatement);
+            const tuple = `(${cols.map(() => "?").join(", ")})`;
+            const statement =
+              `INSERT INTO ${quoteIdent(table)} (${cols.join(", ")}) ` +
+              `VALUES ${batch.map(() => tuple).join(", ")}`;
+            sql.exec(statement, ...(batch.flat() as SqlValue[]));
           }
         }
         for (const [key, value] of chunk.kv ?? []) {
@@ -1052,20 +1125,26 @@ export function union<R extends KindRegistry>(
             }
           }
         }
-        this.ctx.storage.kv.put(IMPORT_CHECKPOINT_KEY, seq);
+        this.ctx.storage.kv.put(IMPORT_CHECKPOINT_KEY, {
+          migrationId,
+          seq,
+        } satisfies ImportCheckpoint);
       });
 
       if (chunk.totals !== undefined) {
         this.#verifyImportTotals(chunk.totals);
+        this.#verifyImportForeignKeys();
       }
       return true;
     }
 
-    async __claydoImportCheckpoint(): Promise<number> {
+    async __claydoImportCheckpoint(): Promise<
+      ImportCheckpoint | undefined
+    > {
       if (this.#facetProps === undefined) {
         throw new Error("claydo: import checkpoint is only available in a facet.");
       }
-      return this.ctx.storage.kv.get<number>(IMPORT_CHECKPOINT_KEY) ?? 0;
+      return this.ctx.storage.kv.get<ImportCheckpoint>(IMPORT_CHECKPOINT_KEY);
     }
 
     #verifyImportTotals(
@@ -1096,6 +1175,19 @@ export function union<R extends KindRegistry>(
           `claydo: import verification failed: ${mismatches.join("; ")}.`,
         );
       }
+    }
+
+    #verifyImportForeignKeys(): void {
+      const violations = this.ctx.storage.sql
+        .exec(`PRAGMA foreign_key_check`)
+        .toArray();
+      if (violations.length > 0) {
+        throw new Error(
+          `claydo: import verification failed: ${violations.length} ` +
+            `foreign key violation(s).`,
+        );
+      }
+      this.ctx.storage.sql.exec("PRAGMA foreign_keys = ON");
     }
 
     async __claydoRemoveImportCheckpoint(): Promise<void> {

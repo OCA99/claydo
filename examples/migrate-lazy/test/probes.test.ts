@@ -163,7 +163,19 @@ describe("traffic during a slow migration", () => {
 
     await old.__claydoSeal();
     const raw = rawNew("session", name);
-    await raw.__claydoBeginImport("session", "stalled-driver");
+    const begin = await raw.__claydoBeginImport(
+      "session",
+      "stalled-driver",
+      undefined,
+      { maxRows: 500, maxBytes: 16 },
+    );
+    if (!begin.ok) expect.unreachable("fresh import must be reserved");
+    await old.__claydoSeal(
+      undefined,
+      undefined,
+      `session:${name}`,
+      begin.migrationId,
+    );
     const first = (await old.__claydoExport(undefined, null, {
       maxBytes: 16,
     })) as ExportChunk;

@@ -60,6 +60,7 @@ const RESERVED_EXPORT_METHODS = new Set<string>(RESERVED_LIFECYCLE_METHODS);
 interface SealRecord {
   /** Immutable destination claim while copying. */
   target?: string;
+  migrationId?: string;
   /** Destination after the target is live. */
   movedTo?: string;
   at: number;
@@ -191,13 +192,19 @@ export interface ExportableInstance {
     secret?: string,
     movedTo?: string,
     target?: string,
+    migrationId?: string,
   ): Promise<void>;
   /** Reverses a seal, for migration rollback. */
   __claydoUnseal(secret?: string): Promise<void>;
   /** Reports the seal state. */
   __claydoSealed(
     secret?: string,
-  ): Promise<{ sealed: boolean; movedTo?: string; target?: string }>;
+  ): Promise<{
+    sealed: boolean;
+    movedTo?: string;
+    target?: string;
+    migrationId?: string;
+  }>;
   /** True when the instance has any user data (table rows or KV entries). */
   __claydoHasData(secret?: string): Promise<boolean>;
   /** Reports sizes, alarm, seal state, and blockers. Never seals. */
@@ -377,6 +384,7 @@ export function exportable<I extends object>(
       secret?: string,
       movedTo?: string,
       target?: string,
+      migrationId?: string,
     ): Promise<void> {
       this.#auth(secret);
       const holder = holderOf(this);
@@ -394,8 +402,26 @@ export function exportable<I extends object>(
             `to '${requestedTarget}'.`,
         );
       }
+      if (
+        existing?.migrationId !== undefined &&
+        migrationId !== undefined &&
+        existing.migrationId !== migrationId &&
+        !(
+          existing.movedTo === undefined &&
+          existingTarget === requestedTarget
+        )
+      ) {
+        throw new Error(
+          `claydo: old instance '${identityOf(holder.ctx)}' is sealed for ` +
+            `migration '${existing.migrationId}', not '${migrationId}'.`,
+        );
+      }
       const record: SealRecord = {
         target: existingTarget ?? requestedTarget,
+        migrationId:
+          existing?.movedTo === undefined && migrationId !== undefined
+            ? migrationId
+            : existing?.migrationId ?? migrationId,
         movedTo: movedTo ?? existing?.movedTo,
         at: existing?.at ?? Date.now(),
       };
@@ -428,7 +454,12 @@ export function exportable<I extends object>(
 
     async __claydoSealed(
       secret?: string,
-    ): Promise<{ sealed: boolean; movedTo?: string; target?: string }> {
+    ): Promise<{
+      sealed: boolean;
+      movedTo?: string;
+      target?: string;
+      migrationId?: string;
+    }> {
       this.#auth(secret);
       const holder = holderOf(this);
       return {
@@ -438,6 +469,7 @@ export function exportable<I extends object>(
           holder.sealed?.movedTo === undefined
             ? holder.sealed?.target
             : undefined,
+        migrationId: holder.sealed?.migrationId,
       };
     }
 
@@ -703,8 +735,16 @@ export function exportable<I extends object>(
         // so they are excluded from the copy instead of breaking it.
         const visible = info.filter((column) => column.hidden === 0);
         const pks = visible.filter((column) => column.pk > 0);
+        const hasPrimaryKeyIndex = sql
+          .exec<{ origin: string }>(
+            `PRAGMA index_list(${quoteIdent(row.name)})`,
+          )
+          .toArray()
+          .some((index) => index.origin === "pk");
         const rowidAlias =
-          pks.length === 1 && pks[0]!.type.toUpperCase() === "INTEGER"
+          pks.length === 1 &&
+          pks[0]!.type.toUpperCase() === "INTEGER" &&
+          !hasPrimaryKeyIndex
             ? pks[0]!.name
             : null;
         for (const column of visible) {
@@ -722,6 +762,11 @@ export function exportable<I extends object>(
                 `the column before migrating.`,
             );
           }
+          const unsafeInteger = this.#unsafeIntegerRange(
+            row.name,
+            column.name,
+          );
+          if (unsafeInteger !== undefined) blockers.push(unsafeInteger);
         }
         const namedRowid = visible.find(
           (column) => column.name.toLowerCase() === "rowid",
@@ -766,6 +811,36 @@ export function exportable<I extends object>(
           `table '${table}' has rowids outside the exportable safe integer ` +
           `range (${range.minRowid}..${range.maxRowid}). Re-key those rows ` +
           `before migrating; unsafe 64-bit rowids cannot be copied exactly.`
+        );
+      }
+      return undefined;
+    }
+
+    #unsafeIntegerRange(
+      table: string,
+      column: string,
+    ): string | undefined {
+      const { ctx } = holderOf(this);
+      const identifier = quoteIdent(column);
+      const range = ctx.storage.sql
+        .exec<{ minValue: string | null; maxValue: string | null }>(
+          `SELECT CAST(min(${identifier}) AS TEXT) AS minValue,
+                  CAST(max(${identifier}) AS TEXT) AS maxValue
+           FROM ${quoteIdent(table)}
+           WHERE typeof(${identifier}) = 'integer'`,
+        )
+        .one();
+      if (range.minValue === null || range.maxValue === null) return undefined;
+      const floor = BigInt(-Number.MAX_SAFE_INTEGER);
+      const ceiling = BigInt(Number.MAX_SAFE_INTEGER);
+      if (
+        BigInt(range.minValue) < floor ||
+        BigInt(range.maxValue) > ceiling
+      ) {
+        return (
+          `table '${table}' column '${column}' contains integers outside ` +
+          `JavaScript's safe range (${range.minValue}..${range.maxValue}). ` +
+          `Store them as text before migrating.`
         );
       }
       return undefined;
@@ -986,6 +1061,7 @@ interface MigrationHostStub {
     token: string,
     secret?: string,
     limits?: ImportLimits,
+    migrationId?: string,
   ): Promise<ImportBegin>;
   __claydoImport(
     kind: string,
@@ -1014,11 +1090,17 @@ export interface ExportableOldStub {
     secret?: string,
     movedTo?: string,
     target?: string,
+    migrationId?: string,
   ): Promise<void>;
   __claydoUnseal(secret?: string): Promise<void>;
   __claydoSealed(
     secret?: string,
-  ): Promise<{ sealed: boolean; movedTo?: string; target?: string }>;
+  ): Promise<{
+    sealed: boolean;
+    movedTo?: string;
+    target?: string;
+    migrationId?: string;
+  }>;
   __claydoHasData(secret?: string): Promise<boolean>;
   __claydoStats(secret?: string): Promise<MigrationPreview>;
   __claydoExport(
@@ -1151,11 +1233,13 @@ export async function migrateInstance(
   const raw = target.stub as unknown as MigrationHostStub;
   const old = options.from as unknown as ExportableStub;
   const secret = options.secret;
-  let limits: ImportLimits = {
+  const requestedLimits: ImportLimits = {
     maxRows: options.maxRowsPerChunk ?? DEFAULT_IMPORT_LIMITS.maxRows,
     maxBytes: options.maxBytesPerChunk ?? DEFAULT_IMPORT_LIMITS.maxBytes,
   };
+  let limits = requestedLimits;
   const token = crypto.randomUUID();
+  let migrationId = crypto.randomUUID();
   // The operator-facing reference of the target. Recorded as the old
   // instance's move marker, so seal errors and previews name something a
   // human can paste into kinds(ns).<kind>.get(name).
@@ -1184,8 +1268,10 @@ export async function migrateInstance(
       }
       if (oldSeal.movedTo === undefined) {
         const verifiedTarget =
-          oldSeal.target === targetRef ||
-          status.completed?.kind === target.kind;
+          oldSeal.target === targetRef &&
+          oldSeal.migrationId !== undefined &&
+          status.completed?.kind === target.kind &&
+          status.completed.migrationId === oldSeal.migrationId;
         if (!verifiedTarget) {
           throw new Error(
             `claydo: old instance '${options.name}' was sealed without a ` +
@@ -1193,7 +1279,12 @@ export async function migrateInstance(
               `live. Refusing to mark uncopied data as migrated.`,
           );
         }
-        await old.__claydoSeal(secret, targetRef, targetRef);
+        await old.__claydoSeal(
+          secret,
+          targetRef,
+          targetRef,
+          oldSeal.migrationId,
+        );
       }
       return skippedSummary("already migrated");
     }
@@ -1233,25 +1324,34 @@ export async function migrateInstance(
     token,
     secret,
     limits,
+    migrationId,
   );
   if (!begin.ok) throw ownedError(target.kind, options.name, begin.ageMs);
-  limits = begin.limits;
+  migrationId = begin.migrationId;
   if (
     begin.resumed &&
-    (begin.restartRequired || !oldSeal.sealed || begin.cursor === null)
+    (begin.restartRequired ||
+      !oldSeal.sealed ||
+      begin.cursor === null ||
+      oldSeal.migrationId !== begin.migrationId)
   ) {
     // Not resumable: the old instance was unsealed mid-import (the data may
     // have changed) or the previous run failed verification. Start over.
     await raw.__claydoAbortImport(token, secret);
+    migrationId = crypto.randomUUID();
     const fresh = await raw.__claydoBeginImport(
       target.kind,
       token,
       secret,
-      limits,
+      requestedLimits,
+      migrationId,
     );
     if (!fresh.ok) throw ownedError(target.kind, options.name, fresh.ageMs);
     begin = fresh;
     limits = fresh.limits;
+    migrationId = fresh.migrationId;
+  } else {
+    limits = begin.limits;
   }
   let seq = begin.seq;
   let cursor = begin.cursor;
@@ -1259,9 +1359,14 @@ export async function migrateInstance(
 
   let sealedByUs = false;
   try {
-    if (!oldSeal.sealed) {
-      await old.__claydoSeal(secret, undefined, targetRef);
-      sealedByUs = true;
+    if (!oldSeal.sealed || oldSeal.migrationId === undefined) {
+      await old.__claydoSeal(
+        secret,
+        undefined,
+        targetRef,
+        migrationId,
+      );
+      sealedByUs = !oldSeal.sealed;
     }
     let chunks = 0;
     for (;;) {
@@ -1291,7 +1396,12 @@ export async function migrateInstance(
       if (cursor === null) {
         // Success. Record the move on the old side (this also silences the
         // old instance's alarm forever).
-        await old.__claydoSeal(secret, targetRef, targetRef);
+        await old.__claydoSeal(
+          secret,
+          targetRef,
+          targetRef,
+          migrationId,
+        );
         return {
           skipped: false,
           reason: undefined,
@@ -1315,7 +1425,12 @@ export async function migrateInstance(
     }
     if (targetLive) {
       try {
-        await old.__claydoSeal(secret, targetRef, targetRef);
+        await old.__claydoSeal(
+          secret,
+          targetRef,
+          targetRef,
+          migrationId,
+        );
       } catch {
         // The move marker is best effort here.
       }

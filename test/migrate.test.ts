@@ -107,10 +107,22 @@ describe("migrateInstance", () => {
     // Simulate a driver crash: seal, reserve, apply one chunk, stop.
     await old.__claydoSeal();
     const raw = rawTarget("m4");
-    await raw.__claydoBeginImport("tally", "crashed-driver", undefined, {
+    const begin = await raw.__claydoBeginImport(
+      "tally",
+      "crashed-driver",
+      undefined,
+      {
       maxRows: 1,
       maxBytes: 256 * 1024,
-    });
+      },
+    );
+    if (!begin.ok) expect.unreachable("fresh import must be reserved");
+    await old.__claydoSeal(
+      undefined,
+      undefined,
+      "tally:m4",
+      begin.migrationId,
+    );
     const first = await old.__claydoExport(undefined, null, { maxRows: 1 });
     await raw.__claydoImport("tally", first, 1, "crashed-driver");
 
@@ -147,10 +159,17 @@ describe("migrateInstance", () => {
     const raw = rawTarget("m4-checkpoint");
     const token = "checkpoint-crash";
     await old.__claydoSeal();
-    await raw.__claydoBeginImport("tally", token, undefined, {
+    const begin = await raw.__claydoBeginImport("tally", token, undefined, {
       maxRows: 1,
       maxBytes: 256 * 1024,
     });
+    if (!begin.ok) expect.unreachable("fresh import must be reserved");
+    await old.__claydoSeal(
+      undefined,
+      undefined,
+      "tally:m4-checkpoint",
+      begin.migrationId,
+    );
     const first = (await old.__claydoExport(undefined, null, {
       maxRows: 1,
     })) as ExportChunk;
@@ -186,9 +205,16 @@ describe("migrateInstance", () => {
         __claydoApplyImport(
           chunk: ExportChunk,
           seq: number,
+          migrationId: string,
         ): Promise<boolean>;
       };
-      expect(await stage.__claydoApplyImport(rowChunk, 2)).toBe(true);
+      expect(
+        await stage.__claydoApplyImport(
+          rowChunk,
+          2,
+          begin.migrationId,
+        ),
+      ).toBe(true);
     });
     const replay = await raw.__claydoImport(
       "tally",
@@ -219,10 +245,17 @@ describe("migrateInstance", () => {
     const raw = rawTarget("m4-seq-zero");
     const token = "seq-zero";
     await old.__claydoSeal(undefined, undefined, "tally:m4-seq-zero");
-    await raw.__claydoBeginImport("tally", token, undefined, {
+    const begin = await raw.__claydoBeginImport("tally", token, undefined, {
       maxRows: 1,
       maxBytes: 256 * 1024,
     });
+    if (!begin.ok) expect.unreachable("fresh import must be reserved");
+    await old.__claydoSeal(
+      undefined,
+      undefined,
+      "tally:m4-seq-zero",
+      begin.migrationId,
+    );
     const first = (await old.__claydoExport(undefined, null, {
       maxRows: 1,
     })) as ExportChunk;
@@ -246,9 +279,12 @@ describe("migrateInstance", () => {
         __claydoApplyImport(
           chunk: ExportChunk,
           seq: number,
+          migrationId: string,
         ): Promise<boolean>;
       };
-      expect(await stage.__claydoApplyImport(first, 1)).toBe(true);
+      expect(
+        await stage.__claydoApplyImport(first, 1, begin.migrationId),
+      ).toBe(true);
       const importState = (await state.storage.get(
         "__claydo:import",
       )) as ImportState;
@@ -634,7 +670,14 @@ describe("migrateInstance", () => {
     await old.__claydoSeal();
     const raw = rawTarget("manual-seal-verified");
     const token = "manual-seal-verified";
-    await raw.__claydoBeginImport("tally", token);
+    const begin = await raw.__claydoBeginImport("tally", token);
+    if (!begin.ok) expect.unreachable("fresh import must be reserved");
+    await old.__claydoSeal(
+      undefined,
+      undefined,
+      "tally:manual-seal-verified",
+      begin.migrationId,
+    );
     let cursor: ExportChunk["cursor"] = null;
     let seq = 0;
     for (;;) {
@@ -651,6 +694,7 @@ describe("migrateInstance", () => {
     expect((await raw.__claydoImportStatus()).completed).toEqual({
       kind: "tally",
       seq,
+      migrationId: begin.migrationId,
     });
 
     const repaired = await migrateInstance({
@@ -827,11 +871,18 @@ describe("migrated() router", () => {
     const old = legacy("r11");
     const raw = rawTarget("r11");
     await old.__claydoSeal(undefined, undefined, "tally:r11");
-    await raw.__claydoBeginImport(
+    const begin = await raw.__claydoBeginImport(
       "tally",
       "dead-router-driver",
       undefined,
       { maxRows: 1, maxBytes: 256 * 1024 },
+    );
+    if (!begin.ok) expect.unreachable("fresh import must be reserved");
+    await old.__claydoSeal(
+      undefined,
+      undefined,
+      "tally:r11",
+      begin.migrationId,
     );
     const first = await old.__claydoExport(undefined, null, { maxRows: 1 });
     await raw.__claydoImport(
@@ -904,6 +955,34 @@ describe("data fidelity extensions", () => {
     expect(await tally().get("g3").searchArticles("namespaces")).toEqual([
       "claydo migrates namespaces",
     ]);
+  });
+
+  it("migrates child tables that sort before their foreign-key parents", async () => {
+    const old = legacy("g3-foreign-keys");
+    await old.bump("x");
+    await runInDurableObject(old, async (_instance, state) => {
+      state.storage.sql.exec(
+        `CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)`,
+      );
+      state.storage.sql.exec(
+        `CREATE TABLE orders (
+          id INTEGER PRIMARY KEY,
+          user_id INTEGER NOT NULL REFERENCES users(id)
+        )`,
+      );
+      state.storage.sql.exec(`INSERT INTO users VALUES (1, 'Ada')`);
+      state.storage.sql.exec(`INSERT INTO orders VALUES (1, 1)`);
+    });
+    await migrateInstance({
+      from: old,
+      to: tally(),
+      name: "g3-foreign-keys",
+      maxRowsPerChunk: 1,
+    });
+    expect(await tally().get("g3-foreign-keys").relationalRows()).toEqual({
+      users: 1,
+      orders: 1,
+    });
   });
 
   it("refuses contentless FTS5 pre-flight, before sealing anything", async () => {
@@ -988,6 +1067,55 @@ describe("data fidelity extensions", () => {
       /table 'floor_rowid'.*exportable safe integer range/,
     );
     expect((await old.__claydoSealed()).sealed).toBe(false);
+  });
+
+  it("rejects unsafe integers in ordinary columns", async () => {
+    const old = legacy("g9");
+    await old.bump("x");
+    await runInDurableObject(old, async (_instance, state) => {
+      state.storage.sql.exec(
+        `CREATE TABLE snowflakes (
+          id INTEGER PRIMARY KEY,
+          external_id INTEGER NOT NULL
+        )`,
+      );
+      state.storage.sql.exec(
+        `INSERT INTO snowflakes VALUES (1, 1152921504606846977)`,
+      );
+    });
+    const preview = await previewInstance({ from: old });
+    expect(preview.blockers.join(" ")).toMatch(
+      /column 'external_id'.*outside JavaScript's safe range/,
+    );
+    expect((await old.__claydoSealed()).sealed).toBe(false);
+  });
+
+  it("does not treat INTEGER PRIMARY KEY DESC as a rowid alias", async () => {
+    const old = legacy("g10");
+    await old.bump("x");
+    await runInDurableObject(old, async (_instance, state) => {
+      state.storage.sql.exec(
+        `CREATE TABLE descending_ids (
+          id INTEGER PRIMARY KEY DESC,
+          value TEXT NOT NULL
+        )`,
+      );
+      state.storage.sql.exec(
+        `INSERT INTO descending_ids VALUES
+          (100, 'a'), (200, 'b'), (300, 'c')`,
+      );
+    });
+    await migrateInstance({
+      from: old,
+      to: tally(),
+      name: "g10",
+      maxRowsPerChunk: 1,
+    });
+    expect(await tally().get("g10").descendingPrimaryKeys()).toEqual([
+      100,
+      200,
+      300,
+    ]);
   });
 });
 

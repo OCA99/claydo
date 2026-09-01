@@ -41,6 +41,11 @@ export interface ImportLimits {
   maxBytes: number;
 }
 
+export interface ImportCheckpoint {
+  migrationId: string;
+  seq: number;
+}
+
 /** A value that SQLite can hold. */
 export type SqlValue = null | number | string | ArrayBuffer;
 
@@ -85,6 +90,7 @@ export interface ExportChunk {
 /** Import progress persisted on the target instance between chunks. */
 export interface ImportState {
   kind: string;
+  migrationId: string;
   seq: number;
   cursor: ExportCursor | null;
   applied: { kv: number; rows: Record<string, number> };
@@ -114,6 +120,7 @@ export type ImportBegin =
       resumed: boolean;
       limits: ImportLimits;
       restartRequired: boolean;
+      migrationId: string;
     }
   | {
       ok: false;
@@ -137,7 +144,7 @@ export interface ImportStatus {
   /** The pinned kind, when the instance is live. */
   kind?: string;
   /** Verified import receipt retained after publication. */
-  completed?: { kind: string; seq: number };
+  completed?: { kind: string; seq: number; migrationId: string };
   /** Present while an import is in progress. */
   importing?: {
     kind: string;
