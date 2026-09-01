@@ -53,7 +53,19 @@ describe("fetch routing", () => {
     const id = app.counter.idFromName("http-mismatch").toString();
     const response = await app.vault.fromId(id).fetch("https://do/value");
     expect(response.status).toBe(409);
+    expect(response.headers.get("x-claydo-code")).toBe(
+      "CLAYDO_KIND_MISMATCH",
+    );
     expect(await response.text()).toContain("expected kind 'vault'");
+  });
+
+  it("strips claydo transport headers before the kind sees the request", async () => {
+    const created = app.counter.unique();
+    const response = await created.fetch("https://do/headers");
+    expect(await response.json()).toEqual({
+      kindHeader: null,
+      initHeader: null,
+    });
   });
 });
 

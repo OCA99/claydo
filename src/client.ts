@@ -1,6 +1,10 @@
 import type { SupervisorInstance } from "./supervisor";
 import {
+  composeInstanceName,
+  INIT_HEADER,
   KIND_HEADER,
+  RESERVED_LIFECYCLE_METHODS,
+  RESERVED_STUB_KEYS,
   type KindRegistry,
   type ReservedLifecycleMethod,
   type ReservedStubKey,
@@ -11,6 +15,19 @@ import {
  * handlers, internals, and the stub metadata keys.
  */
 type ReservedKey = ReservedLifecycleMethod | ReservedStubKey | `__${string}`;
+
+/**
+ * Property names the stub proxy answers locally with `undefined` instead
+ * of an RPC-firing function: reserved kind names, and the probe keys that
+ * serializers and inspectors read (`then`, `toJSON`, `constructor`).
+ * Without this, `JSON.stringify(stub)` would fire a real RPC call.
+ */
+const LOCAL_UNDEFINED_KEYS = new Set<string>([
+  ...RESERVED_STUB_KEYS,
+  ...RESERVED_LIFECYCLE_METHODS,
+  "toJSON",
+  "constructor",
+]);
 
 /**
  * A typed stub for one kind instance. Every public prototype method of the
@@ -113,7 +130,7 @@ export function kind<
   return {
     get: (name, options) =>
       makeStub(
-        ns.get(ns.idFromName(`${kindName}:${name}`), options),
+        ns.get(ns.idFromName(composeInstanceName(kindName, name)), options),
         kindName,
         { name, mode: "named" },
       ),
@@ -127,7 +144,7 @@ export function kind<
         kindName,
         { mode: "fromId" },
       ),
-    idFromName: (name) => ns.idFromName(`${kindName}:${name}`),
+    idFromName: (name) => ns.idFromName(composeInstanceName(kindName, name)),
   };
 }
 
@@ -160,16 +177,6 @@ function makeStub<T>(
   kindName: string,
   { name, mode }: StubOptions,
 ): KindStub<T> {
-  // Named instances carry their kind in the instance name, and fromId()
-  // requires an already-initialized instance, so only unique() stubs must
-  // set the kind before a fetch() can route. A rejected attempt clears the
-  // memo, so a transient failure never poisons later fetches.
-  let initialized: Promise<string> | undefined;
-  const ensureInitialized = (): Promise<string> =>
-    (initialized ??= stub.__claydoInit(kindName).catch((error: unknown) => {
-      initialized = undefined;
-      throw error;
-    }));
   const meta: Record<string, unknown> = {
     id: stub.id,
     name,
@@ -179,22 +186,45 @@ function makeStub<T>(
       input: RequestInfo | URL,
       init?: RequestInit,
     ): Promise<Response> => {
-      if (mode === "unique") await ensureInitialized();
       const request = new Request(input as RequestInfo, init);
       request.headers.set(KIND_HEADER, kindName);
+      // A unique() stub's first contact may pin the kind; the supervisor
+      // does it in the same round trip.
+      if (mode === "unique") request.headers.set(INIT_HEADER, "1");
       return stub.fetch(request);
     },
   };
   return new Proxy(meta, {
     get(target, prop) {
       if (typeof prop !== "string") return undefined;
-      if (Object.prototype.hasOwnProperty.call(target, prop)) {
+      if (Object.hasOwn(target, prop)) {
         return target[prop];
       }
-      // Do not present the stub as a thenable to `await`.
-      if (prop === "then") return undefined;
+      // Serializer and inspector probes must not become RPC calls, and
+      // reserved names fail fast without a round trip.
+      if (LOCAL_UNDEFINED_KEYS.has(prop) || prop.startsWith("__")) {
+        return undefined;
+      }
       return (...args: unknown[]) =>
-        stub.__claydoCall(kindName, prop, args, mode !== "fromId");
+        (
+          stub.__claydoCall(
+            kindName,
+            prop,
+            args,
+            mode !== "fromId",
+          ) as Promise<unknown>
+        ).catch((error: unknown) => {
+            // Serialization failures originate at this call site, not in
+            // the kind, so add the call context the raw error lacks.
+            if (error instanceof Error && error.name === "DataCloneError") {
+              throw new Error(
+                `claydo: call to ${kindName}.${prop}() failed to ` +
+                  `serialize: ${error.message}`,
+                { cause: error },
+              );
+            }
+            throw error;
+          });
     },
   }) as KindStub<T>;
 }

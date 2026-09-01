@@ -62,47 +62,20 @@ export type ReservedLifecycleMethod =
   (typeof RESERVED_LIFECYCLE_METHODS)[number];
 export type ReservedStubKey = (typeof RESERVED_STUB_KEYS)[number];
 
-/** Internal: the props that a claydo supervisor gives each kind facet. */
-export interface FacetProps {
-  readonly claydoFacet: true;
-  /** The kind this facet hosts. */
-  readonly kind: string;
-  /** The top-level export name of the supervisor class. */
-  readonly host: string;
-}
-
-/** Internal: true when `props` identify a claydo facet. */
-export function isFacetProps(props: unknown): props is FacetProps {
-  const candidate = props as Partial<FacetProps> | undefined;
-  return (
-    candidate?.claydoFacet === true &&
-    typeof candidate.kind === "string" &&
-    typeof candidate.host === "string"
-  );
-}
-
 /**
- * Internal: the header the typed stub sets on `fetch()` so the supervisor
- * can verify the caller's expected kind before routing.
+ * Internal: one facet's identity. The same record travels as the facet's
+ * startup props and persists under {@link FACET_IDENTITY_KEY}; the `v`
+ * field versions the persisted form.
  */
-export const KIND_HEADER = "x-claydo-kind";
-
-/**
- * The one reserved key in a kind's key-value store. It holds the facet's
- * identity, so the facet can select its role even when the runtime starts
- * it without props (for example on a hibernation wake). `deleteAll()`
- * preserves it.
- */
-export const FACET_IDENTITY_KEY = "__claydo";
-
-/** Internal: the persisted facet identity record. */
 export interface FacetIdentity {
   readonly v: 1;
+  /** The kind this facet hosts. */
   readonly kind: string;
+  /** The top-level export name of the union class. */
   readonly host: string;
 }
 
-/** Internal: true when `value` is a persisted facet identity. */
+/** Internal: true when `value` is a facet identity record. */
 export function isFacetIdentity(value: unknown): value is FacetIdentity {
   const candidate = value as Partial<FacetIdentity> | undefined;
   return (
@@ -113,13 +86,43 @@ export function isFacetIdentity(value: unknown): value is FacetIdentity {
 }
 
 /**
- * Internal: the serializable subset of `AlarmInvocationInfo` that crosses
- * the supervisor-to-facet RPC hop when an alarm fires.
+ * Internal: the header the typed stub sets on `fetch()` so the supervisor
+ * can verify the caller's expected kind before routing. The supervisor
+ * removes it before the request reaches the kind.
  */
-export interface AlarmInfo {
-  scheduledTime: number;
-  isRetry: boolean;
-  retryCount: number;
+export const KIND_HEADER = "x-claydo-kind";
+
+/**
+ * Internal: the header a `unique()` stub sets on `fetch()` so the
+ * supervisor may pin the kind on first contact, in the same round trip.
+ * The supervisor removes it before the request reaches the kind.
+ */
+export const INIT_HEADER = "x-claydo-init";
+
+/**
+ * The one reserved key in a kind's key-value store. It holds the facet's
+ * identity, so the facet can select its role even when the runtime starts
+ * it without props (for example on a hibernation wake). `deleteAll()`
+ * preserves it, and direct writes to it are rejected.
+ */
+export const FACET_IDENTITY_KEY = "__claydo";
+
+/**
+ * Internal: the kind pin key of the storage layout that claydo 0.1.x
+ * used. Its presence means the instance holds data this layout cannot
+ * serve; claydo fails loudly instead of serving an empty facet.
+ */
+export const LEGACY_KIND_KEY = "__claydo:kind";
+
+/** Internal: builds the full instance name of one kind instance. */
+export function composeInstanceName(kind: string, name: string): string {
+  return `${kind}:${name}`;
+}
+
+/** Internal: the `<kind>` prefix of a full instance name, if any. */
+export function parseKindPrefix(name: string): string | undefined {
+  const separator = name.indexOf(":");
+  return separator === -1 ? undefined : name.slice(0, separator);
 }
 
 /**
@@ -132,4 +135,14 @@ export function instanceName(ctx: DurableObjectState): string | undefined {
   if (name === undefined) return undefined;
   const separator = name.indexOf(":");
   return separator === -1 ? name : name.slice(separator + 1);
+}
+
+/**
+ * Internal: the serializable subset of `AlarmInvocationInfo` that crosses
+ * the supervisor-to-facet RPC hop when an alarm fires.
+ */
+export interface AlarmInfo {
+  scheduledTime: number;
+  isRetry: boolean;
+  retryCount: number;
 }

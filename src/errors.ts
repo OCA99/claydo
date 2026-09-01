@@ -51,3 +51,23 @@ export function isClaydoError(error: unknown): error is ClaydoError {
     typeof (error as { code?: unknown }).code === "string"
   );
 }
+
+/**
+ * Internal: the HTTP status the supervisor's `fetch()` answers with for
+ * each claydo error code. The code itself travels in the
+ * `x-claydo-code` response header.
+ */
+export function claydoErrorStatus(code: ClaydoErrorCode): number {
+  switch (code) {
+    case "CLAYDO_UNINITIALIZED":
+      return 404;
+    case "CLAYDO_KIND_MISMATCH":
+      return 409;
+    case "CLAYDO_NO_METHOD":
+      return 405;
+    case "CLAYDO_UNKNOWN_KIND":
+    case "CLAYDO_CONFIG":
+    case "CLAYDO_ALARM_IN_TRANSACTION":
+      return 500;
+  }
+}

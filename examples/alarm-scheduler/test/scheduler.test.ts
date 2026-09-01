@@ -134,7 +134,7 @@ describe("alarm bookkeeping", () => {
       ],
     );
     expect(native).toBe(at);
-    expect(keys).toEqual(["alarm:scheduler"]);
+    expect(keys.sort()).toEqual(["alarm:scheduler", "kind"]);
   });
 });
 

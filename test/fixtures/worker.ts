@@ -63,6 +63,10 @@ export class Counter extends DurableObject<Env> {
     return [...this.ctx.storage.kv.list()].map(([key]) => key);
   }
 
+  async deleteKv(key: string): Promise<void> {
+    this.ctx.storage.kv.delete(key);
+  }
+
   /** An accessor property; reading it throws. */
   get dangerZone(): never {
     throw new Error("the getter ran");
@@ -96,6 +100,12 @@ export class Counter extends DurableObject<Env> {
     if (url.pathname === "/value") {
       return Response.json({ value: await this.value() });
     }
+    if (url.pathname === "/headers") {
+      return Response.json({
+        kindHeader: request.headers.get("x-claydo-kind"),
+        initHeader: request.headers.get("x-claydo-init"),
+      });
+    }
     return new Response("counter: not found", { status: 404 });
   }
 }
@@ -128,6 +138,17 @@ export class Vault extends DurableObject<Env> {
       onRetry: () => "not cloneable",
     });
   }
+
+  async openWithHostileCause(): Promise<never> {
+    throw new Error("db down", {
+      cause: { socket: () => "not cloneable" },
+    });
+  }
+
+  async openWithHostilePlainThrow(): Promise<never> {
+    // eslint-disable-next-line no-throw-literal
+    throw { reason: "plain object", onRetry: () => "not cloneable" };
+  }
 }
 
 /** A kind that schedules and receives alarms. */
@@ -137,7 +158,15 @@ export class Reminder extends DurableObject<Env> {
     await this.ctx.storage.setAlarm(time);
   }
 
+  async failOnce(): Promise<void> {
+    this.ctx.storage.kv.put("fail-once", true);
+  }
+
   async alarm(alarmInfo?: AlarmInvocationInfo): Promise<void> {
+    if (this.ctx.storage.kv.get("fail-once") === true) {
+      this.ctx.storage.kv.delete("fail-once");
+      throw new Error("reminder: induced failure");
+    }
     const payload = this.ctx.storage.kv.get<string>("payload");
     // Native semantics: inside the handler, the fired alarm is consumed.
     const insideAlarm = await this.ctx.storage.getAlarm();
@@ -309,6 +338,15 @@ export class PlainKind {
   async touch(): Promise<string> {
     this.#ctx.storage.kv.put("touched", true);
     return "plain";
+  }
+
+  /** This kind defines no alarm() handler on purpose. */
+  async setAlarmAt(time: number): Promise<void> {
+    await this.#ctx.storage.setAlarm(time);
+  }
+
+  async alarmTime(): Promise<number | null> {
+    return this.#ctx.storage.getAlarm();
   }
 }
 

@@ -2,25 +2,12 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { kinds } from "../src/index";
 import type { ClaydoError } from "../src/index";
+import { caught, eventually } from "./helpers";
 
 const app = kinds(env.APP_DO);
 
 function rawStub(kind: "reminder" | "captured", name: string) {
   return env.APP_DO.get(app[kind].idFromName(name));
-}
-
-/** Polls until `ok` accepts the read value, or the deadline passes. */
-async function eventually<T>(
-  read: () => Promise<T>,
-  ok: (value: T) => boolean,
-  timeoutMs = 5000,
-): Promise<T> {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    const value = await read();
-    if (ok(value) || Date.now() > deadline) return value;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
 }
 
 describe("kind alarms", () => {
@@ -63,6 +50,30 @@ describe("kind alarms", () => {
     // native Durable Object.
     expect(fired.insideAlarm).toBeNull();
     expect(await reminder.alarmTime()).toBeNull();
+  });
+
+  it("retries a failed handler and reports isRetry", async () => {
+    const reminder = app.reminder.get("alarm-retry");
+    await reminder.failOnce();
+    await reminder.remindAt(Date.now() + 25, "second try");
+    const fired = (await eventually(
+      () => reminder.fired(),
+      (value) => value !== undefined,
+      10_000,
+    )) as { payload: string; isRetry: boolean };
+    expect(fired.payload).toBe("second try");
+    expect(fired.isRetry).toBe(true);
+    expect(await reminder.alarmTime()).toBeNull();
+  });
+
+  it("drops alarms of kinds without an alarm() handler, loudly", async () => {
+    const plain = app.plain.get("alarm-handlerless");
+    await plain.setAlarmAt(Date.now() + 25);
+    const remaining = await eventually(
+      () => plain.alarmTime(),
+      (value) => value === null,
+    );
+    expect(remaining).toBeNull();
   });
 
   it("keeps a guard-based periodic alarm chain alive", async () => {
@@ -174,6 +185,19 @@ describe("deleteAll semantics", () => {
     expect(await counter.listKvKeys()).toEqual(["__claydo"]);
   });
 
+  it("rejects direct writes to the reserved identity key", async () => {
+    const counter = app.counter.get("wipe-guarded");
+    for (const attempt of [
+      counter.deleteKv("__claydo"),
+      counter.putKv("__claydo", "overwritten"),
+    ]) {
+      const error = await caught(attempt);
+      expect((error as ClaydoError).code).toBe("CLAYDO_CONFIG");
+      expect(error.message).toContain("reserved");
+    }
+    expect(await counter.listKvKeys()).toEqual(["__claydo"]);
+  });
+
   it("does not leak claydo state into kind storage", async () => {
     const reminder = app.reminder.get("wipe-clean");
     await reminder.remindAt(Date.now() + 60_000, "x");
@@ -181,8 +205,8 @@ describe("deleteAll semantics", () => {
       rawStub("reminder", "wipe-clean"),
       async (_instance, ctx) => [...(await ctx.storage.list()).keys()],
     );
-    // Supervisor storage holds only the alarm entry; the payload lives in
-    // the kind's facet.
-    expect(keys).toEqual(["alarm:reminder"]);
+    // Supervisor storage holds only the alarm entry and the kind pin; the
+    // payload lives in the kind's facet.
+    expect(keys.sort()).toEqual(["alarm:reminder", "kind"]);
   });
 });

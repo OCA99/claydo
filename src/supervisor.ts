@@ -1,8 +1,11 @@
-import { claydoError, type ClaydoErrorCode } from "./errors";
+import { claydoError, claydoErrorStatus, isClaydoError } from "./errors";
 import {
+  INIT_HEADER,
   KIND_HEADER,
+  LEGACY_KIND_KEY,
+  parseKindPrefix,
   type AlarmInfo,
-  type FacetProps,
+  type FacetIdentity,
   type KindRegistry,
 } from "./types";
 
@@ -16,9 +19,16 @@ export interface UnionOptions {
    * minifier that renames classes.
    */
   name?: string;
+  /**
+   * Runs once after a kind instance is constructed, before it serves. By
+   * default claydo runs the instance's `__unsafe_ensureInitialized()`
+   * hook when one exists, which covers PartyServer and the Agents SDK.
+   * Set this option to adapt other frameworks with deferred setup.
+   */
+  onStart?: (instance: object) => void | Promise<void>;
 }
 
-/** The storage key that pins the kind of a unique-ID instance. */
+/** The storage key that pins the kind of an instance. */
 const KIND_KEY = "kind";
 
 /** The storage key prefix of one kind's scheduled alarm. */
@@ -26,9 +36,8 @@ const ALARM_PREFIX = "alarm:";
 
 /**
  * One kind's alarm entry. A plain number is a scheduled alarm. While the
- * kind's `alarm()` handler runs, the entry becomes a firing marker: the
- * kind's `getAlarm()` reads `null` during its own handler (native Durable
- * Object semantics), but the entry persists so a handler failure retries.
+ * kind's `alarm()` handler runs (and between platform retries after a
+ * handler failure), the entry is a firing marker.
  */
 type AlarmEntry = number | { time: number; firing: true };
 
@@ -47,7 +56,6 @@ export interface SupervisorInstance<R extends KindRegistry>
     args: unknown[],
     init: boolean,
   ): Promise<unknown>;
-  __claydoInit(kind: string): Promise<string>;
   __claydoSetAlarm(kind: string, time: number): Promise<void>;
   __claydoGetAlarm(
     kind: string,
@@ -83,10 +91,6 @@ interface OwnExportEntry {
   get?(id: DurableObjectId): unknown;
 }
 
-function hasOwn(record: object, key: string): boolean {
-  return Object.prototype.hasOwnProperty.call(record, key);
-}
-
 /**
  * The supervisor role of a union instance. It owns the instance's identity,
  * routes every interaction to the kind's facet, and multiplexes the
@@ -97,9 +101,10 @@ export class SupervisorCore {
   readonly #kinds: KindRegistry;
   readonly #options: UnionOptions;
   readonly #className: () => string;
-  #kind?: string;
   #kindLoading?: Promise<string>;
   readonly #facetClasses = new Map<string, unknown>();
+  /** Kinds whose alarm handler is running right now, in this isolate. */
+  readonly #firing = new Set<string>();
 
   constructor(
     ctx: DurableObjectState,
@@ -159,7 +164,7 @@ export class SupervisorCore {
             `{ name: "..." }.`,
         );
       }
-      const props: FacetProps = { claydoFacet: true, kind, host };
+      const props: FacetIdentity = { v: 1, kind, host };
       configured = entry({ props });
       this.#facetClasses.set(kind, configured);
     }
@@ -181,54 +186,71 @@ export class SupervisorCore {
   #kindFromName(): string | undefined {
     const name = this.#ctx.id.name;
     if (name === undefined) return undefined;
-    const separator = name.indexOf(":");
-    if (separator === -1) return undefined;
-    const prefix = name.slice(0, separator);
-    return hasOwn(this.#kinds, prefix) ? prefix : undefined;
+    const prefix = parseKindPrefix(name);
+    return prefix !== undefined && Object.hasOwn(this.#kinds, prefix)
+      ? prefix
+      : undefined;
   }
 
   /**
    * Resolves this instance's kind.
    *
-   * Named instances carry their kind in the name (`<kind>:<name>`), so
-   * the kind is derived on every request and no routing state is ever
-   * persisted. Unique-ID instances have no name to parse; their kind is
-   * pinned in storage once, at first contact, and is immutable for the
-   * instance's lifetime.
+   * Named instances carry their kind in the name (`<kind>:<name>`), which
+   * stays authoritative on every request; the kind is also pinned once in
+   * storage so ID-based access (`fromId()`) still resolves after the
+   * instance restarts without its name. Unique-ID instances have no name
+   * to parse; their kind is pinned at first contact. A pin is written
+   * once and is immutable for the instance's lifetime.
    */
   async #resolveKind(
     hint: string | undefined,
     init: boolean,
   ): Promise<string> {
-    if (this.#kind === undefined) {
-      this.#kindLoading ??= this.#initializeKind(hint, init).catch(
-        (error) => {
-          this.#kindLoading = undefined;
-          throw error;
-        },
-      );
-      this.#kind = await this.#kindLoading;
-    }
-    if (hint !== undefined && hint !== this.#kind) {
+    this.#kindLoading ??= this.#initializeKind(hint, init).catch((error) => {
+      this.#kindLoading = undefined;
+      throw error;
+    });
+    const kind = await this.#kindLoading;
+    if (hint !== undefined && hint !== kind) {
       throw claydoError(
         "CLAYDO_KIND_MISMATCH",
-        `instance '${this.#identity()}' is kind '${this.#kind}', but ` +
-          `the caller expected kind '${hint}'.`,
-        { actualKind: this.#kind, expectedKind: hint },
+        `instance '${this.#identity()}' is kind '${kind}', but the ` +
+          `caller expected kind '${hint}'.`,
+        { actualKind: kind, expectedKind: hint },
       );
     }
-    return this.#kind;
+    return kind;
   }
 
   async #initializeKind(
     hint: string | undefined,
     init: boolean,
   ): Promise<string> {
+    const persisted = await this.#ctx.storage.get<unknown>([
+      KIND_KEY,
+      LEGACY_KIND_KEY,
+    ]);
+    if (persisted.get(LEGACY_KIND_KEY) !== undefined) {
+      this.#config(
+        `instance '${this.#identity()}' holds data written by the claydo ` +
+          `0.1.x storage layout, which this version cannot serve. ` +
+          `Refusing instead of serving an empty instance. Keep the claydo ` +
+          `0.1.x dependency for this binding, or move the data before ` +
+          `upgrading.`,
+      );
+    }
+    const pinned = persisted.get(KIND_KEY) as string | undefined;
     const derived = this.#kindFromName();
-    if (derived !== undefined) return derived;
-    const pinned = await this.#ctx.storage.get<string>(KIND_KEY);
+    if (derived !== undefined) {
+      // The name stays authoritative; the pin is a write-once cache that
+      // lets fromId() resolve this instance after a nameless cold start.
+      if (pinned === undefined) {
+        await this.#ctx.storage.put(KIND_KEY, derived);
+      }
+      return derived;
+    }
     if (pinned !== undefined) {
-      if (!hasOwn(this.#kinds, pinned)) {
+      if (!Object.hasOwn(this.#kinds, pinned)) {
         throw claydoError(
           "CLAYDO_UNKNOWN_KIND",
           `instance '${this.#identity()}' is kind '${pinned}', which is ` +
@@ -241,7 +263,7 @@ export class SupervisorCore {
     if (hint === undefined || !init) {
       throw this.#noKindError(hint, init);
     }
-    if (!hasOwn(this.#kinds, hint)) {
+    if (!Object.hasOwn(this.#kinds, hint)) {
       throw claydoError(
         "CLAYDO_UNKNOWN_KIND",
         `unknown kind '${hint}'. Registered kinds: ` +
@@ -292,10 +314,6 @@ export class SupervisorCore {
     return this.#facet(resolved).__claydoCall(resolved, method, args, init);
   }
 
-  async init(kind: string): Promise<string> {
-    return this.#resolveKind(kind, true);
-  }
-
   async #assertKind(kind: string): Promise<void> {
     const resolved = await this.#resolveKind(undefined, false);
     if (kind !== resolved) {
@@ -326,7 +344,18 @@ export class SupervisorCore {
   async setKindAlarm(kind: string, time: number): Promise<void> {
     await this.#assertKind(kind);
     await this.#ctx.storage.transaction(async (txn) => {
-      await txn.put(`${ALARM_PREFIX}${kind}`, time);
+      const key = `${ALARM_PREFIX}${kind}`;
+      const current = await txn.get<AlarmEntry>(key);
+      // A firing marker outside the running handler is a failed delivery
+      // awaiting its platform retry. A new schedule must not erase that
+      // due work, so the earlier of the two times wins.
+      const value =
+        current !== undefined &&
+        typeof current !== "number" &&
+        !this.#firing.has(kind)
+          ? Math.min(current.time, time)
+          : time;
+      await txn.put(key, value);
       await this.#rearm(txn);
     });
   }
@@ -340,9 +369,11 @@ export class SupervisorCore {
       `${ALARM_PREFIX}${kind}`,
       alarmOptions,
     );
-    // A firing entry reads as no alarm: inside its own alarm() handler a
-    // kind sees `null`, exactly like a native Durable Object.
-    return entry === undefined || typeof entry !== "number" ? null : entry;
+    if (entry === undefined) return null;
+    if (typeof entry === "number") return entry;
+    // Native semantics: inside its own handler the fired alarm reads as
+    // consumed; between platform retries it reads as pending.
+    return this.#firing.has(kind) ? null : entry.time;
   }
 
   async deleteKindAlarm(kind: string): Promise<void> {
@@ -357,11 +388,10 @@ export class SupervisorCore {
    * Dispatches every due kind alarm, then re-arms the native alarm.
    *
    * Alarm delivery is at-least-once relative to the kind's data writes:
-   * a kind alarm entry is deleted only after the kind's `alarm()` handler
+   * a kind alarm entry is consumed only after the kind's `alarm()` handler
    * returns, and a handler failure keeps the entry and retries through
    * the platform's native retry. A handler that re-schedules its own
-   * alarm keeps the new time: the entry is deleted only when it still
-   * holds the time that just fired.
+   * alarm keeps the new time.
    */
   async alarm(alarmInfo?: AlarmInvocationInfo): Promise<void> {
     const entries = await this.#ctx.storage.list<AlarmEntry>({
@@ -374,7 +404,7 @@ export class SupervisorCore {
       .sort(([, a], [, b]) => a - b);
     for (const [key, time] of due) {
       const kind = key.slice(ALARM_PREFIX.length);
-      if (!hasOwn(this.#kinds, kind)) {
+      if (!Object.hasOwn(this.#kinds, kind)) {
         console.warn(
           `claydo: dropping an alarm for kind '${kind}', which is no ` +
             `longer in the registry.`,
@@ -383,16 +413,20 @@ export class SupervisorCore {
         continue;
       }
       // Mark the entry as firing before dispatch: the kind's own
-      // getAlarm() reads null while its handler runs. The entry itself
-      // persists, so a handler failure keeps the alarm and retries
-      // through the platform's native retry.
+      // getAlarm() reads null while its handler runs, and the entry
+      // itself persists so a handler failure retries.
       await this.#ctx.storage.put(key, { time, firing: true } as AlarmEntry);
       const info: AlarmInfo = {
         scheduledTime: time,
         isRetry: alarmInfo?.isRetry ?? false,
         retryCount: alarmInfo?.retryCount ?? 0,
       };
-      await this.#facet(kind).__claydoAlarm(info);
+      this.#firing.add(kind);
+      try {
+        await this.#facet(kind).__claydoAlarm(info);
+      } finally {
+        this.#firing.delete(kind);
+      }
       // Consume the firing marker only if the handler did not schedule a
       // new alarm (a re-schedule overwrites the entry with a number).
       await this.#ctx.storage.transaction(async (txn) => {
@@ -410,23 +444,30 @@ export class SupervisorCore {
   }
 
   async fetch(request: Request): Promise<Response> {
-    // The typed stub asserts its expected kind in a header, so a
-    // wrong-kind fetch fails exactly like a wrong-kind RPC call.
-    const hint = request.headers.get(KIND_HEADER) ?? undefined;
-    let kind: string;
     try {
-      kind = await this.#resolveKind(hint, false);
+      // The typed stub asserts its expected kind in a header, so a
+      // wrong-kind fetch fails exactly like a wrong-kind RPC call. A
+      // unique() stub also marks its first contact as init-capable, so
+      // pinning costs no extra round trip.
+      const hint = request.headers.get(KIND_HEADER) ?? undefined;
+      const init =
+        hint !== undefined && request.headers.get(INIT_HEADER) !== null;
+      const kind = await this.#resolveKind(hint, init);
+      // The headers are claydo transport, not part of the kind's request.
+      const forwarded = new Request(request);
+      forwarded.headers.delete(KIND_HEADER);
+      forwarded.headers.delete(INIT_HEADER);
+      return await this.#facet(kind).fetch(forwarded);
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      const code = (error as { code?: ClaydoErrorCode }).code;
-      const status =
-        code === "CLAYDO_UNINITIALIZED"
-          ? 404
-          : code === "CLAYDO_KIND_MISMATCH"
-            ? 409
-            : 500;
-      return new Response(message, { status });
+      // Claydo's own errors become structured HTTP responses; the kind's
+      // errors stay native rejections for the caller to handle.
+      if (isClaydoError(error)) {
+        return new Response(error.message, {
+          status: claydoErrorStatus(error.code),
+          headers: { "x-claydo-code": error.code },
+        });
+      }
+      throw error;
     }
-    return this.#facet(kind).fetch(request);
   }
 }

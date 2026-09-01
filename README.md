@@ -19,7 +19,7 @@ const room = app.chat.get("lobby");
 
 The class that `union()` returns plays one of two roles, selected once at construction. Addressed through the binding, it is a thin **supervisor**: it owns the instance's identity and its single native alarm. Started by that supervisor as a facet of the same instance, it is the kind's **facet host**: it runs the kind implementation against the facet's own database. One export covers both roles:
 
-- **Identity is the address.** A named instance is `<kind>:<name>`, so the supervisor derives the kind from the name on every request and persists no routing state. Only unique-ID instances (which have no name to parse) pin their kind in storage — written once at first contact, immutable afterwards.
+- **Identity is the address.** A named instance is `<kind>:<name>`, so the supervisor derives the kind from the name, which stays authoritative on every request. The kind is also pinned once at first contact — for named instances as a cache that lets ID-based access resolve after a nameless cold start, for unique-ID instances (which have no name to parse) as the identity itself. A pin is written once and is immutable.
 - **Storage is the kind's alone.** The facet's SQLite database and key-value store belong to the kind. `claydo` keeps exactly one reserved key-value key (`__claydo`, the facet's identity) and touches nothing else. `deleteAll()`, schema, and key naming are all yours.
 - **One consistency domain per instance.** The supervisor, its bookkeeping, and the kind's facet live inside one Durable Object. There is no cross-instance protocol anywhere in the library.
 - **Errors are native.** Kind methods throw across the stub exactly like Workers RPC: `name`, `message`, `stack`, and own fields such as `code` survive. `claydo`'s own errors carry a stable `code` for programmatic handling.
@@ -133,7 +133,7 @@ export class Checkout extends DurableObject<Env> {
 
 | Access | Instance | Kind resolution |
 | --- | --- | --- |
-| `app.counter.get("a")` | named `counter:a` | derived from the name, every request |
+| `app.counter.get("a")` | named `counter:a` | derived from the name, every request; pinned once as a cache for ID access |
 | `app.counter.unique()` | unique ID | pinned in storage at first contact, immutable |
 | `app.counter.fromId(id)` | existing instance | must already have a kind; never initializes |
 
@@ -172,7 +172,8 @@ async alarm(info?: AlarmInvocationInfo): Promise<void> {
 The contract:
 
 - **At-least-once, not exactly-once.** The alarm entry is consumed only after your `alarm()` handler returns. A handler failure keeps the entry and retries through the platform's native retry (`info.isRetry`, `info.retryCount`). Write handlers to tolerate replay.
-- **Native in-handler semantics.** Inside `alarm()`, `getAlarm()` reads `null` — the fired alarm is already consumed, exactly like a native Durable Object — so guard-based periodic chains (`if (await getAlarm() === null) setAlarm(next)`) work unchanged.
+- **Native in-handler semantics.** Inside `alarm()`, `getAlarm()` reads `null` — the fired alarm is already consumed, exactly like a native Durable Object — so guard-based periodic chains (`if (await getAlarm() === null) setAlarm(next)`) work unchanged. Between the retries of a failed handler, `getAlarm()` reads the pending time, and a `setAlarm()` in that window keeps the earlier of the two times, so the failed delivery is never silently erased.
+- **A kind that schedules alarms must define `alarm()`.** An alarm delivered to a kind without a handler is dropped with a loud log line.
 - **Re-scheduling inside the handler works.** A handler that calls `setAlarm()` keeps the new time.
 - **Scheduling is not atomic with your data writes.** Alarm state lives with the instance, outside the kind's database. The safe pattern is: persist the job first, then schedule; on fire, read the job and tolerate a replay. Alarm calls inside `storage.transaction()` or `storage.transactionSync()` throw `CLAYDO_ALARM_IN_TRANSACTION` instead of losing atomicity silently. The guard tracks open transactions, not call scope: an alarm call issued concurrently with an open transaction (for example through `Promise.all`) is also rejected — sequence the alarm call after the transaction commits.
 
@@ -219,7 +220,7 @@ try {
 }
 ```
 
-HTTP status codes from the supervisor's `fetch()`: `404` when the instance cannot resolve a kind, `409` when the stub's expected kind does not match the instance, `501` when the kind has no `fetch()` handler. The typed stub asserts its expected kind through one internal request header (`x-claydo-kind`), so a wrong-kind `fetch()` fails like a wrong-kind RPC call instead of reaching the other kind.
+On the `fetch()` path, claydo's own errors become structured responses: the status is `404` when the instance cannot resolve a kind, `409` when the stub's expected kind does not match the instance, and `500` for configuration errors; the `x-claydo-code` response header carries the error code, and kinds without a `fetch()` handler answer `501`. The kind's own errors stay native rejections. The typed stub asserts its expected kind through one internal request header, which the supervisor removes before the request reaches the kind, so a wrong-kind `fetch()` fails like a wrong-kind RPC call instead of reaching the other kind.
 
 Errors that carry non-cloneable own fields (an open socket, a function) still arrive: claydo drops only the fields that cannot cross the RPC hop and keeps the error's `name`, `message`, `stack`, and every cloneable field.
 
@@ -236,7 +237,7 @@ Two caveats, both from the kind-prefixed naming scheme:
 
 ### `union(kinds, options?)`
 
-Creates the union class from a registry of kind names to classes. Kind names must be non-empty, must not contain `:`, and must not start with `__`. Options: `name` overrides the class's export name. The class reserves `ctx.props` to select between its supervisor and facet roles; do not configure props on it.
+Creates the union class from a registry of kind names to classes. Kind names must be non-empty, must not contain `:`, and must not start with `__`. Options: `name` overrides the class's export name; `onStart` runs once after a kind instance is constructed (the default runs the `__unsafe_ensureInitialized()` hook that PartyServer and the Agents SDK use). The class reserves `ctx.props` to select between its supervisor and facet roles; do not configure props on it.
 
 ### `kinds(namespace)` / `kind(namespace, kindName)`
 
@@ -260,6 +261,7 @@ Type guard for claydo errors, and the constructor claydo uses internally (export
 - **Reserved names.** `ctx`, `env`, `id`, `name`, `kind`, `stub`, and `then` are stub metadata; `union()` rejects kinds that define them as methods. `fetch`, `alarm`, and the `webSocket*` handlers are lifecycle methods, invoked by the platform rather than the stub. Names starting with `__` are internal.
 - **Arguments and return values** must serialize under Workers RPC rules (structured clone plus RPC extensions).
 - **One kind per instance.** An instance's kind is fixed by its name or its first contact and never changes.
+- **One storage layout per major version.** An instance holding data written by the claydo 0.1.x layout fails with `CLAYDO_CONFIG` instead of serving an empty instance.
 
 ## Testing
 

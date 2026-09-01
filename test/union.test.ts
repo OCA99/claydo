@@ -1,19 +1,12 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import { readFacetIdentity } from "../src/facet";
 import { isClaydoError, kind, kinds, union } from "../src/index";
 import type { ClaydoError } from "../src/index";
 import { Counter } from "./fixtures/worker";
+import { caught } from "./helpers";
 
 const app = kinds(env.APP_DO);
-
-async function caught(promise: Promise<unknown>): Promise<ClaydoError> {
-  const error = await promise.then(
-    () => undefined,
-    (thrown: unknown) => thrown,
-  );
-  expect(error).toBeInstanceOf(Error);
-  return error as ClaydoError;
-}
 
 describe("RPC through the typed stub", () => {
   it("calls kind methods and returns their values", async () => {
@@ -74,13 +67,19 @@ describe("identity and isolation", () => {
     expect(await app.counter.get("iso-2").value()).toBe(0);
   });
 
-  it("persists no routing state for named instances", async () => {
-    await app.counter.get("iso-stateless").increment();
-    const raw = env.APP_DO.get(app.counter.idFromName("iso-stateless"));
+  it("pins the kind of named instances so fromId() survives restarts", async () => {
+    const named = app.counter.get("iso-pin");
+    await named.increment(3);
+    // The name stays authoritative, and the kind is also pinned once so
+    // an ID-based cold start (no name available) still resolves.
+    const raw = env.APP_DO.get(app.counter.idFromName("iso-pin"));
     const stored = await runInDurableObject(raw, (_instance, ctx) =>
       ctx.storage.get("kind"),
     );
-    expect(stored).toBeUndefined();
+    expect(stored).toBe("counter");
+    expect(
+      await app.counter.fromId(named.id.toString()).value(),
+    ).toBe(3);
   });
 });
 
@@ -179,15 +178,25 @@ describe("error fidelity across the stub", () => {
     expect(error.message).toContain("instance field");
   });
 
-  it("refuses reserved and internal method names", async () => {
+  it("answers reserved and internal names locally, without an RPC", async () => {
     const counter = app.counter.get("errors") as unknown as Record<
       string,
-      () => Promise<void>
+      unknown
     >;
-    for (const name of ["alarm", "webSocketMessage", "__claydoCall"]) {
-      const error = await caught(counter[name]!());
-      expect((error as ClaydoError).code).toBe("CLAYDO_NO_METHOD");
+    for (const name of [
+      "alarm",
+      "webSocketMessage",
+      "__claydoCall",
+      "toJSON",
+      "then",
+    ]) {
+      expect(counter[name]).toBeUndefined();
     }
+  });
+
+  it("survives JSON.stringify without firing an RPC", async () => {
+    const counter = app.counter.get("errors");
+    expect(() => JSON.stringify(counter)).not.toThrow();
   });
 
   it("fails when a return value cannot serialize", async () => {
@@ -202,6 +211,30 @@ describe("error fidelity across the stub", () => {
     expect(
       (error as unknown as { onRetry?: unknown }).onRetry,
     ).toBeUndefined();
+  });
+
+  it("delivers errors whose cause cannot serialize", async () => {
+    const error = await caught(app.vault.get("errors").openWithHostileCause());
+    expect(error.message).toBe("db down");
+  });
+
+  it("delivers non-Error throwables that cannot serialize", async () => {
+    const error = await caught(
+      app.vault.get("errors").openWithHostilePlainThrow(),
+    );
+    expect(error.message).toBeDefined();
+  });
+
+  it("adds call context to argument serialization failures", async () => {
+    class NotWireSafe {
+      x = 1;
+    }
+    const counter = app.counter.get("errors") as unknown as {
+      increment(bad: unknown): Promise<number>;
+    };
+    const error = await caught(counter.increment(new NotWireSafe()));
+    expect(error.message).toContain("counter.increment()");
+    expect(error.message).toMatch(/serial/i);
   });
 
   it("diagnoses accessor properties without invoking the getter", async () => {
@@ -238,6 +271,18 @@ describe("raw namespace access", () => {
     );
     expect((error as ClaydoError).code).toBe("CLAYDO_UNINITIALIZED");
     expect(error.message).toContain("kind() helper");
+  });
+});
+
+describe("storage layout protection", () => {
+  it("refuses instances holding the claydo 0.1.x layout", async () => {
+    const raw = env.APP_DO.get(app.counter.idFromName("legacy-1"));
+    await runInDurableObject(raw, (_instance, ctx) =>
+      ctx.storage.put("__claydo:kind", "counter"),
+    );
+    const error = await caught(app.counter.get("legacy-1").value());
+    expect((error as ClaydoError).code).toBe("CLAYDO_CONFIG");
+    expect(error.message).toContain("0.1.x");
   });
 });
 
@@ -283,8 +328,9 @@ describe("role selection", () => {
   it("rejects construction with props that claydo did not write", () => {
     for (const props of [
       { anything: true },
-      { claydoFacet: true },
-      { claydoFacet: true, kind: "counter" },
+      { v: 1 },
+      { v: 1, kind: "counter" },
+      { v: 2, kind: "counter", host: "AppDO" },
       "nonsense",
       42,
     ]) {
@@ -292,6 +338,41 @@ describe("role selection", () => {
         () => new Union({ props } as unknown as DurableObjectState, {}),
       ).toThrowError(/reserves ctx\.props/);
     }
+  });
+
+  it("restores the facet role from the persisted identity on a propless start", () => {
+    // Simulates a runtime wake that does not replay startup props: empty
+    // props, but the reserved key holds the identity written at first
+    // start. Role detection must select the facet role, marked persisted.
+    const identity = { v: 1, kind: "counter", host: "AppDO" };
+    const fakeCtx = {
+      props: {},
+      storage: {
+        kv: { get: (key: string) => (key === "__claydo" ? identity : undefined) },
+      },
+    } as unknown as DurableObjectState;
+    expect(readFacetIdentity(fakeCtx)).toEqual({
+      identity,
+      persisted: true,
+    });
+  });
+
+  it("selects the supervisor role when nothing is persisted", () => {
+    const fakeCtx = {
+      props: {},
+      storage: { kv: { get: () => undefined } },
+    } as unknown as DurableObjectState;
+    expect(readFacetIdentity(fakeCtx)).toBeUndefined();
+  });
+
+  it("explains a key-value storage backend misconfiguration", () => {
+    const fakeCtx = {
+      props: {},
+      storage: {},
+    } as unknown as DurableObjectState;
+    expect(() => readFacetIdentity(fakeCtx)).toThrowError(
+      /new_sqlite_classes/,
+    );
   });
 
   it("refuses facet-internal methods on a supervisor", async () => {

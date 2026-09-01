@@ -1,18 +1,14 @@
 import { DurableObject } from "cloudflare:workers";
 import { claydoError } from "./errors";
-import { FacetCore } from "./facet";
+import { FacetCore, readFacetIdentity } from "./facet";
 import {
   SupervisorCore,
   type SupervisorClass,
   type UnionOptions,
 } from "./supervisor";
 import {
-  FACET_IDENTITY_KEY,
-  isFacetIdentity,
-  isFacetProps,
   RESERVED_STUB_KEYS,
   type AlarmInfo,
-  type FacetProps,
   type KindRegistry,
 } from "./types";
 
@@ -44,36 +40,43 @@ export function union<R extends KindRegistry>(
     readonly #core: SupervisorCore | FacetCore;
 
     constructor(ctx: DurableObjectState, env: unknown) {
-      // Role selection happens exactly once, before any other code runs.
-      // No facet props: supervisor. Valid facet props: facet. Anything
-      // else is a configuration error, never a silent role guess.
-      const facetProps = readFacetProps(ctx);
+      // Role selection happens exactly once, before any other code runs:
+      // supervisor without a facet identity, facet with one (from props,
+      // or from the persisted record on a propless wake).
+      const role = readFacetIdentity(ctx);
       super(ctx, env);
       this.#core =
-        facetProps === undefined
+        role === undefined
           ? new SupervisorCore(ctx, kinds, options, () =>
               this.constructor.name,
             )
-          : new FacetCore(ctx, env, facetProps, kinds);
+          : new FacetCore(
+              ctx,
+              env,
+              role.identity,
+              role.persisted,
+              kinds,
+              options,
+            );
     }
 
-    #supervisor(method: string): SupervisorCore {
+    #supervisor(): SupervisorCore {
       if (!(this.#core instanceof SupervisorCore)) {
         throw claydoError(
           "CLAYDO_CONFIG",
-          `'${method}' is internal to claydo and is not available on a ` +
-            `kind facet.`,
+          "this method is internal to claydo and is not available on a " +
+            "kind facet.",
         );
       }
       return this.#core;
     }
 
-    #facet(method: string): FacetCore {
+    #facet(): FacetCore {
       if (!(this.#core instanceof FacetCore)) {
         throw claydoError(
           "CLAYDO_CONFIG",
-          `'${method}' is internal to claydo and is not available on a ` +
-            `supervisor.`,
+          "this method is internal to claydo and is not available on a " +
+            "supervisor.",
         );
       }
       return this.#core;
@@ -85,35 +88,26 @@ export function union<R extends KindRegistry>(
       args: unknown[],
       init: boolean,
     ): Promise<unknown> {
-      return this.#core instanceof FacetCore
-        ? this.#core.call(kind, method, args)
-        : this.#core.call(kind, method, args, init);
-    }
-
-    async __claydoInit(kind: string): Promise<string> {
-      return this.#supervisor("__claydoInit").init(kind);
+      return this.#core.call(kind, method, args, init);
     }
 
     async __claydoSetAlarm(kind: string, time: number): Promise<void> {
-      return this.#supervisor("__claydoSetAlarm").setKindAlarm(kind, time);
+      return this.#supervisor().setKindAlarm(kind, time);
     }
 
     async __claydoGetAlarm(
       kind: string,
       options?: DurableObjectGetAlarmOptions,
     ): Promise<number | null> {
-      return this.#supervisor("__claydoGetAlarm").getKindAlarm(
-        kind,
-        options,
-      );
+      return this.#supervisor().getKindAlarm(kind, options);
     }
 
     async __claydoDeleteAlarm(kind: string): Promise<void> {
-      return this.#supervisor("__claydoDeleteAlarm").deleteKindAlarm(kind);
+      return this.#supervisor().deleteKindAlarm(kind);
     }
 
     async __claydoAlarm(info: AlarmInfo): Promise<void> {
-      return this.#facet("__claydoAlarm").deliverAlarm(info);
+      return this.#facet().deliverAlarm(info);
     }
 
     async fetch(request: Request): Promise<Response> {
@@ -123,7 +117,7 @@ export function union<R extends KindRegistry>(
     async alarm(alarmInfo?: AlarmInvocationInfo): Promise<void> {
       // A facet has no native alarm; the supervisor delivers kind alarms
       // through __claydoAlarm.
-      return this.#supervisor("alarm").alarm(alarmInfo);
+      return this.#supervisor().alarm(alarmInfo);
     }
 
     async webSocketMessage(
@@ -171,38 +165,6 @@ export function union<R extends KindRegistry>(
   }
 
   return ClaydoUnion as unknown as SupervisorClass<R>;
-}
-
-/**
- * Interprets the props of a starting instance. Returns the facet props, or
- * `undefined` for the supervisor role.
- *
- * The runtime gives unconfigured instances an empty props object, so
- * absent, null, and empty props normally mean supervisor. Empty props on
- * an instance whose storage holds a persisted facet identity mean the
- * runtime started an existing facet without replaying its startup props
- * (for example on a hibernation wake); the identity restores the facet
- * role. Props that claydo did not write are a configuration error, never
- * a silent role guess.
- */
-function readFacetProps(ctx: DurableObjectState): FacetProps | undefined {
-  const props = (ctx as { props?: unknown }).props;
-  const empty =
-    props === undefined ||
-    props === null ||
-    (typeof props === "object" && Object.keys(props).length === 0);
-  if (empty) {
-    const identity = ctx.storage.kv.get<unknown>(FACET_IDENTITY_KEY);
-    return isFacetIdentity(identity)
-      ? { claydoFacet: true, kind: identity.kind, host: identity.host }
-      : undefined;
-  }
-  if (isFacetProps(props)) return props;
-  throw claydoError(
-    "CLAYDO_CONFIG",
-    "the union class reserves ctx.props to select between its supervisor " +
-      "and facet roles. Do not configure props on this class.",
-  );
 }
 
 function validateRegistry(kinds: KindRegistry): void {
