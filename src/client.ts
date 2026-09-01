@@ -3,7 +3,13 @@ import type {
   GenericDurableObjectInstance,
   WireError,
 } from "./host";
-import { KIND_HEADER, NO_INIT_HEADER, type KindRegistry } from "./types";
+import {
+  KIND_HEADER,
+  NO_INIT_HEADER,
+  type KindRegistry,
+  type ReservedLifecycleMethod,
+  type ReservedStubKey,
+} from "./types";
 
 /**
  * Keys that are not exposed as RPC methods on the typed stub: lifecycle
@@ -11,23 +17,14 @@ import { KIND_HEADER, NO_INIT_HEADER, type KindRegistry } from "./types";
  * classes that define the metadata keys as methods).
  */
 type ReservedKey =
-  | "ctx"
-  | "env"
-  | "fetch"
-  | "alarm"
-  | "webSocketMessage"
-  | "webSocketClose"
-  | "webSocketError"
-  | "id"
-  | "name"
-  | "kind"
-  | "stub"
-  | "then"
+  | ReservedLifecycleMethod
+  | ReservedStubKey
   | `__${string}`;
 
 /**
- * A typed stub for one kind instance. Every public method of the kind class
- * becomes an async method on the stub.
+ * A typed stub for one kind instance. Public prototype methods become async
+ * stub methods. TypeScript cannot distinguish prototype methods from
+ * function-valued instance fields; the runtime rejects the latter.
  */
 export type KindStub<T> = {
   [K in Exclude<keyof T, ReservedKey | symbol | number> as T[K] extends (

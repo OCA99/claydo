@@ -169,8 +169,8 @@ describe("non-method members and reserved-name shadowing", () => {
     }
     expect(() => union({ bad: BadKind })).toThrowError(
       "claydo: kind 'bad' (class BadKind) defines a method " +
-        "named 'name'. The stub reserves 'id', 'name', 'kind', 'stub' for " +
-        "metadata, so this method would not be callable. Rename the method.",
+        "named 'name'. The stub reserves that name for metadata or control " +
+        "flow, so the method would not be callable. Rename it.",
     );
   });
 

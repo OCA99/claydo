@@ -7,6 +7,7 @@ import {
   type ExportChunk,
   type ImportAck,
   type ImportBegin,
+  type ImportLimits,
   type ImportState,
   type ImportStatus,
   type SqlValue,
@@ -18,20 +19,14 @@ import {
   KIND_HEADER,
   KIND_STORAGE_KEY,
   NO_INIT_HEADER,
+  RESERVED_LIFECYCLE_METHODS,
+  RESERVED_STUB_KEYS,
   type ClaydoFacetProps,
   type KindHandlers,
   type KindRegistry,
 } from "./types";
 
-const RESERVED_METHODS = new Set([
-  "constructor",
-  "fetch",
-  "alarm",
-  "webSocketMessage",
-  "webSocketClose",
-  "webSocketError",
-]);
-const RESERVED_STUB_KEYS = ["id", "name", "kind", "stub"] as const;
+const RESERVED_METHODS = new Set<string>(RESERVED_LIFECYCLE_METHODS);
 
 /** A serializable error snapshot carried through the claydo RPC envelope. */
 export interface WireError {
@@ -90,6 +85,7 @@ type AlarmInfoWire = Pick<
 
 const IMPORT_FACET_PREFIX = "import:";
 const IMPORT_RECEIPT_KEY = "__claydo:import-receipt";
+const RESET_STATE_KEY = "__claydo:reset";
 
 interface ImportReceipt {
   kind: string;
@@ -97,6 +93,10 @@ interface ImportReceipt {
   seq: number;
   applied: { kv: number; rows: Record<string, number> };
   cleanupPending: boolean;
+}
+
+interface ResetState {
+  kinds: string[];
 }
 
 function importFacetName(kind: string): string {
@@ -141,6 +141,7 @@ export interface GenericDurableObjectInstance<R extends KindRegistry>
     kind: string,
     token: string,
     secret?: string,
+    limits?: ImportLimits,
   ): Promise<ImportBegin>;
   __claydoImport(
     kind: string,
@@ -288,6 +289,12 @@ export function union<R extends KindRegistry>(
       return this.#namedFacet(kind, importFacetName(kind));
     }
 
+    #deleteKindFacets(kind: string): void {
+      const facets = this.#facets();
+      facets.delete(kindFacetName(kind));
+      facets.delete(importFacetName(kind));
+    }
+
     #kindFromName(): string | undefined {
       const name = this.ctx.id.name;
       if (name === undefined) return undefined;
@@ -330,9 +337,11 @@ export function union<R extends KindRegistry>(
       hint: string | undefined,
       allowInit: boolean,
     ): Promise<string> {
+      await this.#recoverReset();
       const persisted = await this.ctx.storage.get<unknown>([
         KIND_STORAGE_KEY,
         IMPORT_STATE_KEY,
+        IMPORT_RECEIPT_KEY,
       ]);
       const importing = persisted.get(IMPORT_STATE_KEY) as
         | ImportState
@@ -362,6 +371,11 @@ export function union<R extends KindRegistry>(
       }
       if (stored === undefined) {
         await this.ctx.storage.put(KIND_STORAGE_KEY, kind);
+      } else {
+        await this.#cleanupImportArtifacts(
+          kind,
+          persisted.get(IMPORT_RECEIPT_KEY) as ImportReceipt | undefined,
+        );
       }
       return kind;
     }
@@ -415,10 +429,7 @@ export function union<R extends KindRegistry>(
             `${Object.keys(kinds).join(", ")}.`,
         );
       }
-      // A crash after supervisor publication can leave the staging
-      // checkpoint in the cloned live facet. Remove it before user code can
-      // observe storage.
-      this.ctx.storage.kv.delete(IMPORT_CHECKPOINT_KEY);
+      const adaptedContext = facetContext(this.ctx, this.#facetProps!);
       const impl = new Kind(this.ctx, this.env) as object & KindHandlers;
       // Recommended claydo kinds already receive this context from their
       // base class. Reinstalling it also makes normal DurableObject and
@@ -426,7 +437,7 @@ export function union<R extends KindRegistry>(
       // constructor has completed.
       try {
         Object.defineProperty(impl, "ctx", {
-          value: facetContext(this.ctx, this.#facetProps!),
+          value: adaptedContext,
           writable: true,
           configurable: true,
         });
@@ -613,6 +624,7 @@ export function union<R extends KindRegistry>(
 
     async __claydoImportStatus(secret?: string): Promise<ImportStatus> {
       this.#checkMigrationAuth(secret);
+      await this.#recoverReset();
       const persisted = await this.ctx.storage.get<unknown>([
         KIND_STORAGE_KEY,
         IMPORT_STATE_KEY,
@@ -624,15 +636,8 @@ export function union<R extends KindRegistry>(
       const receipt = persisted.get(IMPORT_RECEIPT_KEY) as
         | ImportReceipt
         | undefined;
-      if (
-        kind !== undefined &&
-        state === undefined &&
-        receipt?.cleanupPending === true
-      ) {
-        await this.#facet(kind).__claydoRemoveImportCheckpoint();
-        this.#facets().delete(importFacetName(kind));
-        receipt.cleanupPending = false;
-        await this.ctx.storage.put(IMPORT_RECEIPT_KEY, receipt);
+      if (kind !== undefined && state === undefined) {
+        await this.#cleanupImportArtifacts(kind, receipt);
       }
       return {
         kind,
@@ -647,13 +652,29 @@ export function union<R extends KindRegistry>(
       };
     }
 
+    async #cleanupImportArtifacts(
+      kind: string,
+      receipt: ImportReceipt | undefined,
+    ): Promise<void> {
+      if (receipt?.cleanupPending !== true) return;
+      await this.#facet(kind).__claydoRemoveImportCheckpoint();
+      this.#facets().delete(importFacetName(kind));
+      receipt.cleanupPending = false;
+      await this.ctx.storage.put(IMPORT_RECEIPT_KEY, receipt);
+    }
+
     async __claydoBeginImport(
       kind: string,
       token: string,
       secret?: string,
+      limits: ImportLimits = {
+        maxRows: 500,
+        maxBytes: 256 * 1024,
+      },
     ): Promise<ImportBegin> {
       this.#checkMigrationAuth(secret);
       this.#checkImportEnabled(kind);
+      await this.#recoverReset();
       const persisted = await this.ctx.storage.get<unknown>([
         KIND_STORAGE_KEY,
         IMPORT_STATE_KEY,
@@ -693,23 +714,33 @@ export function union<R extends KindRegistry>(
           seq: state.seq,
           cursor: state.cursor,
           resumed: state.seq > 0,
+          limits: state.limits,
+          restartRequired: state.restartRequired,
         };
       }
       // A previous failed import may have left an unreferenced facet after a
       // runtime interruption. Facet deletion is isolated and cannot touch
       // supervisor metadata or another kind.
-      this.#facets().delete(kindFacetName(kind));
-      this.#facets().delete(importFacetName(kind));
+      this.#deleteKindFacets(kind);
       const fresh: ImportState = {
         kind,
         seq: 0,
         cursor: null,
         applied: { kv: 0, rows: {} },
         token,
+        limits,
+        restartRequired: false,
         updatedAtMs: Date.now(),
       };
       await this.ctx.storage.put(IMPORT_STATE_KEY, fresh);
-      return { ok: true, seq: 0, cursor: null, resumed: false };
+      return {
+        ok: true,
+        seq: 0,
+        cursor: null,
+        resumed: false,
+        limits,
+        restartRequired: false,
+      };
     }
 
     async __claydoImport(
@@ -772,8 +803,11 @@ export function union<R extends KindRegistry>(
         );
       }
       if (state.kind !== kind || state.token !== token) {
-        throw new Error(
-          `claydo: this import is owned by another migration driver.`,
+        throw Object.assign(
+          new Error(
+            `claydo: this import is owned by another migration driver.`,
+          ),
+          { code: "CLAYDO_IMPORT_OWNED" },
         );
       }
       if (seq <= state.seq) {
@@ -786,10 +820,21 @@ export function union<R extends KindRegistry>(
         );
       }
 
-      const facetApplied = await this.#importFacet(kind).__claydoApplyImport(
-        chunk,
-        seq,
-      );
+      let facetApplied: boolean;
+      try {
+        facetApplied = await this.#importFacet(kind).__claydoApplyImport(
+          chunk,
+          seq,
+        );
+      } catch (error) {
+        if (chunk.cursor === null) {
+          state.restartRequired = true;
+          state.cursor = null;
+          state.updatedAtMs = Date.now();
+          await this.ctx.storage.put(IMPORT_STATE_KEY, state);
+        }
+        throw error;
+      }
       if (chunk.rows !== undefined) {
         state.applied.rows[chunk.rows.table] =
           (state.applied.rows[chunk.rows.table] ?? 0) +
@@ -869,13 +914,15 @@ export function union<R extends KindRegistry>(
       const state = await this.ctx.storage.get<ImportState>(IMPORT_STATE_KEY);
       if (state === undefined) return false;
       if (state.token !== token) {
-        throw new Error(
-          `claydo: cannot abort an import owned by another migration driver. ` +
-            `Use wipeTarget() to force.`,
+        throw Object.assign(
+          new Error(
+            `claydo: cannot abort an import owned by another migration driver. ` +
+              `Use wipeTarget() to force.`,
+          ),
+          { code: "CLAYDO_IMPORT_OWNED" },
         );
       }
-      this.#facets().delete(kindFacetName(state.kind));
-      this.#facets().delete(importFacetName(state.kind));
+      this.#deleteKindFacets(state.kind);
       await this.ctx.storage.delete(IMPORT_STATE_KEY);
       await this.ctx.storage.deleteAlarm();
       return true;
@@ -907,18 +954,30 @@ export function union<R extends KindRegistry>(
         | ImportState
         | undefined;
       const nameKind = this.#kindFromName();
-      for (const kind of new Set(
+      const resetKinds = [...new Set(
         [pinned, importing?.kind, nameKind].filter(
           (value): value is string => value !== undefined,
         ),
-      )) {
-        this.#facets().delete(kindFacetName(kind));
-        this.#facets().delete(importFacetName(kind));
-      }
-      await this.ctx.storage.deleteAll();
-      await this.ctx.storage.deleteAlarm();
+      )];
+      await this.ctx.storage.transaction(async (txn) => {
+        await txn.put(RESET_STATE_KEY, { kinds: resetKinds } satisfies ResetState);
+        await txn.deleteAlarm();
+      });
+      await this.#recoverReset();
       this.#kind = undefined;
       this.#kindLoading = undefined;
+    }
+
+    async #recoverReset(): Promise<boolean> {
+      const reset = await this.ctx.storage.get<ResetState>(RESET_STATE_KEY);
+      if (reset === undefined) return false;
+      for (const kind of reset.kinds) {
+        this.#deleteKindFacets(kind);
+      }
+      await this.ctx.storage.deleteAll();
+      this.#kind = undefined;
+      this.#kindLoading = undefined;
+      return true;
     }
 
     async __claydoApplyImport(
@@ -1030,14 +1089,20 @@ export function union<R extends KindRegistry>(
 
     async fetch(request: Request): Promise<Response> {
       if (this.#facetProps !== undefined) {
-        const impl = await this.#loadImpl();
-        if (typeof impl.fetch !== "function") {
-          return new Response(
-            `claydo: kind '${this.#facetProps.kind}' does not implement fetch().`,
-            { status: 501 },
-          );
+        try {
+          const impl = await this.#loadImpl();
+          if (typeof impl.fetch !== "function") {
+            return new Response(
+              `claydo: kind '${this.#facetProps.kind}' does not implement fetch().`,
+              { status: 501 },
+            );
+          }
+          return await impl.fetch(request);
+        } catch (error) {
+          const message =
+            error instanceof Error ? error.message : String(error);
+          return new Response(message, { status: 500 });
         }
-        return impl.fetch(request);
       }
       let kind: string;
       try {
@@ -1115,6 +1180,7 @@ export function union<R extends KindRegistry>(
         await this.__claydoAlarm(alarmInfo);
         return;
       }
+      if (await this.#recoverReset()) return;
       const kind = await this.#resolveKind();
       await this.#facet(kind).__claydoAlarm(
         alarmInfo === undefined
@@ -1198,9 +1264,8 @@ function validateRegistry(kinds: KindRegistry): void {
         if (descriptor && typeof descriptor.value === "function") {
           throw new Error(
             `claydo: kind '${name}' (class ${Kind.name}) defines a method ` +
-              `named '${key}'. The stub reserves ` +
-              `'${RESERVED_STUB_KEYS.join("', '")}' for metadata, so this ` +
-              `method would not be callable. Rename the method.`,
+              `named '${key}'. The stub reserves that name for metadata or ` +
+              `control flow, so the method would not be callable. Rename it.`,
           );
         }
       }

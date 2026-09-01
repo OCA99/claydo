@@ -31,6 +31,12 @@ export const SEALED_HEADER = "x-claydo-sealed";
  */
 export const IMPORT_STALE_MS = 30_000;
 
+/** Export page limits persisted with an import reservation. */
+export interface ImportLimits {
+  maxRows: number;
+  maxBytes: number;
+}
+
 /** A value that SQLite can hold. */
 export type SqlValue = null | number | string | ArrayBuffer;
 
@@ -80,6 +86,9 @@ export interface ImportState {
   applied: { kv: number; rows: Record<string, number> };
   /** The driver that owns this import. Chunks from other drivers fail. */
   token: string;
+  limits: ImportLimits;
+  /** Final verification failed; adoption must discard staging and restart. */
+  restartRequired: boolean;
   /** Refreshed on every chunk; used for stale-import adoption. */
   updatedAtMs: number;
 }
@@ -99,6 +108,8 @@ export type ImportBegin =
       cursor: ExportCursor | null;
       /** True when this call adopted an existing (stale or own) import. */
       resumed: boolean;
+      limits: ImportLimits;
+      restartRequired: boolean;
     }
   | {
       ok: false;

@@ -81,9 +81,21 @@ export class Echo extends DurableObject<Env> {
 
 /** A kind that uses alarms. */
 export class Reminder extends DurableObject<Env> {
+  readonly #capturedStorage: DurableObjectStorage;
+
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    this.#capturedStorage = ctx.storage;
+  }
+
   async remind(text: string): Promise<void> {
     await this.ctx.storage.put("text", text);
     await this.ctx.storage.setAlarm(Date.now() + 60_000);
+  }
+
+  async remindThroughCapturedStorage(text: string): Promise<void> {
+    await this.#capturedStorage.put("text", text);
+    await this.#capturedStorage.setAlarm(Date.now() + 60_000);
   }
 
   async alarm(info?: AlarmInvocationInfo): Promise<void> {
@@ -128,6 +140,12 @@ export class Reminder extends DurableObject<Env> {
     });
   }
 
+  async outerAlarmInsideTransaction(): Promise<void> {
+    await this.ctx.storage.transaction(async () => {
+      await this.ctx.storage.setAlarm(Date.now() + 60_000);
+    });
+  }
+
   alarmInsideSyncTransaction(): void {
     this.ctx.storage.transactionSync(() => {
       void this.ctx.storage.setAlarm(Date.now() + 60_000);
@@ -168,6 +186,13 @@ export class Teapot extends DurableObject<Env> {
       },
     });
     throw error;
+  }
+}
+
+export class BrokenConstructor extends DurableObject<Env> {
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    throw new Error("broken constructor");
   }
 }
 
@@ -481,6 +506,7 @@ export class AppDO extends union(
     reminder: Reminder,
     plain: Plain,
     teapot: Teapot,
+    brokenConstructor: BrokenConstructor,
     vault: Vault,
     party: PartyRoom,
     tally: Tally,

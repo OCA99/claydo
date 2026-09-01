@@ -20,6 +20,29 @@ export type KindClass = new (ctx: DurableObjectState, env: any) => object;
  */
 export type KindRegistry = Record<string, KindClass>;
 
+export const RESERVED_LIFECYCLE_METHODS = [
+  "constructor",
+  "fetch",
+  "alarm",
+  "webSocketMessage",
+  "webSocketClose",
+  "webSocketError",
+] as const;
+
+export const RESERVED_STUB_KEYS = [
+  "ctx",
+  "env",
+  "id",
+  "name",
+  "kind",
+  "stub",
+  "then",
+] as const;
+
+export type ReservedLifecycleMethod =
+  (typeof RESERVED_LIFECYCLE_METHODS)[number];
+export type ReservedStubKey = (typeof RESERVED_STUB_KEYS)[number];
+
 /** The header that carries the kind hint on `fetch()` calls to the stub. */
 export const KIND_HEADER = "x-claydo-kind";
 
@@ -78,8 +101,9 @@ interface LoopbackHostNamespace {
  */
 async function deleteAllFacetStorage(
   storage: DurableObjectStorage,
+  transactionSync: <T>(closure: () => T) => T,
 ): Promise<void> {
-  storage.transactionSync(() => {
+  transactionSync(() => {
     // Defers FK checks until commit, after every user table is gone. The
     // whole reset rolls back if any drop fails; partial destruction is not
     // observable.
@@ -104,6 +128,8 @@ async function deleteAllFacetStorage(
   });
 }
 
+const facetContexts = new WeakMap<DurableObjectState, DurableObjectState>();
+
 /**
  * Gives a facet-hosted kind the normal Durable Object alarm API even though
  * native facet alarms are not implemented yet. Alarm state stays in the
@@ -113,6 +139,8 @@ export function facetContext(
   ctx: DurableObjectState,
   props: ClaydoFacetProps,
 ): DurableObjectState {
+  const cached = facetContexts.get(ctx);
+  if (cached !== undefined) return cached;
   const exported = (ctx.exports as unknown as Record<string, unknown>)[
     props.hostExport
   ] as LoopbackHostNamespace | undefined;
@@ -127,8 +155,19 @@ export function facetContext(
     );
   }
   const host = exported.get(ctx.id);
+  const nativeTransaction = ctx.storage.transaction.bind(ctx.storage);
+  const nativeTransactionSync =
+    ctx.storage.transactionSync.bind(ctx.storage);
+  let asyncTransactionDepth = 0;
   let syncTransactionDepth = 0;
-  const assertAlarmOutsideSyncTransaction = (): void => {
+  const assertAlarmOutsideTransaction = (): void => {
+    if (asyncTransactionDepth > 0) {
+      throw new Error(
+        "claydo: alarm operations inside storage.transaction() cannot be " +
+          "atomic across facet and supervisor storage. Commit the " +
+          "transaction, then call the alarm method.",
+      );
+    }
     if (syncTransactionDepth > 0) {
       throw new Error(
         "claydo: alarm operations inside storage.transactionSync() cannot " +
@@ -137,98 +176,117 @@ export function facetContext(
       );
     }
   };
+  const setAlarm = (
+    scheduledTime: number | Date,
+    options?: DurableObjectSetAlarmOptions,
+  ): Promise<void> => {
+    assertAlarmOutsideTransaction();
+    const timestamp =
+      scheduledTime instanceof Date ? scheduledTime.getTime() : scheduledTime;
+    return host.__claydoSetAlarm(props.kind, timestamp, options);
+  };
+  const getAlarm = (
+    options?: DurableObjectGetAlarmOptions,
+  ): Promise<number | null> => {
+    assertAlarmOutsideTransaction();
+    return host.__claydoGetAlarm(props.kind, options);
+  };
+  const deleteAlarm = (
+    options?: DurableObjectSetAlarmOptions,
+  ): Promise<void> => {
+    assertAlarmOutsideTransaction();
+    return host.__claydoDeleteAlarm(props.kind, options);
+  };
+  const transaction = <T>(
+    closure: (txn: DurableObjectTransaction) => Promise<T>,
+  ): Promise<T> =>
+    nativeTransaction(async (txn) => {
+      asyncTransactionDepth += 1;
+      try {
+        return await closure(
+          new Proxy(txn, {
+            get(transactionTarget, property) {
+              if (
+                property === "setAlarm" ||
+                property === "getAlarm" ||
+                property === "deleteAlarm"
+              ) {
+                return (): never => {
+                  throw new Error(
+                    "claydo: alarm operations inside storage.transaction() " +
+                      "cannot be atomic across facet and supervisor storage. " +
+                      "Commit the transaction, then call the alarm method.",
+                  );
+                };
+              }
+              const value = Reflect.get(
+                transactionTarget,
+                property,
+                transactionTarget,
+              );
+              return typeof value === "function"
+                ? value.bind(transactionTarget)
+                : value;
+            },
+          }),
+        );
+      } finally {
+        asyncTransactionDepth -= 1;
+      }
+    });
+  const transactionSync = <T>(closure: () => T): T =>
+    nativeTransactionSync(() => {
+      syncTransactionDepth += 1;
+      try {
+        return closure();
+      } finally {
+        syncTransactionDepth -= 1;
+      }
+    });
+  const deleteAll = (): Promise<void> =>
+    deleteAllFacetStorage(ctx.storage, nativeTransactionSync);
+  const boundStorage = new Map<PropertyKey, unknown>();
   const storage = new Proxy(ctx.storage, {
     get(target, property) {
-      if (property === "setAlarm") {
-        return (
-          scheduledTime: number | Date,
-          options?: DurableObjectSetAlarmOptions,
-        ): Promise<void> => {
-          assertAlarmOutsideSyncTransaction();
-          const timestamp =
-            scheduledTime instanceof Date
-              ? scheduledTime.getTime()
-              : scheduledTime;
-          return host.__claydoSetAlarm(props.kind, timestamp, options);
-        };
-      }
-      if (property === "getAlarm") {
-        return (
-          options?: DurableObjectGetAlarmOptions,
-        ): Promise<number | null> => {
-          assertAlarmOutsideSyncTransaction();
-          return host.__claydoGetAlarm(props.kind, options);
-        };
-      }
-      if (property === "deleteAlarm") {
-        return (
-          options?: DurableObjectSetAlarmOptions,
-        ): Promise<void> => {
-          assertAlarmOutsideSyncTransaction();
-          return host.__claydoDeleteAlarm(props.kind, options);
-        };
-      }
-      if (property === "transaction") {
-        return <T>(
-          closure: (txn: DurableObjectTransaction) => Promise<T>,
-        ): Promise<T> =>
-          target.transaction((txn) =>
-            closure(
-              new Proxy(txn, {
-                get(transaction, transactionProperty) {
-                  if (
-                    transactionProperty === "setAlarm" ||
-                    transactionProperty === "getAlarm" ||
-                    transactionProperty === "deleteAlarm"
-                  ) {
-                    return (): never => {
-                      throw new Error(
-                        "claydo: alarm operations inside storage.transaction() " +
-                          "cannot be atomic across facet and supervisor storage. " +
-                          "Commit the transaction, then call the alarm method.",
-                      );
-                    };
-                  }
-                  const value = Reflect.get(
-                    transaction,
-                    transactionProperty,
-                    transaction,
-                  );
-                  return typeof value === "function"
-                    ? value.bind(transaction)
-                    : value;
-                },
-              }),
-            ),
-          );
-      }
-      if (property === "transactionSync") {
-        return <T>(closure: () => T): T =>
-          target.transactionSync(() => {
-            syncTransactionDepth += 1;
-            try {
-              return closure();
-            } finally {
-              syncTransactionDepth -= 1;
-            }
-          });
-      }
-      if (property === "deleteAll") {
-        return async (): Promise<void> => {
-          await deleteAllFacetStorage(target);
-        };
-      }
+      if (property === "setAlarm") return setAlarm;
+      if (property === "getAlarm") return getAlarm;
+      if (property === "deleteAlarm") return deleteAlarm;
+      if (property === "transaction") return transaction;
+      if (property === "transactionSync") return transactionSync;
+      if (property === "deleteAll") return deleteAll;
+      if (boundStorage.has(property)) return boundStorage.get(property);
       const value = Reflect.get(target, property, target);
-      return typeof value === "function" ? value.bind(target) : value;
+      const result = typeof value === "function" ? value.bind(target) : value;
+      boundStorage.set(property, result);
+      return result;
     },
   }) as DurableObjectStorage;
-  return new Proxy(ctx, {
+  const boundContext = new Map<PropertyKey, unknown>();
+  const context = new Proxy(ctx, {
     get(target, property) {
       if (property === "storage") return storage;
+      if (boundContext.has(property)) return boundContext.get(property);
       const value = Reflect.get(target, property, target);
-      return typeof value === "function" ? value.bind(target) : value;
+      const result = typeof value === "function" ? value.bind(target) : value;
+      boundContext.set(property, result);
+      return result;
     },
   }) as DurableObjectState;
+  for (const property of [
+    "setAlarm",
+    "getAlarm",
+    "deleteAlarm",
+    "transaction",
+    "transactionSync",
+    "deleteAll",
+  ] as const) {
+    Object.defineProperty(ctx.storage, property, {
+      value: Reflect.get(storage, property),
+      configurable: true,
+    });
+  }
+  facetContexts.set(ctx, context);
+  return context;
 }
 
 /**

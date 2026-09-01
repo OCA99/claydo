@@ -272,8 +272,8 @@ describeHosted("library behaviors", () => {
     }
     expect(() => union({ bad: Bad })).toThrow(
       "claydo: kind 'bad' (class Bad) defines a method " +
-        "named 'name'. The stub reserves 'id', 'name', 'kind', 'stub' for " +
-        "metadata, so this method would not be callable. Rename the method.",
+        "named 'name'. The stub reserves that name for metadata or control " +
+        "flow, so the method would not be callable. Rename it.",
     );
     class Fine {
       get name(): string {

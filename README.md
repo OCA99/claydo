@@ -449,7 +449,8 @@ const tally = migrated(env.OLD_TALLY, kinds(env.APP_DO).tally, {
 - `lazy`: migrate an old instance on first touch.
 - `manual`: route old until an external driver moves it.
 - `drain`: never migrate existing data; new names use the kind.
-- `resolve(name)`: read-only `"old" | "new"` routing probe.
+- `resolve(name)`: read-only status probe returning `"old"`, `"new"`,
+  `"importing"`, `"stalled"`, or `"conflict"`.
 
 Create one facade per kind at module scope so its route cache survives requests.
 Route all traffic through it during transition.
@@ -532,7 +533,7 @@ entry points.
 | `union(kinds, options?)` | Builds the supervisor/facet runtime class. |
 | `kinds(namespace)` / `kind(namespace, name)` | Typed kind accessors. |
 | `instanceName(ctx)` | Logical name without kind prefix. |
-| `resetStorage(ctx)` | Clears facet user storage and alarm; supervisor identity remains. |
+| `resetStorage(ctx)` | Clears facet user storage; supervisor identity and pending alarm remain. |
 
 `union` options: `exportName`, `importable`, and migration `secret`.
 

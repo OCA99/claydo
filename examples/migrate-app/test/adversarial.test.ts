@@ -119,7 +119,7 @@ describe("B. the seal window and polluted targets", () => {
     ]);
   });
 
-  it("a manually sealed (never-reserved) old instance can still be shadowed by a reader", async () => {
+  it("a manual seal and independently live target report a conflict", async () => {
     const NAME = "manual-seal-hole";
     const old = oldRoom(NAME);
     await old.post("system", "stranded one");
@@ -129,12 +129,15 @@ describe("B. the seal window and polluted targets", () => {
     const facade = migrated(env.OLD_ROOMS, app().room, { strategy: "manual" });
     expect(await facade.get(NAME).history()).toEqual([]); // empty pin
 
-    const summary = await migrateInstance({
-      from: old,
-      to: app().room,
-      name: NAME,
-    });
-    expect(summary).toMatchObject({ skipped: true, reason: "already migrated" });
+    await expectRejects(
+      () =>
+        migrateInstance({
+          from: old,
+          to: app().room,
+          name: NAME,
+        }),
+      /sealed without a migration claim/,
+    );
 
     await wipeTarget(app().room, NAME);
     const rerun = await migrateInstance({
@@ -150,8 +153,8 @@ describe("B. the seal window and polluted targets", () => {
   });
 });
 
-describe("C. wrong-shape migration: binding A's instance into binding B's kind (unchanged by design)", () => {
-  it("migrating a partyserver room into the match kind still succeeds silently and serves nonsense", async () => {
+describe("C. wrong-shape migration", () => {
+  it("migrating a partyserver room into the match kind succeeds without schema validation", async () => {
     const old = oldRoom("oops");
     await old.post("system", "this is a chat room");
     await old.post("alice", "definitely not a match");

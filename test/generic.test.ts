@@ -135,6 +135,14 @@ describe("union() validation", () => {
     expect(() => union({ bad: BadKind })).toThrow(
       /defines a method named 'name'/,
     );
+    for (const method of ["then", "ctx", "env"] as const) {
+      class ReservedKind {
+        [method](): void {}
+      }
+      expect(() => union({ reserved: ReservedKind })).toThrow(
+        new RegExp(`defines a method named '${method}'`),
+      );
+    }
   });
 });
 
@@ -281,6 +289,13 @@ describe("fetch and websockets", () => {
     expect(response.status).toBe(501);
   });
 
+  it("returns 500 when kind construction fails during fetch", async () => {
+    const broken = kind(env.APP_DO, "brokenConstructor").get("fetch");
+    const response = await broken.fetch("https://do/");
+    expect(response.status).toBe(500);
+    expect(await response.text()).toBe("broken constructor");
+  });
+
   it("forwards hibernating WebSocket events", async () => {
     const echo = kind(env.APP_DO, "echo").get("ws");
     const response = await echo.fetch("https://do/ws", {
@@ -328,6 +343,18 @@ describe("alarms", () => {
     expect(await reminder.fired()).toBe("fired:water the plants");
   });
 
+  it("adapts storage references captured during construction", async () => {
+    const reminder = kind(env.APP_DO, "reminder").get("captured-alarm");
+    await reminder.remindThroughCapturedStorage("captured");
+    expect(await reminder.alarmTime()).toBeTypeOf("number");
+    expect(
+      await runDurableObjectAlarm(
+        env.APP_DO.get(env.APP_DO.idFromName("reminder:captured-alarm")),
+      ),
+    ).toBe(true);
+    expect(await reminder.fired()).toBe("fired:captured");
+  });
+
   it("serializes AlarmInvocationInfo into the facet", async () => {
     const reminder = kind(env.APP_DO, "reminder").get("alarm-info");
     await reminder.remind("inspect info");
@@ -356,6 +383,9 @@ describe("alarms", () => {
   it("rejects non-atomic alarm operations inside storage transactions", async () => {
     const reminder = kind(env.APP_DO, "reminder").get("alarm-transaction");
     await expect(reminder.alarmInsideTransaction()).rejects.toThrow(
+      /alarm operations inside storage\.transaction\(\) cannot be atomic/,
+    );
+    await expect(reminder.outerAlarmInsideTransaction()).rejects.toThrow(
       /alarm operations inside storage\.transaction\(\) cannot be atomic/,
     );
     await expect(reminder.alarmInsideSyncTransaction()).rejects.toThrow(

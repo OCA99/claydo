@@ -107,7 +107,10 @@ describe("migrateInstance", () => {
     // Simulate a driver crash: seal, reserve, apply one chunk, stop.
     await old.__claydoSeal();
     const raw = rawTarget("m4");
-    await raw.__claydoBeginImport("tally", "crashed-driver");
+    await raw.__claydoBeginImport("tally", "crashed-driver", undefined, {
+      maxRows: 1,
+      maxBytes: 256 * 1024,
+    });
     const first = await old.__claydoExport(undefined, null, { maxRows: 1 });
     await raw.__claydoImport("tally", first, 1, "crashed-driver");
 
@@ -144,7 +147,10 @@ describe("migrateInstance", () => {
     const raw = rawTarget("m4-checkpoint");
     const token = "checkpoint-crash";
     await old.__claydoSeal();
-    await raw.__claydoBeginImport("tally", token);
+    await raw.__claydoBeginImport("tally", token, undefined, {
+      maxRows: 1,
+      maxBytes: 256 * 1024,
+    });
     const first = (await old.__claydoExport(undefined, null, {
       maxRows: 1,
     })) as ExportChunk;
@@ -202,7 +208,6 @@ describe("migrateInstance", () => {
       from: old,
       to: tally(),
       name: "m4-checkpoint",
-      maxRowsPerChunk: 1,
     });
     expect(summary.resumed).toBe(true);
     expect(await tally().get("m4-checkpoint").total()).toBe(5);
@@ -246,8 +251,20 @@ describe("migrateInstance", () => {
     const status = await raw.__claydoImportStatus();
     expect(status.kind).toBeUndefined();
     expect(status.importing).toBeDefined();
-    await raw.__claydoAbortImport(token);
-    await old.__claydoUnseal();
+    await runInDurableObject(raw, async (_instance, state) => {
+      const importState = (await state.storage.get(
+        "__claydo:import",
+      )) as ImportState;
+      importState.updatedAtMs = Date.now() - 60_000;
+      await state.storage.put("__claydo:import", importState);
+    });
+    const restarted = await migrateInstance({
+      from: old,
+      to: tally(),
+      name: "m4-verify-retry",
+    });
+    expect(restarted.skipped).toBe(false);
+    expect(await tally().get("m4-verify-retry").total()).toBe(5);
   });
 
   it("serializes concurrent duplicate final chunks without deleting live data", async () => {
@@ -394,12 +411,14 @@ describe("migrateInstance", () => {
   it("refuses when both sides are live, and wipeTarget() recovers", async () => {
     await seed("m8");
     await tally().get("m8").bump("pollution");
+    await tally().get("m8").remindAt(Date.now() + 60_000);
     await expectRejects(
       () => migrateInstance({ from: legacy("m8"), to: tally(), name: "m8" }),
       /both the old instance .* are live/,
     );
     // Recovery path from the error message: wipe the polluted target.
     await wipeTarget(tally(), "m8");
+    expect(await runDurableObjectAlarm(rawTarget("m8"))).toBe(false);
     const summary = await migrateInstance({
       from: legacy("m8"),
       to: tally(),
@@ -505,6 +524,28 @@ describe("migrateInstance", () => {
     expect(await tally().get("one-target").total()).toBe(5);
     expect((await rawTarget("second-target").__claydoImportStatus()).kind)
       .toBeUndefined();
+  });
+
+  it("does not stamp a manual seal as migrated when the target is live", async () => {
+    const old = legacy("manual-seal");
+    await old.bump("source", 5);
+    const alarm = Date.now() + 60_000;
+    await old.remindAt(alarm);
+    await old.__claydoSeal();
+    await tally().get("manual-seal").bump("unrelated", 1);
+
+    await expectRejects(
+      () =>
+        migrateInstance({
+          from: old,
+          to: tally(),
+          name: "manual-seal",
+        }),
+      /sealed without a migration claim.*uncopied data/s,
+    );
+    expect(await old.__claydoSealed()).toEqual({ sealed: true });
+    expect(await old.__claydoStats()).toMatchObject({ alarm });
+    expect(await tally().get("manual-seal").total()).toBe(1);
   });
 
   it("lets only one concurrent target claim a source", async () => {
@@ -619,6 +660,29 @@ describe("migrated() router", () => {
     expect(await accessor.resolve("r9")).toBe("new");
   });
 
+  it("resolve() reports conflict and stalled states", async () => {
+    await seed("r9-conflict");
+    await tally().get("r9-conflict").bump("target", 1);
+    const manual = migrated(env.LEGACY, tally(), { strategy: "manual" });
+    expect(await manual.resolve("r9-conflict")).toBe("conflict");
+
+    await seed("r9-stalled");
+    const old = legacy("r9-stalled");
+    await old.__claydoSeal(undefined, undefined, "tally:r9-stalled");
+    const raw = rawTarget("r9-stalled");
+    await raw.__claydoBeginImport("tally", "stalled");
+    await runInDurableObject(raw, async (_instance, state) => {
+      const importState = (await state.storage.get(
+        "__claydo:import",
+      )) as ImportState;
+      importState.updatedAtMs = Date.now() - 60_000;
+      await state.storage.put("__claydo:import", importState);
+    });
+    expect(await manual.resolve("r9-stalled")).toBe("stalled");
+    await raw.__claydoAbortImport("stalled");
+    await old.__claydoUnseal();
+  });
+
   it("resolve() is read-only even under the lazy strategy", async () => {
     await seed("r10");
     const accessor = migrated(env.LEGACY, tally(), { strategy: "lazy" });
@@ -638,7 +702,12 @@ describe("migrated() router", () => {
     const old = legacy("r11");
     const raw = rawTarget("r11");
     await old.__claydoSeal(undefined, undefined, "tally:r11");
-    await raw.__claydoBeginImport("tally", "dead-router-driver");
+    await raw.__claydoBeginImport(
+      "tally",
+      "dead-router-driver",
+      undefined,
+      { maxRows: 1, maxBytes: 256 * 1024 },
+    );
     const first = await old.__claydoExport(undefined, null, { maxRows: 1 });
     await raw.__claydoImport(
       "tally",

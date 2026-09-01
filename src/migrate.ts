@@ -23,6 +23,7 @@
  */
 
 import type { KindAccessor, KindStub } from "./client";
+import { RESERVED_LIFECYCLE_METHODS } from "./types";
 import {
   IMPORT_STALE_MS,
   IMPORT_CHECKPOINT_KEY,
@@ -35,6 +36,7 @@ import {
   type ExportCursor,
   type ImportAck,
   type ImportBegin,
+  type ImportLimits,
   type ImportStatus,
   type SqlValue,
 } from "./migrate-wire";
@@ -44,6 +46,7 @@ export type {
   ExportCursor,
   ImportAck,
   ImportBegin,
+  ImportLimits,
   ImportStatus,
 } from "./migrate-wire";
 export { SEALED_HEADER } from "./migrate-wire";
@@ -53,6 +56,7 @@ const DEFAULT_MAX_ROWS = 500;
 const DEFAULT_MAX_BYTES = 256 * 1024;
 const ROWID_FLOOR = -Number.MAX_SAFE_INTEGER;
 const SEALED_ALARM_DEFER_MS = 60_000;
+const RESERVED_EXPORT_METHODS = new Set<string>(RESERVED_LIFECYCLE_METHODS);
 
 interface SealRecord {
   /** Immutable destination claim while copying. */
@@ -104,7 +108,7 @@ function guardObject<T extends object>(real: T, holder: SealHolder): T {
       if (typeof value !== "function") return value;
       return (...args: unknown[]) => {
         const seal = holder.sealed;
-        if (seal) throw new Error(sealMessage(holder.ctx, seal));
+        if (seal) throw sealedError(holder.ctx, seal);
         return Reflect.apply(value, target, args);
       };
     },
@@ -120,7 +124,7 @@ function guardState(holder: SealHolder): DurableObjectState {
       if (typeof value !== "function") return value;
       return (...args: unknown[]) => {
         const seal = holder.sealed;
-        if (seal) throw new Error(sealMessage(holder.ctx, seal));
+        if (seal) throw sealedError(holder.ctx, seal);
         return Reflect.apply(value, target, args);
       };
     },
@@ -917,15 +921,7 @@ export function exportable<I extends object>(
     ...(options.guardMethods ?? []),
   ]);
   for (const name of guardedNames) {
-    if (
-      name === "constructor" ||
-      name === "fetch" ||
-      name === "alarm" ||
-      name === "webSocketMessage" ||
-      name === "webSocketClose" ||
-      name === "webSocketError" ||
-      name.startsWith("__claydo")
-    ) {
+    if (RESERVED_EXPORT_METHODS.has(name) || name.startsWith("__claydo")) {
       continue;
     }
     let owner: object | null = ConcreteBase.prototype;
@@ -953,7 +949,7 @@ export function exportable<I extends object>(
       value: function (this: object, ...args: unknown[]): unknown {
         const holder = holders.get(this);
         if (holder?.sealed) {
-          throw new Error(sealMessage(holder.ctx, holder.sealed));
+          throw sealedError(holder.ctx, holder.sealed);
         }
         return original.apply(this, args);
       },
@@ -975,6 +971,12 @@ function sealMessage(ctx: DurableObjectState, seal: SealRecord): string {
   return `claydo: instance '${identityOf(ctx)}' is sealed.${moved}`;
 }
 
+function sealedError(ctx: DurableObjectState, seal: SealRecord): Error {
+  return Object.assign(new Error(sealMessage(ctx, seal)), {
+    code: "CLAYDO_SEALED",
+  });
+}
+
 /** The host-side migration surface, reachable on a raw claydo stub. */
 interface MigrationHostStub {
   __claydoImportStatus(secret?: string): Promise<ImportStatus>;
@@ -982,6 +984,7 @@ interface MigrationHostStub {
     kind: string,
     token: string,
     secret?: string,
+    limits?: ImportLimits,
   ): Promise<ImportBegin>;
   __claydoImport(
     kind: string,
@@ -1102,10 +1105,13 @@ function skippedSummary(reason: string): MigrationSummary {
 }
 
 function ownedError(kind: string, name: string, ageMs: number): Error {
-  return new Error(
-    `claydo: another migration driver owns the import on instance ` +
-      `'${kind}:${name}' (last progress ${ageMs}ms ago). It is not stale ` +
-      `yet; retry later.`,
+  return Object.assign(
+    new Error(
+      `claydo: another migration driver owns the import on instance ` +
+        `'${kind}:${name}' (last progress ${ageMs}ms ago). It is not stale ` +
+        `yet; retry later.`,
+    ),
+    { code: "CLAYDO_IMPORT_OWNED" },
   );
 }
 
@@ -1144,9 +1150,9 @@ export async function migrateInstance(
   const raw = target.stub as unknown as MigrationHostStub;
   const old = options.from as unknown as ExportableStub;
   const secret = options.secret;
-  const limits = {
-    maxRows: options.maxRowsPerChunk,
-    maxBytes: options.maxBytesPerChunk,
+  let limits: ImportLimits = {
+    maxRows: options.maxRowsPerChunk ?? DEFAULT_MAX_ROWS,
+    maxBytes: options.maxBytesPerChunk ?? DEFAULT_MAX_BYTES,
   };
   const token = crypto.randomUUID();
   // The operator-facing reference of the target. Recorded as the old
@@ -1176,7 +1182,13 @@ export async function migrateInstance(
         );
       }
       if (oldSeal.movedTo === undefined) {
-        // Crash after finalize, before the move marker: record it now.
+        if (oldSeal.target !== targetRef) {
+          throw new Error(
+            `claydo: old instance '${options.name}' was sealed without a ` +
+              `migration claim, while target '${targetRef}' is independently ` +
+              `live. Refusing to mark uncopied data as migrated.`,
+          );
+        }
         await old.__claydoSeal(secret, targetRef, targetRef);
       }
       return skippedSummary("already migrated");
@@ -1212,15 +1224,30 @@ export async function migrateInstance(
   // Reserve the target FIRST: from here on, traffic to it blocks instead of
   // initializing an empty instance. Ownership refusals surface here, before
   // anything was changed, so there is nothing to roll back.
-  let begin = await raw.__claydoBeginImport(target.kind, token, secret);
+  let begin = await raw.__claydoBeginImport(
+    target.kind,
+    token,
+    secret,
+    limits,
+  );
   if (!begin.ok) throw ownedError(target.kind, options.name, begin.ageMs);
-  if (begin.resumed && (!oldSeal.sealed || begin.cursor === null)) {
+  limits = begin.limits;
+  if (
+    begin.resumed &&
+    (begin.restartRequired || !oldSeal.sealed || begin.cursor === null)
+  ) {
     // Not resumable: the old instance was unsealed mid-import (the data may
     // have changed) or the previous run failed verification. Start over.
     await raw.__claydoAbortImport(token, secret);
-    const fresh = await raw.__claydoBeginImport(target.kind, token, secret);
+    const fresh = await raw.__claydoBeginImport(
+      target.kind,
+      token,
+      secret,
+      limits,
+    );
     if (!fresh.ok) throw ownedError(target.kind, options.name, fresh.ageMs);
     begin = fresh;
+    limits = fresh.limits;
   }
   let seq = begin.seq;
   let cursor = begin.cursor;
@@ -1308,7 +1335,7 @@ export async function migrateInstance(
       }
     }
     const message = error instanceof Error ? error.message : String(error);
-    throw new Error(
+    const wrapped = new Error(
       `claydo: migration of '${options.name}' to kind '${target.kind}' ` +
         `failed${
           !ownedRollback
@@ -1319,6 +1346,11 @@ export async function migrateInstance(
         }: ${message}`,
       { cause: error },
     );
+    const code = (error as { code?: unknown } | null)?.code;
+    if (typeof code === "string") {
+      (wrapped as Error & { code: string }).code = code;
+    }
+    throw wrapped;
   }
 }
 
@@ -1341,6 +1373,12 @@ export async function wipeTarget(
 
 /** Routing strategies for {@link migrated}. */
 export type MigratedStrategy = "lazy" | "manual" | "drain";
+export type MigratedResolution =
+  | "old"
+  | "new"
+  | "importing"
+  | "stalled"
+  | "conflict";
 
 /** Options for {@link migrated}. */
 export interface MigratedOptions {
@@ -1375,7 +1413,7 @@ export interface MigratedAccessor<T> {
    * cutover sweeps. (Like any contact, it constructs both instances if
    * they do not exist yet.)
    */
-  resolve(name: string): Promise<"new" | "old">;
+  resolve(name: string): Promise<MigratedResolution>;
 }
 
 /**
@@ -1439,13 +1477,22 @@ export function migrated<T, NS extends DurableObjectNamespace<any>>(
    * cache. This is what `resolve()` exposes, so observability sweeps over
    * a fleet cannot trigger migrations the way `get()` under `lazy` does.
    */
-  async function peek(name: string): Promise<"new" | "old"> {
+  async function peek(name: string): Promise<MigratedResolution> {
     const status = await rawFor(name).__claydoImportStatus(secret);
-    if (status.kind !== undefined) return "new";
-    if (status.importing !== undefined) return "old";
     const oldStub = oldStubFor(name);
     const seal = await oldStub.__claydoSealed(secret);
-    if (seal.sealed) return "new";
+    if (status.kind !== undefined) {
+      if (!seal.sealed && (await oldStub.__claydoHasData(secret))) {
+        return "conflict";
+      }
+      return "new";
+    }
+    if (status.importing !== undefined) {
+      return status.importing.ageMs >= IMPORT_STALE_MS
+        ? "stalled"
+        : "importing";
+    }
+    if (seal.sealed) return "stalled";
     if (!(await oldStub.__claydoHasData(secret))) return "new";
     return "old";
   }
@@ -1518,12 +1565,10 @@ export function migrated<T, NS extends DurableObjectNamespace<any>>(
       try {
         await migrateInstance({ from: oldStub, to: accessor, name, secret });
       } catch (error) {
-        // A concurrent lazy migration may own the instance; wait for it.
-        const message = error instanceof Error ? error.message : "";
+        const code = (error as { code?: unknown } | null)?.code;
         if (
-          /owns the import|is importing kind|another migration driver/.test(
-            message,
-          ) &&
+          (code === "CLAYDO_IMPORT_OWNED" ||
+            code === "CLAYDO_IMPORTING") &&
           (await waitForMigration(name))
         ) {
           return "new";
@@ -1610,8 +1655,8 @@ export function migrated<T, NS extends DurableObjectNamespace<any>>(
             // The old instance may have been sealed between the route check
             // and the call. Re-resolve once and retry on the new side.
             if (
-              error instanceof Error &&
-              error.message.includes("is sealed")
+              (error as { code?: unknown } | null)?.code ===
+              "CLAYDO_SEALED"
             ) {
               routes.delete(name);
               const retry = await resolveCached(name);
