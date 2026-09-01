@@ -82,7 +82,6 @@ export function createSupervisorClass<R extends KindRegistry>(
     #kind?: string;
     #kindLoading?: Promise<string>;
     readonly #facetClasses = new Map<string, unknown>();
-    #facetStub?: FacetInstance;
 
     #identity(): string {
       return this.ctx.id.name ?? this.ctx.id.toString();
@@ -149,28 +148,29 @@ export function createSupervisorClass<R extends KindRegistry>(
       return configured;
     }
 
-    /** Returns the facet that owns this instance's kind data. */
+    /**
+     * Returns the facet that owns this instance's kind data. `facets.get()`
+     * runs on every call: it resumes or restarts the facet transparently,
+     * so a stale stub is never held across a facet restart.
+     */
     #facet(kind: string): FacetInstance {
-      if (this.#facetStub === undefined) {
-        const configured = this.#facetClass(kind);
-        try {
-          this.#facetStub = this.#facets().get(kind, () => ({
-            class: configured as never,
-          })) as unknown as FacetInstance;
-        } catch (error) {
-          if (error instanceof TypeError) {
-            const facetExport = `${this.#hostExport()}${FACET_EXPORT_SUFFIX}`;
-            this.#config(
-              `the facet export '${facetExport}' is not a Durable Object ` +
-                `class the runtime can start. List "${facetExport}" in ` +
-                `new_sqlite_classes in the wrangler configuration; it ` +
-                `needs no binding.`,
-            );
-          }
-          throw error;
+      const configured = this.#facetClass(kind);
+      try {
+        return this.#facets().get(kind, () => ({
+          class: configured as never,
+        })) as unknown as FacetInstance;
+      } catch (error) {
+        if (error instanceof TypeError) {
+          const facetExport = `${this.#hostExport()}${FACET_EXPORT_SUFFIX}`;
+          this.#config(
+            `the facet export '${facetExport}' is not a Durable Object ` +
+              `class the runtime can start. List "${facetExport}" in ` +
+              `new_sqlite_classes in the wrangler configuration; it ` +
+              `needs no binding.`,
+          );
         }
+        throw error;
       }
-      return this.#facetStub;
     }
 
     #kindFromName(): string | undefined {
