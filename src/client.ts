@@ -1,32 +1,22 @@
+import type { SupervisorInstance } from "./supervisor";
 import type {
-  ClaydoCallResult,
-  GenericDurableObjectInstance,
-  WireError,
-} from "./host";
-import { KIND_HEADER, NO_INIT_HEADER, type KindRegistry } from "./types";
+  KindRegistry,
+  ReservedLifecycleMethod,
+  ReservedStubKey,
+} from "./types";
 
 /**
  * Keys that are not exposed as RPC methods on the typed stub: lifecycle
- * handlers, internals, and the stub metadata keys (`union()` rejects kind
- * classes that define the metadata keys as methods).
+ * handlers, internals, and the stub metadata keys.
  */
-type ReservedKey =
-  | "ctx"
-  | "env"
-  | "fetch"
-  | "alarm"
-  | "webSocketMessage"
-  | "webSocketClose"
-  | "webSocketError"
-  | "id"
-  | "name"
-  | "kind"
-  | "stub"
-  | `__${string}`;
+type ReservedKey = ReservedLifecycleMethod | ReservedStubKey | `__${string}`;
 
 /**
- * A typed stub for one kind instance. Every public method of the kind class
- * becomes an async method on the stub.
+ * A typed stub for one kind instance. Every public prototype method of the
+ * kind class becomes an async method on the stub. Errors thrown by the
+ * kind propagate natively: `name`, `message`, `stack`, and own enumerable
+ * fields such as `code` survive the hop; `instanceof` custom classes does
+ * not, so match on `error.name` or `error.code`.
  */
 export type KindStub<T> = {
   [K in Exclude<keyof T, ReservedKey | symbol | number> as T[K] extends (
@@ -45,10 +35,7 @@ export type KindStub<T> = {
   readonly kind: string;
   /** The raw Durable Object stub, for escape hatches such as `cloudflare:test`. */
   readonly stub: DurableObjectStub;
-  /**
-   * Sends a request to the `fetch()` handler of the kind implementation.
-   * The helper attaches the kind hint header automatically.
-   */
+  /** Sends a request to the `fetch()` handler of the kind implementation. */
   fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response>;
 };
 
@@ -72,7 +59,7 @@ type KindInstance<NS, K extends KindNameOf<NS>> = InstanceType<
   RegistryOf<NS>[K]
 >;
 
-/** Accessor for one kind inside a generic Durable Object namespace. */
+/** Accessor for one kind inside a union namespace. */
 export interface KindAccessor<T> {
   /**
    * Returns a stub for the named instance. The full Durable Object name is
@@ -87,20 +74,19 @@ export interface KindAccessor<T> {
   unique(options?: DurableObjectNamespaceNewUniqueIdOptions): KindStub<T>;
   /**
    * Returns a stub from a stored ID string or a `DurableObjectId`.
-   * `fromId()` never initializes an instance: the instance must already have
-   * a kind (from a previous `get()` or `unique()` contact), or every call
-   * fails.
+   * `fromId()` never initializes an instance: the instance must already
+   * have a kind (from a previous `get()` or `unique()` contact), or every
+   * call fails with `CLAYDO_UNINITIALIZED`.
    */
   fromId(id: string | DurableObjectId): KindStub<T>;
   /** Returns the Durable Object ID that `get(name)` resolves to. */
   idFromName(name: string): DurableObjectId;
 }
 
-type AnyHost = GenericDurableObjectInstance<KindRegistry>;
+type AnySupervisor = SupervisorInstance<KindRegistry>;
 
 /**
- * Returns a typed accessor for one kind inside a generic Durable Object
- * namespace.
+ * Returns a typed accessor for one kind inside a union namespace.
  *
  * Prefer {@link kinds} for literal kind names: its property access produces
  * better TypeScript diagnostics. Use `kind()` when the kind name is a
@@ -114,20 +100,23 @@ export function kind<
   NS extends DurableObjectNamespace<any>,
   K extends KindNameOf<NS>,
 >(namespace: NS, kindName: K): KindAccessor<KindInstance<NS, K>> {
-  const ns = namespace as unknown as DurableObjectNamespace<AnyHost>;
+  const ns = namespace as unknown as DurableObjectNamespace<AnySupervisor>;
   return {
     get: (name, options) =>
-      makeStub(ns.get(ns.idFromName(`${kindName}:${name}`), options), kindName, {
-        name,
-        allowInit: true,
-      }),
+      makeStub(
+        ns.get(ns.idFromName(`${kindName}:${name}`), options),
+        kindName,
+        { name, mode: "named" },
+      ),
     unique: (options) =>
-      makeStub(ns.get(ns.newUniqueId(options)), kindName, { allowInit: true }),
+      makeStub(ns.get(ns.newUniqueId(options)), kindName, {
+        mode: "unique",
+      }),
     fromId: (id) =>
       makeStub(
         ns.get(typeof id === "string" ? ns.idFromString(id) : id),
         kindName,
-        { allowInit: false },
+        { mode: "fromId" },
       ),
     idFromName: (name) => ns.idFromName(`${kindName}:${name}`),
   };
@@ -154,24 +143,31 @@ export function kinds<NS extends DurableObjectNamespace<any>>(
 
 interface StubOptions {
   name?: string;
-  allowInit: boolean;
+  mode: "named" | "unique" | "fromId";
 }
 
 function makeStub<T>(
-  stub: DurableObjectStub<AnyHost>,
+  stub: DurableObjectStub<AnySupervisor>,
   kindName: string,
-  { name, allowInit }: StubOptions,
+  { name, mode }: StubOptions,
 ): KindStub<T> {
+  // Named instances carry their kind in the instance name, and fromId()
+  // requires an already-initialized instance, so only unique() stubs must
+  // set the kind before a fetch() can route.
+  let initialized: Promise<string> | undefined;
+  const ensureInitialized = (): Promise<string> =>
+    (initialized ??= stub.__claydoInit(kindName));
   const meta: Record<string, unknown> = {
     id: stub.id,
     name,
     kind: kindName,
     stub,
-    fetch: (input: RequestInfo | URL, init?: RequestInit) => {
-      const request = new Request(input, init);
-      request.headers.set(KIND_HEADER, kindName);
-      if (!allowInit) request.headers.set(NO_INIT_HEADER, "1");
-      return stub.fetch(request);
+    fetch: async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ): Promise<Response> => {
+      if (mode === "unique") await ensureInitialized();
+      return stub.fetch(input as RequestInfo, init);
     },
   };
   return new Proxy(meta, {
@@ -182,47 +178,8 @@ function makeStub<T>(
       }
       // Do not present the stub as a thenable to `await`.
       if (prop === "then") return undefined;
-      return async (...args: unknown[]) => {
-        let result: ClaydoCallResult;
-        try {
-          // The RPC type mapping widens the `ok` literal, so restate the type.
-          result = (await stub.__claydoCall(
-            kindName,
-            prop,
-            args,
-            allowInit,
-          )) as ClaydoCallResult;
-        } catch (transport) {
-          // The call failed outside the envelope: transport errors, or the
-          // return value did not serialize. Add call context.
-          const message =
-            transport instanceof Error ? transport.message : String(transport);
-          throw new Error(
-            `claydo: call to ${kindName}.${prop}() failed: ${message}`,
-            { cause: transport },
-          );
-        }
-        if (result.ok) return result.value;
-        throw reviveError(result.error, kindName, prop);
-      };
+      return (...args: unknown[]) =>
+        stub.__claydoCall(kindName, prop, args, mode !== "fromId");
     },
   }) as KindStub<T>;
-}
-
-/**
- * Rebuilds an error thrown inside a kind. The revived error keeps the
- * original name, message, serializable fields, and stack; the local frames
- * follow after a marker line. `instanceof` custom classes does not survive
- * the hop; match on `error.name` instead.
- */
-function reviveError(wire: WireError, kindName: string, method: string): Error {
-  const error = new Error(wire.message);
-  error.name = wire.name;
-  if (wire.props) Object.assign(error, wire.props);
-  const localFrames = error.stack?.split("\n").slice(1).join("\n");
-  const remote = wire.stack ?? `${wire.name}: ${wire.message}`;
-  error.stack =
-    `${remote}\n    at [remote call ${kindName}.${method}() via claydo]` +
-    (localFrames ? `\n${localFrames}` : "");
-  return error;
 }

@@ -11,21 +11,9 @@ export type KindClass = new (ctx: DurableObjectState, env: any) => object;
  */
 export type KindRegistry = Record<string, KindClass>;
 
-/** The header that carries the kind hint on `fetch()` calls to the stub. */
-export const KIND_HEADER = "x-claydo-kind";
-
 /**
- * The header that marks a `fetch()` from a `fromId()` stub. It tells the
- * host that the kind hint must validate only, never initialize.
- */
-export const NO_INIT_HEADER = "x-claydo-no-init";
-
-/** The storage key that persists the kind of an instance. */
-export const KIND_STORAGE_KEY = "__claydo:kind";
-
-/**
- * Handler methods that the host Durable Object forwards to the kind
- * implementation. All handlers are optional.
+ * Lifecycle handlers that claydo forwards to the kind implementation.
+ * All handlers are optional.
  */
 export interface KindHandlers {
   fetch?(request: Request): Response | Promise<Response>;
@@ -41,4 +29,76 @@ export interface KindHandlers {
     wasClean: boolean,
   ): void | Promise<void>;
   webSocketError?(ws: WebSocket, error: unknown): void | Promise<void>;
+}
+
+/**
+ * Kind methods with these names are lifecycle handlers. Claydo invokes them
+ * through platform events; the typed stub does not proxy them as RPC.
+ */
+export const RESERVED_LIFECYCLE_METHODS = [
+  "fetch",
+  "alarm",
+  "webSocketMessage",
+  "webSocketClose",
+  "webSocketError",
+] as const;
+
+/**
+ * Names the typed stub reserves for metadata and control flow. `union()`
+ * rejects kind classes that define these names as prototype methods,
+ * because the stub could never call them.
+ */
+export const RESERVED_STUB_KEYS = [
+  "ctx",
+  "env",
+  "id",
+  "name",
+  "kind",
+  "stub",
+  "then",
+] as const;
+
+export type ReservedLifecycleMethod =
+  (typeof RESERVED_LIFECYCLE_METHODS)[number];
+export type ReservedStubKey = (typeof RESERVED_STUB_KEYS)[number];
+
+/** Internal: the props that a claydo supervisor gives each kind facet. */
+export interface FacetProps {
+  readonly claydoFacet: true;
+  /** The kind this facet hosts. */
+  readonly kind: string;
+  /** The top-level export name of the supervisor class. */
+  readonly host: string;
+}
+
+/** Internal: true when `props` identify a claydo facet. */
+export function isFacetProps(props: unknown): props is FacetProps {
+  const candidate = props as Partial<FacetProps> | undefined;
+  return (
+    candidate?.claydoFacet === true &&
+    typeof candidate.kind === "string" &&
+    typeof candidate.host === "string"
+  );
+}
+
+/**
+ * Internal: the serializable subset of `AlarmInvocationInfo` that crosses
+ * the supervisor-to-facet RPC hop when an alarm fires.
+ */
+export interface AlarmInfo {
+  scheduledTime: number;
+  isRetry: boolean;
+  retryCount: number;
+}
+
+/**
+ * Returns the logical instance name without its `<kind>:` prefix, or
+ * `undefined` for unique-ID instances. Works inside kind implementations:
+ * a kind facet shares the identity of its instance.
+ */
+export function instanceName(ctx: DurableObjectState): string | undefined {
+  const name = ctx.id.name;
+  if (name === undefined) return undefined;
+  const separator = name.indexOf(":");
+  return separator === -1 ? name : name.slice(separator + 1);
 }
