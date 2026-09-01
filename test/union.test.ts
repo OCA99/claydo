@@ -245,14 +245,6 @@ describe("registry validation", () => {
 });
 
 describe("union configuration errors", () => {
-  it("fails loudly when the facet class is not exported", async () => {
-    const lonely = kinds(env.LONELY);
-    const error = await caught(lonely.counter.get("lonely-1").value());
-    expect((error as ClaydoError).code).toBe("CLAYDO_CONFIG");
-    expect(error.message).toContain("LonelyDOFacet");
-    expect(error.message).toContain("new_sqlite_classes");
-  });
-
   it("supports direct export with the name option", async () => {
     const renamed = kinds(env.RENAMED);
     expect(await renamed.counter.get("renamed-1").increment(5)).toBe(5);
@@ -263,5 +255,37 @@ describe("union configuration errors", () => {
     const error = await caught(misnamed.counter.get("misnamed-1").value());
     expect((error as ClaydoError).code).toBe("CLAYDO_CONFIG");
     expect(error.message).toContain('{ name: "..." }');
+  });
+});
+
+describe("role selection", () => {
+  const Union = union({ counter: Counter });
+
+  it("rejects construction with props that claydo did not write", () => {
+    for (const props of [
+      { anything: true },
+      { claydoFacet: true },
+      { claydoFacet: true, kind: "counter" },
+      "nonsense",
+      42,
+    ]) {
+      expect(
+        () => new Union({ props } as unknown as DurableObjectState, {}),
+      ).toThrowError(/reserves ctx\.props/);
+    }
+  });
+
+  it("refuses facet-internal methods on a supervisor", async () => {
+    await app.counter.get("role-guard").increment();
+    const raw = env.APP_DO.get(
+      app.counter.idFromName("role-guard"),
+    ) as unknown as {
+      __claydoAlarm(info: unknown): Promise<void>;
+    };
+    const error = await caught(
+      raw.__claydoAlarm({ scheduledTime: 0, isRetry: false, retryCount: 0 }),
+    );
+    expect((error as ClaydoError).code).toBe("CLAYDO_CONFIG");
+    expect(error.message).toContain("internal to claydo");
   });
 });

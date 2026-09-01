@@ -152,7 +152,6 @@ export class ShopDO extends union({
   cart: Cart,
   inventory: Inventory,
 }) {}
-export const ShopDOFacet = ShopDO.Facet;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {

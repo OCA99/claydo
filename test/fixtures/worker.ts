@@ -3,7 +3,6 @@ import { instanceName, kinds, union } from "../../src/index";
 
 export interface Env {
   APP_DO: DurableObjectNamespace<AppDO>;
-  LONELY: DurableObjectNamespace<LonelyDO>;
   RENAMED: DurableObjectNamespace<InstanceType<typeof RenamedDO>>;
   MISNAMED: DurableObjectNamespace<InstanceType<typeof Misnamed>>;
 }
@@ -301,18 +300,12 @@ export class AppDO extends union({
   plain: PlainKind,
   broken: BrokenKind,
 }) {}
-export const AppDOFacet = AppDO.Facet;
-
-/** A union whose facet class is not exported: every use must fail loudly. */
-export class LonelyDO extends union({ counter: Counter }) {}
 
 /** A union exported without a subclass: the name option carries the export name. */
 export const RenamedDO = union({ counter: Counter }, { name: "RenamedDO" });
-export const RenamedDOFacet = RenamedDO.Facet;
 
 /** A union exported without a subclass and without the name option. */
 export const Misnamed = union({ counter: Counter });
-export const MisnamedFacet = Misnamed.Facet;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {

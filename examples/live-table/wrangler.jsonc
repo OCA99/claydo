@@ -7,6 +7,6 @@
     "bindings": [{ "name": "APP_DO", "class_name": "LiveTableDO" }]
   },
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["LiveTableDO", "LiveTableDOFacet"] }
+    { "tag": "v1", "new_sqlite_classes": ["LiveTableDO"] }
   ]
 }

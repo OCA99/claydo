@@ -1,7 +1,5 @@
-import { DurableObject } from "cloudflare:workers";
 import { claydoError } from "./errors";
 import {
-  isFacetProps,
   RESERVED_LIFECYCLE_METHODS,
   RESERVED_STUB_KEYS,
   type AlarmInfo,
@@ -10,7 +8,7 @@ import {
   type KindRegistry,
 } from "./types";
 
-/** Methods that `__claydoCall` refuses to dispatch. */
+/** Methods that `call()` refuses to dispatch. */
 const RESERVED_METHODS = new Set<string>([
   ...RESERVED_LIFECYCLE_METHODS,
   ...RESERVED_STUB_KEYS,
@@ -26,19 +24,6 @@ interface AlarmBridge {
   ): Promise<number | null>;
   __claydoDeleteAlarm(kind: string): Promise<void>;
 }
-
-/** The instance surface of the facet class that `union()` creates. */
-export interface FacetInstance extends Rpc.DurableObjectBranded {
-  __claydoCall(method: string, args: unknown[]): Promise<unknown>;
-  __claydoAlarm(info: AlarmInfo): Promise<void>;
-  fetch(request: Request): Promise<Response>;
-}
-
-/** The constructor of the facet class that `union()` creates. */
-export type FacetClass = new (
-  ctx: DurableObjectState,
-  env: any,
-) => FacetInstance;
 
 /** Quotes an SQLite identifier. */
 function quoteIdent(name: string): string {
@@ -201,178 +186,181 @@ function prototypeMethod(
 }
 
 /**
- * Creates the facet class for one registry. Each instance of this class is
- * one isolated kind facet: it constructs the kind implementation, forwards
- * lifecycle events to it, and dispatches RPC methods on it.
+ * The facet role of a union instance. One isolated kind facet: it
+ * constructs the kind implementation, forwards lifecycle events to it, and
+ * dispatches RPC methods on it.
  */
-export function createFacetClass(kinds: KindRegistry): FacetClass {
-  class ClaydoKindFacet extends DurableObject<unknown> {
-    readonly #props: FacetProps;
-    #bridge?: AlarmBridge;
-    #impl?: object & KindHandlers;
-    #implLoading?: Promise<object & KindHandlers>;
-    readonly #methods = new Map<string, (...args: unknown[]) => unknown>();
+export class FacetCore {
+  readonly #ctx: DurableObjectState;
+  readonly #env: unknown;
+  readonly #props: FacetProps;
+  readonly #kinds: KindRegistry;
+  #bridge?: AlarmBridge;
+  #impl?: object & KindHandlers;
+  #implLoading?: Promise<object & KindHandlers>;
+  readonly #methods = new Map<string, (...args: unknown[]) => unknown>();
 
-    constructor(ctx: DurableObjectState, env: unknown) {
-      super(ctx, env);
-      const props = ctx.props;
-      if (!isFacetProps(props)) {
-        throw claydoError(
-          "CLAYDO_CONFIG",
-          "this class only runs as a kind facet inside a claydo " +
-            "supervisor. Bind the supervisor class in wrangler and reach " +
-            "kinds through kind() or kinds().",
-        );
-      }
-      this.#props = props;
-      adaptFacetStorage(ctx, props.kind, () => this.#hostBridge());
-      // The kind implementation gets a clean context: the props are a
-      // claydo detail, not part of the kind's contract.
-      try {
-        Object.defineProperty(ctx, "props", {
-          value: undefined,
-          configurable: true,
-        });
-      } catch {
-        // A frozen context still works; the kind just sees the props.
-      }
-    }
-
-    #hostBridge(): AlarmBridge {
-      if (this.#bridge === undefined) {
-        const exported = (
-          this.ctx.exports as unknown as Record<string, unknown>
-        )[this.#props.host] as
-          | { get?: (id: DurableObjectId) => AlarmBridge }
-          | undefined;
-        if (typeof exported?.get !== "function") {
-          throw claydoError(
-            "CLAYDO_CONFIG",
-            `cannot find the supervisor export '${this.#props.host}' from ` +
-              `inside a kind facet. Keep the class returned by union() ` +
-              `exported under that name.`,
-          );
-        }
-        this.#bridge = exported.get(this.ctx.id);
-      }
-      return this.#bridge;
-    }
-
-    async #load(): Promise<object & KindHandlers> {
-      if (this.#impl !== undefined) return this.#impl;
-      this.#implLoading ??= this.#construct().catch((error) => {
-        this.#implLoading = undefined;
-        throw error;
+  constructor(
+    ctx: DurableObjectState,
+    env: unknown,
+    props: FacetProps,
+    kinds: KindRegistry,
+  ) {
+    this.#ctx = ctx;
+    this.#env = env;
+    this.#props = props;
+    this.#kinds = kinds;
+    adaptFacetStorage(ctx, props.kind, () => this.#hostBridge());
+    // The kind implementation gets a clean context: the props are a claydo
+    // detail, not part of the kind's contract.
+    try {
+      Object.defineProperty(ctx, "props", {
+        value: undefined,
+        configurable: true,
       });
-      this.#impl = await this.#implLoading;
-      return this.#impl;
-    }
-
-    async #construct(): Promise<object & KindHandlers> {
-      const kind = this.#props.kind;
-      const Kind = kinds[kind];
-      if (Kind === undefined) {
-        throw claydoError(
-          "CLAYDO_UNKNOWN_KIND",
-          `this facet hosts kind '${kind}', which is not in the registry. ` +
-            `Registered kinds: ${Object.keys(kinds).join(", ")}.`,
-        );
-      }
-      const impl = new Kind(this.ctx, this.env) as object & KindHandlers;
-      // Frameworks such as PartyServer and the Agents SDK defer their setup
-      // to this hook. Run it so their instances are usable immediately.
-      const ensure = (impl as Record<string, unknown>)[
-        "__unsafe_ensureInitialized"
-      ];
-      if (typeof ensure === "function") {
-        await (ensure as (this: object) => unknown).call(impl);
-      }
-      return impl;
-    }
-
-    async __claydoCall(method: string, args: unknown[]): Promise<unknown> {
-      const impl = await this.#load();
-      const kind = this.#props.kind;
-      if (
-        typeof method !== "string" ||
-        method.startsWith("__") ||
-        RESERVED_METHODS.has(method)
-      ) {
-        throw claydoError(
-          "CLAYDO_NO_METHOD",
-          `'${method}' is reserved and is not callable through the stub.`,
-        );
-      }
-      let fn = this.#methods.get(method);
-      if (fn === undefined) {
-        fn = prototypeMethod(impl, method);
-        if (fn !== undefined) this.#methods.set(method, fn);
-      }
-      if (fn === undefined) {
-        const value = (impl as Record<string, unknown>)[method];
-        if (method in impl && typeof value !== "function") {
-          throw claydoError(
-            "CLAYDO_NO_METHOD",
-            `'${method}' on kind '${kind}' is a property, not a method ` +
-              `(type: ${typeof value}). The stub only proxies methods; ` +
-              `add a getter method to read it.`,
-          );
-        }
-        if (method in impl && typeof value === "function") {
-          throw claydoError(
-            "CLAYDO_NO_METHOD",
-            `'${method}' on kind '${kind}' is a function-valued instance ` +
-              `field, not a prototype method. Workers RPC exposes ` +
-              `prototype methods only.`,
-          );
-        }
-        throw claydoError(
-          "CLAYDO_NO_METHOD",
-          `kind '${kind}' has no method '${method}'.`,
-        );
-      }
-      return fn.apply(impl, args);
-    }
-
-    async __claydoAlarm(info: AlarmInfo): Promise<void> {
-      const impl = await this.#load();
-      await impl.alarm?.(info as unknown as AlarmInvocationInfo);
-    }
-
-    async fetch(request: Request): Promise<Response> {
-      const impl = await this.#load();
-      if (typeof impl.fetch !== "function") {
-        return new Response(
-          `claydo: kind '${this.#props.kind}' does not implement fetch().`,
-          { status: 501 },
-        );
-      }
-      return impl.fetch(request);
-    }
-
-    async webSocketMessage(
-      ws: WebSocket,
-      message: string | ArrayBuffer,
-    ): Promise<void> {
-      const impl = await this.#load();
-      await impl.webSocketMessage?.(ws, message);
-    }
-
-    async webSocketClose(
-      ws: WebSocket,
-      code: number,
-      reason: string,
-      wasClean: boolean,
-    ): Promise<void> {
-      const impl = await this.#load();
-      await impl.webSocketClose?.(ws, code, reason, wasClean);
-    }
-
-    async webSocketError(ws: WebSocket, error: unknown): Promise<void> {
-      const impl = await this.#load();
-      await impl.webSocketError?.(ws, error);
+    } catch {
+      // A frozen context still works; the kind just sees the props.
     }
   }
 
-  return ClaydoKindFacet as unknown as FacetClass;
+  #hostBridge(): AlarmBridge {
+    if (this.#bridge === undefined) {
+      const exported = (
+        this.#ctx.exports as unknown as Record<string, unknown>
+      )[this.#props.host] as
+        | { get?: (id: DurableObjectId) => AlarmBridge }
+        | undefined;
+      if (typeof exported?.get !== "function") {
+        throw claydoError(
+          "CLAYDO_CONFIG",
+          `cannot find the union export '${this.#props.host}' from ` +
+            `inside a kind facet. Keep the class returned by union() ` +
+            `exported under that name.`,
+        );
+      }
+      this.#bridge = exported.get(this.#ctx.id);
+    }
+    return this.#bridge;
+  }
+
+  async #load(): Promise<object & KindHandlers> {
+    if (this.#impl !== undefined) return this.#impl;
+    this.#implLoading ??= this.#construct().catch((error) => {
+      this.#implLoading = undefined;
+      throw error;
+    });
+    this.#impl = await this.#implLoading;
+    return this.#impl;
+  }
+
+  async #construct(): Promise<object & KindHandlers> {
+    const kind = this.#props.kind;
+    const Kind = this.#kinds[kind];
+    if (Kind === undefined) {
+      throw claydoError(
+        "CLAYDO_UNKNOWN_KIND",
+        `this facet hosts kind '${kind}', which is not in the registry. ` +
+          `Registered kinds: ${Object.keys(this.#kinds).join(", ")}.`,
+      );
+    }
+    const impl = new Kind(this.#ctx, this.#env) as object & KindHandlers;
+    // Frameworks such as PartyServer and the Agents SDK defer their setup
+    // to this hook. Run it so their instances are usable immediately.
+    const ensure = (impl as Record<string, unknown>)[
+      "__unsafe_ensureInitialized"
+    ];
+    if (typeof ensure === "function") {
+      await (ensure as (this: object) => unknown).call(impl);
+    }
+    return impl;
+  }
+
+  async call(kind: string, method: string, args: unknown[]): Promise<unknown> {
+    if (kind !== this.#props.kind) {
+      throw claydoError(
+        "CLAYDO_KIND_MISMATCH",
+        `this facet is kind '${this.#props.kind}', not '${kind}'.`,
+        { actualKind: this.#props.kind, expectedKind: kind },
+      );
+    }
+    const impl = await this.#load();
+    if (
+      typeof method !== "string" ||
+      method.startsWith("__") ||
+      RESERVED_METHODS.has(method)
+    ) {
+      throw claydoError(
+        "CLAYDO_NO_METHOD",
+        `'${method}' is reserved and is not callable through the stub.`,
+      );
+    }
+    let fn = this.#methods.get(method);
+    if (fn === undefined) {
+      fn = prototypeMethod(impl, method);
+      if (fn !== undefined) this.#methods.set(method, fn);
+    }
+    if (fn === undefined) {
+      const value = (impl as Record<string, unknown>)[method];
+      if (method in impl && typeof value !== "function") {
+        throw claydoError(
+          "CLAYDO_NO_METHOD",
+          `'${method}' on kind '${kind}' is a property, not a method ` +
+            `(type: ${typeof value}). The stub only proxies methods; ` +
+            `add a getter method to read it.`,
+        );
+      }
+      if (method in impl && typeof value === "function") {
+        throw claydoError(
+          "CLAYDO_NO_METHOD",
+          `'${method}' on kind '${kind}' is a function-valued instance ` +
+            `field, not a prototype method. Workers RPC exposes ` +
+            `prototype methods only.`,
+        );
+      }
+      throw claydoError(
+        "CLAYDO_NO_METHOD",
+        `kind '${kind}' has no method '${method}'.`,
+      );
+    }
+    return fn.apply(impl, args);
+  }
+
+  async deliverAlarm(info: AlarmInfo): Promise<void> {
+    const impl = await this.#load();
+    await impl.alarm?.(info as unknown as AlarmInvocationInfo);
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const impl = await this.#load();
+    if (typeof impl.fetch !== "function") {
+      return new Response(
+        `claydo: kind '${this.#props.kind}' does not implement fetch().`,
+        { status: 501 },
+      );
+    }
+    return impl.fetch(request);
+  }
+
+  async webSocketMessage(
+    ws: WebSocket,
+    message: string | ArrayBuffer,
+  ): Promise<void> {
+    const impl = await this.#load();
+    await impl.webSocketMessage?.(ws, message);
+  }
+
+  async webSocketClose(
+    ws: WebSocket,
+    code: number,
+    reason: string,
+    wasClean: boolean,
+  ): Promise<void> {
+    const impl = await this.#load();
+    await impl.webSocketClose?.(ws, code, reason, wasClean);
+  }
+
+  async webSocketError(ws: WebSocket, error: unknown): Promise<void> {
+    const impl = await this.#load();
+    await impl.webSocketError?.(ws, error);
+  }
 }

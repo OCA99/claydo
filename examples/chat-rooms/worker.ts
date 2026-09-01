@@ -183,7 +183,6 @@ export class AppDO extends union({
   chat: Chat,
   limiter: Limiter,
 }) {}
-export const AppDOFacet = AppDO.Facet;
 
 export default {
   async fetch(

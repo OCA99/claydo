@@ -187,7 +187,6 @@ export class Scheduler extends DurableObject<Env> {
 export class AppDO extends union({
   scheduler: Scheduler,
 }) {}
-export const AppDOFacet = AppDO.Facet;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {

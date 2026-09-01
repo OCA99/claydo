@@ -113,7 +113,6 @@ export class LiveTableDO extends union({
   shard: Shard,
   session: Session,
 }) {}
-export const LiveTableDOFacet = LiveTableDO.Facet;
 
 export default {
   async fetch(

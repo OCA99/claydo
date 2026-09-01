@@ -188,7 +188,6 @@ export class AppDO extends union({
   tally: Counter,
   broken: BrokenKind,
 }) {}
-export const AppDOFacet = AppDO.Facet;
 
 export default {
   async fetch(

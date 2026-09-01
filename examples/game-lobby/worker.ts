@@ -202,7 +202,6 @@ export class AppDO extends union({
   lobby: Lobby,
   game: Game,
 }) {}
-export const AppDOFacet = AppDO.Facet;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {

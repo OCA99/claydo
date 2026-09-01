@@ -9,7 +9,7 @@
   "migrations": [
     {
       "tag": "v1",
-      "new_sqlite_classes": ["RateLimiterDO", "RateLimiterDOFacet"]
+      "new_sqlite_classes": ["RateLimiterDO"]
     }
   ]
 }

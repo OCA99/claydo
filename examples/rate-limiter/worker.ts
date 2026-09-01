@@ -153,7 +153,6 @@ export class Bucket extends DurableObject<Env> {
 }
 
 export class RateLimiterDO extends union({ bucket: Bucket }) {}
-export const RateLimiterDOFacet = RateLimiterDO.Facet;
 
 export default {
   async fetch(

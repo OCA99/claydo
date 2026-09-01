@@ -8,7 +8,6 @@ Cloudflare Workers accounts have a hard limit on Durable Object namespaces, and 
 import { union, kinds } from "claydo";
 
 export class AppDO extends union({ counter: Counter, chat: ChatRoom }) {}
-export const AppDOFacet = AppDO.Facet;
 
 // In your Worker:
 const app = kinds(env.APP_DO);
@@ -18,7 +17,7 @@ const room = app.chat.get("lobby");
 
 ## Design
 
-The class that `union()` returns is a thin **supervisor**. It owns the instance's identity and its single native alarm, and it delegates everything else to the kind's **facet**:
+The class that `union()` returns plays one of two roles, selected once at construction. Addressed through the binding, it is a thin **supervisor**: it owns the instance's identity and its single native alarm. Started by that supervisor as a facet of the same instance, it is the kind's **facet host**: it runs the kind implementation against the facet's own database. One export covers both roles:
 
 - **Identity is the address.** A named instance is `<kind>:<name>`, so the supervisor derives the kind from the name on every request and persists no routing state. Only unique-ID instances (which have no name to parse) pin their kind in storage — written once at first contact, immutable afterwards.
 - **Storage is the kind's alone.** The facet's SQLite database and key-value store belong entirely to the kind. `claydo` stores nothing in it. `deleteAll()`, schema, and key naming are all yours.
@@ -64,7 +63,7 @@ export class Counter extends DurableObject<Env> {
 
 Kinds can use the full Durable Object surface: SQL and key-value storage, transactions, alarms, WebSockets with the hibernation API, and a `fetch()` handler.
 
-### 2. Export the union and its facet class
+### 2. Export one union class
 
 ```ts
 // index.ts
@@ -76,10 +75,9 @@ export class AppDO extends union({
   counter: Counter,
   chat: ChatRoom,
 }) {}
-export const AppDOFacet = AppDO.Facet;
 ```
 
-Two exports, one contract: the facet class is exported under the supervisor's export name plus `Facet`. The supervisor finds it in `ctx.exports` at runtime. If your bundler renames classes, pass the export name explicitly: `union(kinds, { name: "AppDO" })`.
+The supervisor starts each kind facet from this same top-level export, which it finds in `ctx.exports` by name. If your bundler renames classes, pass the export name explicitly: `union(kinds, { name: "AppDO" })`.
 
 ### 3. Configure one binding and one migration
 
@@ -90,13 +88,9 @@ Two exports, one contract: the facet class is exported under the supervisor's ex
   "durable_objects": {
     "bindings": [{ "name": "APP_DO", "class_name": "AppDO" }]
   },
-  "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["AppDO", "AppDOFacet"] }
-  ]
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AppDO"] }]
 }
 ```
-
-The facet class needs a migration entry so the runtime can start it, but no binding: nothing addresses it directly.
 
 ### 4. Call kinds from your Worker
 
@@ -239,7 +233,7 @@ Two caveats, both from the kind-prefixed naming scheme:
 
 ### `union(kinds, options?)`
 
-Creates the supervisor class from a registry of kind names to classes. Kind names must be non-empty, must not contain `:`, and must not start with `__`. The facet class is available as the static `Facet` property. Options: `name` overrides the supervisor's export name.
+Creates the union class from a registry of kind names to classes. Kind names must be non-empty, must not contain `:`, and must not start with `__`. Options: `name` overrides the class's export name. The class reserves `ctx.props` to select between its supervisor and facet roles; do not configure props on it.
 
 ### `kinds(namespace)` / `kind(namespace, kindName)`
 

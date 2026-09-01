@@ -201,7 +201,6 @@ export class Doc extends DurableObject<Env> {
 export class AppDO extends union({
   doc: Doc,
 }) {}
-export const AppDOFacet = AppDO.Facet;
 
 export default {
   async fetch(
