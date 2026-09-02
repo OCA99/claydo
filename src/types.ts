@@ -129,12 +129,16 @@ export function parseKindPrefix(name: string): string | undefined {
  * Returns the logical instance name without its `<kind>:` prefix, or
  * `undefined` for unique-ID instances. Works inside kind implementations:
  * a kind facet shares the identity of its instance.
+ *
+ * The first `:`-delimited prefix is stripped unconditionally — inside a
+ * running kind the prefix is always the kind, because instances without a
+ * registered prefix never reach kind code.
  */
 export function instanceName(ctx: DurableObjectState): string | undefined {
   const name = ctx.id.name;
   if (name === undefined) return undefined;
-  const separator = name.indexOf(":");
-  return separator === -1 ? name : name.slice(separator + 1);
+  const prefix = parseKindPrefix(name);
+  return prefix === undefined ? name : name.slice(prefix.length + 1);
 }
 
 /**
