@@ -66,6 +66,40 @@ describe("kind alarms", () => {
     expect(await reminder.alarmTime()).toBeNull();
   });
 
+  it("cancels from inside the handler without a refire", async () => {
+    const reminder = app.reminder.get("alarm-cancel-inside");
+    await reminder.cancelInsideHandler();
+    await reminder.remindAt(Date.now() + 25, "once");
+    await eventually(
+      () => reminder.fired(),
+      (value) => value !== undefined,
+    );
+    expect(await reminder.alarmTime()).toBeNull();
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(await reminder.attempts()).toBe(1);
+  });
+
+  it("keeps a schedule set during a failed delivery's retry window", async () => {
+    const reminder = app.reminder.get("alarm-backoff-schedule");
+    const later = Date.now() + 120_000;
+    await reminder.failOnce();
+    await reminder.remindAt(Date.now() + 25, "retried");
+    // Wait for the first (failing) attempt, then schedule while the
+    // delivery awaits its retry. Whichever side wins the race, the retry
+    // must complete AND the new schedule must survive.
+    await eventually(
+      () => reminder.attempts(),
+      (value) => value >= 1,
+    );
+    await reminder.remindAt(later, "retried");
+    await eventually(
+      () => reminder.fired(),
+      (value) => value !== undefined,
+      10_000,
+    );
+    expect(await reminder.alarmTime()).toBe(later);
+  });
+
   it("drops alarms of kinds without an alarm() handler, loudly", async () => {
     const plain = app.plain.get("alarm-handlerless");
     await plain.setAlarmAt(Date.now() + 25);

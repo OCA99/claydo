@@ -45,19 +45,11 @@ export function union<R extends KindRegistry>(
       // or from the persisted record on a propless wake).
       const role = readFacetIdentity(ctx);
       super(ctx, env);
+      const className = (): string => this.constructor.name;
       this.#core =
         role === undefined
-          ? new SupervisorCore(ctx, kinds, options, () =>
-              this.constructor.name,
-            )
-          : new FacetCore(
-              ctx,
-              env,
-              role.identity,
-              role.persisted,
-              kinds,
-              options,
-            );
+          ? new SupervisorCore(ctx, kinds, options, className)
+          : new FacetCore(ctx, env, role, kinds, options, className);
     }
 
     #supervisor(): SupervisorCore {
@@ -180,6 +172,10 @@ function validateRegistry(kinds: KindRegistry): void {
     while (proto !== null && proto !== Object.prototype) {
       for (const key of RESERVED_STUB_KEYS) {
         const descriptor = Object.getOwnPropertyDescriptor(proto, key);
+        // Only plain methods are rejected: accessor properties with
+        // reserved names are legitimate internal helpers (PartyServer's
+        // Server ships a `name` getter), and only a method could ever be
+        // expected to be stub-callable.
         if (descriptor && typeof descriptor.value === "function") {
           throw claydoError(
             "CLAYDO_CONFIG",

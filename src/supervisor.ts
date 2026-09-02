@@ -1,5 +1,6 @@
 import { claydoError, claydoErrorStatus, isClaydoError } from "./errors";
 import {
+  FACET_IDENTITY_KEY,
   INIT_HEADER,
   KIND_HEADER,
   LEGACY_KIND_KEY,
@@ -35,14 +36,47 @@ const KIND_KEY = "kind";
 const ALARM_PREFIX = "alarm:";
 
 /**
- * One kind's alarm entry. A plain number is a scheduled alarm. While the
- * kind's `alarm()` handler runs (and between platform retries after a
- * handler failure), the entry is a firing marker.
+ * One kind's alarm entry.
+ *
+ * The entry is a small state machine with two states:
+ *
+ * - **scheduled**: a plain number, the pending alarm time.
+ * - **firing**: `{ time, firing, attempts, next? }` — a delivery of `time`
+ *   is running or has failed and awaits retry. `attempts` counts per-kind
+ *   delivery attempts; `next` carries a schedule the kind set while the
+ *   delivery was in flight, so a retry can never erase it.
+ *
+ * Consuming a successful delivery promotes `next` to a scheduled entry or
+ * deletes the entry. Every transition re-reads the entry inside a
+ * transaction and gives up when another writer got there first.
  */
-type AlarmEntry = number | { time: number; firing: true };
+type AlarmEntry = number | FiringEntry;
 
-function alarmTime(entry: AlarmEntry): number {
-  return typeof entry === "number" ? entry : entry.time;
+interface FiringEntry {
+  time: number;
+  firing: true;
+  attempts: number;
+  next?: number;
+}
+
+function isFiring(entry: AlarmEntry): entry is FiringEntry {
+  return typeof entry !== "number";
+}
+
+/**
+ * The supervisor's own re-fire pacing for a firing entry, so a failed
+ * delivery is retried even after the platform's native retries exhaust,
+ * without hot-looping a permanently failing handler.
+ */
+function retryFloor(attempts: number): number {
+  return Math.min(1000 * 2 ** Math.min(attempts, 6), 60_000);
+}
+
+/** The time the native alarm must be armed for, for one entry. */
+function rearmTime(entry: AlarmEntry): number {
+  if (!isFiring(entry)) return entry;
+  const retryAt = entry.time + retryFloor(entry.attempts);
+  return entry.next === undefined ? retryAt : Math.min(entry.next, retryAt);
 }
 
 /** The instance type of the class that `union()` returns. */
@@ -130,6 +164,15 @@ export class SupervisorCore {
     throw claydoError("CLAYDO_CONFIG", message);
   }
 
+  #legacyLayoutError(): never {
+    this.#config(
+      `instance '${this.#identity()}' holds data written by the claydo ` +
+        `0.1.x storage layout, which this version cannot serve. Refusing ` +
+        `instead of serving an empty instance. Keep the claydo 0.1.x ` +
+        `dependency for this binding, or move the data before upgrading.`,
+    );
+  }
+
   #facets(): DurableObjectFacets {
     const facets = (
       this.#ctx as DurableObjectState & { facets?: DurableObjectFacets }
@@ -145,9 +188,10 @@ export class SupervisorCore {
   }
 
   /**
-   * Returns the union class handle, configured with facet props for
-   * `kind`. The facet runs the same top-level export as the supervisor;
-   * the props select the facet role.
+   * Returns the union class handle, configured for `kind`. The facet runs
+   * the same top-level export as the supervisor. Claydo's identity travels
+   * under the one reserved props field; the supervisor's own configured
+   * props (if any) pass through to the kind.
    */
   #facetClass(kind: string): unknown {
     let configured = this.#facetClasses.get(kind);
@@ -164,7 +208,14 @@ export class SupervisorCore {
             `{ name: "..." }.`,
         );
       }
-      const props: FacetIdentity = { v: 1, kind, host };
+      const identity: FacetIdentity = { v: 1, kind, host };
+      const ownProps = (this.#ctx as { props?: unknown }).props;
+      const props = {
+        ...(typeof ownProps === "object" && ownProps !== null
+          ? (ownProps as Record<string, unknown>)
+          : {}),
+        [FACET_IDENTITY_KEY]: identity,
+      };
       configured = entry({ props });
       this.#facetClasses.set(kind, configured);
     }
@@ -231,13 +282,7 @@ export class SupervisorCore {
       LEGACY_KIND_KEY,
     ]);
     if (persisted.get(LEGACY_KIND_KEY) !== undefined) {
-      this.#config(
-        `instance '${this.#identity()}' holds data written by the claydo ` +
-          `0.1.x storage layout, which this version cannot serve. ` +
-          `Refusing instead of serving an empty instance. Keep the claydo ` +
-          `0.1.x dependency for this binding, or move the data before ` +
-          `upgrading.`,
-      );
+      this.#legacyLayoutError();
     }
     const pinned = persisted.get(KIND_KEY) as string | undefined;
     const derived = this.#kindFromName();
@@ -279,13 +324,22 @@ export class SupervisorCore {
     const base = `instance '${identity}' has no kind yet.`;
     const name = this.#ctx.id.name;
     if (name !== undefined) {
+      const prefix = parseKindPrefix(name);
+      if (prefix !== undefined) {
+        return claydoError(
+          "CLAYDO_UNKNOWN_KIND",
+          `instance name '${name}' carries the prefix '${prefix}', which ` +
+            `is not a registered kind. Registered kinds: ` +
+            `${Object.keys(this.#kinds).join(", ")}.`,
+        );
+      }
       return claydoError(
         "CLAYDO_UNINITIALIZED",
-        `${base} Its name has no registered '<kind>:' prefix. Raw ` +
-          `namespace access (for example getByName('${name}')) reaches ` +
-          `a different instance than kind(ns, '<kind>').get('${name}'). ` +
-          `Reach instances through the kind() helper, or use a ` +
-          `'<kind>:' prefixed name.`,
+        `${base} Its name has no '<kind>:' prefix. Raw namespace access ` +
+          `(for example getByName('${name}')) reaches a different ` +
+          `instance than kind(ns, '<kind>').get('${name}'). Reach ` +
+          `instances through the kind() helper, or use a '<kind>:' ` +
+          `prefixed name.`,
       );
     }
     if (hint !== undefined && !init) {
@@ -326,12 +380,12 @@ export class SupervisorCore {
     }
   }
 
-  /** Re-arms the native alarm to the earliest scheduled kind alarm. */
-  async #rearm(txn: DurableObjectTransaction): Promise<void> {
+  /** Re-arms the native alarm to the earliest relevant alarm time. */
+  async #rearmIn(txn: DurableObjectTransaction): Promise<void> {
     const entries = await txn.list<AlarmEntry>({ prefix: ALARM_PREFIX });
     let min: number | undefined;
     for (const entry of entries.values()) {
-      const time = alarmTime(entry);
+      const time = rearmTime(entry);
       if (min === undefined || time < min) min = time;
     }
     if (min === undefined) {
@@ -341,22 +395,25 @@ export class SupervisorCore {
     }
   }
 
+  async #rearm(): Promise<void> {
+    await this.#ctx.storage.transaction(async (txn) => this.#rearmIn(txn));
+  }
+
   async setKindAlarm(kind: string, time: number): Promise<void> {
     await this.#assertKind(kind);
     await this.#ctx.storage.transaction(async (txn) => {
       const key = `${ALARM_PREFIX}${kind}`;
       const current = await txn.get<AlarmEntry>(key);
-      // A firing marker outside the running handler is a failed delivery
-      // awaiting its platform retry. A new schedule must not erase that
-      // due work, so the earlier of the two times wins.
-      const value =
-        current !== undefined &&
-        typeof current !== "number" &&
-        !this.#firing.has(kind)
-          ? Math.min(current.time, time)
-          : time;
-      await txn.put(key, value);
-      await this.#rearm(txn);
+      if (current !== undefined && isFiring(current)) {
+        // A delivery of `current.time` is in flight (running, or awaiting
+        // retry after a failure). The new schedule rides alongside in
+        // `next`; it becomes the scheduled alarm when the delivery
+        // consumes, and the due retry is never erased.
+        await txn.put(key, { ...current, next: time } satisfies FiringEntry);
+      } else {
+        await txn.put(key, time);
+      }
+      await this.#rearmIn(txn);
     });
   }
 
@@ -370,9 +427,11 @@ export class SupervisorCore {
       alarmOptions,
     );
     if (entry === undefined) return null;
-    if (typeof entry === "number") return entry;
+    if (!isFiring(entry)) return entry;
     // Native semantics: inside its own handler the fired alarm reads as
-    // consumed; between platform retries it reads as pending.
+    // consumed (or as the re-schedule the handler already made); between
+    // the retries of a failed delivery it reads as pending.
+    if (entry.next !== undefined) return entry.next;
     return this.#firing.has(kind) ? null : entry.time;
   }
 
@@ -380,87 +439,133 @@ export class SupervisorCore {
     await this.#assertKind(kind);
     await this.#ctx.storage.transaction(async (txn) => {
       await txn.delete(`${ALARM_PREFIX}${kind}`);
-      await this.#rearm(txn);
+      await this.#rearmIn(txn);
     });
   }
 
   /**
    * Dispatches every due kind alarm, then re-arms the native alarm.
    *
-   * Alarm delivery is at-least-once relative to the kind's data writes:
-   * a kind alarm entry is consumed only after the kind's `alarm()` handler
-   * returns, and a handler failure keeps the entry and retries through
-   * the platform's native retry. A handler that re-schedules its own
-   * alarm keeps the new time.
+   * Alarm delivery is at-least-once relative to the kind's data writes: a
+   * kind alarm entry is consumed only after the kind's `alarm()` handler
+   * returns, and a handler failure keeps the entry and retries — through
+   * the platform's native retry first, and through the supervisor's own
+   * paced re-fire after native retries exhaust. One kind's failure never
+   * blocks another kind's delivery, and re-arming always runs.
    */
   async alarm(alarmInfo?: AlarmInvocationInfo): Promise<void> {
+    if (
+      (await this.#ctx.storage.get<unknown>(LEGACY_KIND_KEY)) !== undefined
+    ) {
+      // A 0.1.x instance can hold a pending native alarm and user keys
+      // that collide with the alarm prefix. Touch nothing.
+      this.#legacyLayoutError();
+    }
     const entries = await this.#ctx.storage.list<AlarmEntry>({
       prefix: ALARM_PREFIX,
     });
     const now = Date.now();
     const due = [...entries]
-      .map(([key, entry]) => [key, alarmTime(entry)] as const)
+      .map(
+        ([key, entry]) =>
+          [key, isFiring(entry) ? entry.time : entry] as const,
+      )
       .filter(([, time]) => time <= now)
       .sort(([, a], [, b]) => a - b);
-    for (const [key, time] of due) {
-      const kind = key.slice(ALARM_PREFIX.length);
-      if (!Object.hasOwn(this.#kinds, kind)) {
-        console.warn(
-          `claydo: dropping an alarm for kind '${kind}', which is no ` +
-            `longer in the registry.`,
-        );
-        await this.#ctx.storage.delete(key);
-        continue;
-      }
-      // Mark the entry as firing before dispatch: the kind's own
-      // getAlarm() reads null while its handler runs, and the entry
-      // itself persists so a handler failure retries.
-      await this.#ctx.storage.put(key, { time, firing: true } as AlarmEntry);
-      const info: AlarmInfo = {
-        scheduledTime: time,
-        isRetry: alarmInfo?.isRetry ?? false,
-        retryCount: alarmInfo?.retryCount ?? 0,
-      };
-      this.#firing.add(kind);
-      try {
-        await this.#facet(kind).__claydoAlarm(info);
-      } finally {
-        this.#firing.delete(kind);
-      }
-      // Consume the firing marker only if the handler did not schedule a
-      // new alarm (a re-schedule overwrites the entry with a number).
-      await this.#ctx.storage.transaction(async (txn) => {
-        const current = await txn.get<AlarmEntry>(key);
-        if (
-          current !== undefined &&
-          typeof current !== "number" &&
-          current.time === time
-        ) {
-          await txn.delete(key);
+    let firstFailure: unknown;
+    try {
+      for (const [key, snapshotTime] of due) {
+        const kind = key.slice(ALARM_PREFIX.length);
+        if (!Object.hasOwn(this.#kinds, kind)) {
+          console.warn(
+            `claydo: dropping an alarm for kind '${kind}', which is no ` +
+              `longer in the registry.`,
+          );
+          await this.#ctx.storage.delete(key);
+          continue;
         }
-      });
+        // Mark the entry as firing with a compare-and-set: a concurrent
+        // delete or re-schedule since the snapshot wins, and the kind is
+        // skipped this round. The marker persists through a handler
+        // failure, so the delivery retries; `attempts` is this kind's own
+        // delivery count.
+        const marked = await this.#ctx.storage.transaction(
+          async (txn): Promise<FiringEntry | undefined> => {
+            const current = await txn.get<AlarmEntry>(key);
+            if (current === undefined) return undefined;
+            const time = isFiring(current) ? current.time : current;
+            if (time !== snapshotTime) return undefined;
+            const marker: FiringEntry = isFiring(current)
+              ? { ...current, attempts: current.attempts + 1 }
+              : { time, firing: true, attempts: 1 };
+            await txn.put(key, marker);
+            return marker;
+          },
+        );
+        if (marked === undefined) continue;
+        const info: AlarmInfo = {
+          scheduledTime: marked.time,
+          isRetry: marked.attempts > 1,
+          retryCount: marked.attempts - 1,
+        };
+        this.#firing.add(kind);
+        try {
+          await this.#facet(kind).__claydoAlarm(info);
+          // Consume with a compare-and-set: promote a schedule the
+          // handler (or a concurrent caller) set while the delivery ran,
+          // otherwise delete. The in-flight flag clears only after the
+          // consume commits, so reads never see a half-consumed state.
+          await this.#ctx.storage.transaction(async (txn) => {
+            const current = await txn.get<AlarmEntry>(key);
+            if (
+              current !== undefined &&
+              isFiring(current) &&
+              current.time === marked.time
+            ) {
+              if (current.next !== undefined) {
+                await txn.put(key, current.next);
+              } else {
+                await txn.delete(key);
+              }
+            }
+          });
+        } catch (error) {
+          firstFailure ??= error;
+        } finally {
+          this.#firing.delete(kind);
+        }
+      }
+    } finally {
+      await this.#rearm();
     }
-    await this.#ctx.storage.transaction(async (txn) => this.#rearm(txn));
+    if (firstFailure !== undefined) throw firstFailure;
   }
 
   async fetch(request: Request): Promise<Response> {
+    let facet: FacetStub;
+    let forwarded: Request;
     try {
       // The typed stub asserts its expected kind in a header, so a
-      // wrong-kind fetch fails exactly like a wrong-kind RPC call. A
-      // unique() stub also marks its first contact as init-capable, so
-      // pinning costs no extra round trip.
+      // wrong-kind fetch fails exactly like a wrong-kind RPC call. The
+      // init marker allows first-contact pinning in the same round trip.
       const hint = request.headers.get(KIND_HEADER) ?? undefined;
       const init =
         hint !== undefined && request.headers.get(INIT_HEADER) !== null;
       const kind = await this.#resolveKind(hint, init);
-      // The headers are claydo transport, not part of the kind's request.
-      const forwarded = new Request(request);
+      // The headers are claydo transport, not part of the kind's request,
+      // and `cf` does not survive Request cloning on its own.
+      const cf = (request as { cf?: unknown }).cf;
+      forwarded = new Request(
+        request,
+        cf === undefined ? undefined : ({ cf } as RequestInit),
+      );
       forwarded.headers.delete(KIND_HEADER);
       forwarded.headers.delete(INIT_HEADER);
-      return await this.#facet(kind).fetch(forwarded);
+      facet = this.#facet(kind);
     } catch (error) {
-      // Claydo's own errors become structured HTTP responses; the kind's
-      // errors stay native rejections for the caller to handle.
+      // Only routing and configuration errors reach this catch; they
+      // become structured HTTP responses. The kind's own errors — thrown
+      // below, outside this try — stay native rejections.
       if (isClaydoError(error)) {
         return new Response(error.message, {
           status: claydoErrorStatus(error.code),
@@ -469,5 +574,6 @@ export class SupervisorCore {
       }
       throw error;
     }
+    return facet.fetch(forwarded);
   }
 }

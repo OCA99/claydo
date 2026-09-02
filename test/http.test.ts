@@ -62,10 +62,36 @@ describe("fetch routing", () => {
   it("strips claydo transport headers before the kind sees the request", async () => {
     const created = app.counter.unique();
     const response = await created.fetch("https://do/headers");
-    expect(await response.json()).toEqual({
+    expect(await response.json()).toMatchObject({
       kindHeader: null,
       initHeader: null,
     });
+  });
+
+  it("documents that request.cf does not reach Durable Object fetches", async () => {
+    // The platform does not deliver `cf` through Durable Object stub
+    // fetches. The supervisor still forwards `cf` explicitly when it is
+    // present, so this test flags a platform change that would make that
+    // forwarding observable.
+    const response = await app.counter.get("cf-doc").fetch("https://do/headers");
+    expect(((await response.json()) as { cfPresent: boolean }).cfPresent).toBe(
+      false,
+    );
+  });
+
+  it("ignores a spoofed init header on fromId() fetches", async () => {
+    const untouched = env.APP_DO.newUniqueId();
+    const response = await app.counter
+      .fromId(untouched.toString())
+      .fetch("https://do/value", {
+        headers: { "x-claydo-init": "1" },
+      });
+    // fromId() never initializes, even when a forwarded client request
+    // carries the init marker.
+    expect(response.status).toBe(404);
+    expect(response.headers.get("x-claydo-code")).toBe(
+      "CLAYDO_UNINITIALIZED",
+    );
   });
 });
 

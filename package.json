@@ -1,6 +1,6 @@
 {
   "name": "claydo",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "One Durable Object class, many use cases. Each instance routes to a fixed kind, and each kind runs in its own isolated storage facet.",
   "license": "MIT",
   "repository": {
@@ -32,6 +32,7 @@
     "dist",
     "src",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "scripts": {

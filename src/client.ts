@@ -19,14 +19,16 @@ type ReservedKey = ReservedLifecycleMethod | ReservedStubKey | `__${string}`;
 /**
  * Property names the stub proxy answers locally with `undefined` instead
  * of an RPC-firing function: reserved kind names, and the probe keys that
- * serializers and inspectors read (`then`, `toJSON`, `constructor`).
- * Without this, `JSON.stringify(stub)` would fire a real RPC call.
+ * serializers, inspectors, and coercion read (`then`, `toJSON`,
+ * `constructor`, `valueOf`). Without this, `JSON.stringify(stub)` or
+ * `${stub}` would fire real RPC calls.
  */
 const LOCAL_UNDEFINED_KEYS = new Set<string>([
   ...RESERVED_STUB_KEYS,
   ...RESERVED_LIFECYCLE_METHODS,
   "toJSON",
   "constructor",
+  "valueOf",
 ]);
 
 /**
@@ -182,15 +184,25 @@ function makeStub<T>(
     name,
     kind: kindName,
     stub,
+    // Coercion in template literals must not fire RPC calls.
+    toString: () =>
+      `[claydo ${kindName} stub${name === undefined ? "" : ` '${name}'`}]`,
     fetch: async (
       input: RequestInfo | URL,
       init?: RequestInit,
     ): Promise<Response> => {
       const request = new Request(input as RequestInfo, init);
+      // Forwarded requests can carry claydo headers from an untrusted
+      // client; the stub owns both, so it always overwrites them.
       request.headers.set(KIND_HEADER, kindName);
-      // A unique() stub's first contact may pin the kind; the supervisor
-      // does it in the same round trip.
-      if (mode === "unique") request.headers.set(INIT_HEADER, "1");
+      if (mode === "fromId") {
+        // fromId() never initializes.
+        request.headers.delete(INIT_HEADER);
+      } else {
+        // First contact through get() or unique() may pin the kind; the
+        // supervisor does it in the same round trip.
+        request.headers.set(INIT_HEADER, "1");
+      }
       return stub.fetch(request);
     },
   };

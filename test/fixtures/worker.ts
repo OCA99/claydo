@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { Server } from "partyserver";
 import { instanceName, kinds, union } from "../../src/index";
 
 export interface Env {
@@ -104,6 +105,7 @@ export class Counter extends DurableObject<Env> {
       return Response.json({
         kindHeader: request.headers.get("x-claydo-kind"),
         initHeader: request.headers.get("x-claydo-init"),
+        cfPresent: request.cf !== undefined,
       });
     }
     return new Response("counter: not found", { status: 404 });
@@ -162,10 +164,26 @@ export class Reminder extends DurableObject<Env> {
     this.ctx.storage.kv.put("fail-once", true);
   }
 
+  async cancelInsideHandler(): Promise<void> {
+    this.ctx.storage.kv.put("cancel-inside", true);
+  }
+
+  async attempts(): Promise<number> {
+    return this.ctx.storage.kv.get<number>("attempts") ?? 0;
+  }
+
   async alarm(alarmInfo?: AlarmInvocationInfo): Promise<void> {
+    this.ctx.storage.kv.put(
+      "attempts",
+      (this.ctx.storage.kv.get<number>("attempts") ?? 0) + 1,
+    );
     if (this.ctx.storage.kv.get("fail-once") === true) {
       this.ctx.storage.kv.delete("fail-once");
       throw new Error("reminder: induced failure");
+    }
+    if (this.ctx.storage.kv.get("cancel-inside") === true) {
+      this.ctx.storage.kv.delete("cancel-inside");
+      await this.ctx.storage.deleteAlarm();
     }
     const payload = this.ctx.storage.kv.get<string>("payload");
     // Native semantics: inside the handler, the fired alarm is consumed.
@@ -350,6 +368,17 @@ export class PlainKind {
   }
 }
 
+/** A PartyServer server registered directly as a kind. */
+export class PartyRoom extends Server<Env> {
+  async hello(): Promise<string> {
+    return `party:${instanceName(this.ctx) ?? "?"}`;
+  }
+
+  async storedName(): Promise<string> {
+    return this.name;
+  }
+}
+
 /** A kind whose constructor throws. */
 export class BrokenKind extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
@@ -368,6 +397,7 @@ export class AppDO extends union({
   chat: ChatRoom,
   plain: PlainKind,
   broken: BrokenKind,
+  party: PartyRoom,
 }) {}
 
 /** A union exported without a subclass: the name option carries the export name. */

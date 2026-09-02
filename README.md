@@ -172,7 +172,7 @@ async alarm(info?: AlarmInvocationInfo): Promise<void> {
 The contract:
 
 - **At-least-once, not exactly-once.** The alarm entry is consumed only after your `alarm()` handler returns. A handler failure keeps the entry and retries through the platform's native retry (`info.isRetry`, `info.retryCount`). Write handlers to tolerate replay.
-- **Native in-handler semantics.** Inside `alarm()`, `getAlarm()` reads `null` — the fired alarm is already consumed, exactly like a native Durable Object — so guard-based periodic chains (`if (await getAlarm() === null) setAlarm(next)`) work unchanged. Between the retries of a failed handler, `getAlarm()` reads the pending time, and a `setAlarm()` in that window keeps the earlier of the two times, so the failed delivery is never silently erased.
+- **Native in-handler semantics.** Inside `alarm()`, `getAlarm()` reads `null` — the fired alarm is already consumed, exactly like a native Durable Object — so guard-based periodic chains (`if (await getAlarm() === null) setAlarm(next)`) work unchanged. Between the retries of a failed delivery, `getAlarm()` reads the pending time; a `setAlarm()` made while a delivery is in flight rides alongside it and becomes the scheduled alarm once the delivery consumes, so neither the retry nor the new schedule is ever lost. After the platform's native retries exhaust, the supervisor re-fires failed deliveries itself, with a growing backoff.
 - **A kind that schedules alarms must define `alarm()`.** An alarm delivered to a kind without a handler is dropped with a loud log line.
 - **Re-scheduling inside the handler works.** A handler that calls `setAlarm()` keeps the new time.
 - **Scheduling is not atomic with your data writes.** Alarm state lives with the instance, outside the kind's database. The safe pattern is: persist the job first, then schedule; on fire, read the job and tolerate a replay. Alarm calls inside `storage.transaction()` or `storage.transactionSync()` throw `CLAYDO_ALARM_IN_TRANSACTION` instead of losing atomicity silently. The guard tracks open transactions, not call scope: an alarm call issued concurrently with an open transaction (for example through `Promise.all`) is also rejected — sequence the alarm call after the transaction commits.
@@ -237,7 +237,7 @@ Two caveats, both from the kind-prefixed naming scheme:
 
 ### `union(kinds, options?)`
 
-Creates the union class from a registry of kind names to classes. Kind names must be non-empty, must not contain `:`, and must not start with `__`. Options: `name` overrides the class's export name; `onStart` runs once after a kind instance is constructed (the default runs the `__unsafe_ensureInitialized()` hook that PartyServer and the Agents SDK use). The class reserves `ctx.props` to select between its supervisor and facet roles; do not configure props on it.
+Creates the union class from a registry of kind names to classes. Kind names must be non-empty, must not contain `:`, and must not start with `__`. Options: `name` overrides the class's export name; `onStart` runs once after a kind instance is constructed (the default runs the `__unsafe_ensureInitialized()` hook that PartyServer and the Agents SDK use). The class reserves the `__claydo` field of `ctx.props` for its role selection; all other configured props pass through to the kind.
 
 ### `kinds(namespace)` / `kind(namespace, kindName)`
 

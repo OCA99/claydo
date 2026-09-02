@@ -11,9 +11,34 @@ import {
 } from "./types";
 import type { UnionOptions } from "./supervisor";
 
+/** Methods that `call()` refuses to dispatch. */
+const RESERVED_METHODS = new Set<string>([
+  ...RESERVED_LIFECYCLE_METHODS,
+  ...RESERVED_STUB_KEYS,
+  "constructor",
+]);
+
+/** Storage methods that relay to the supervisor's alarm bridge. */
+const ALARM_METHODS = new Set(["setAlarm", "getAlarm", "deleteAlarm"]);
+
+/** Storage methods that write keys and must protect the reserved key. */
+const KEYED_WRITE_METHODS = new Set(["put", "delete"]);
+
+/** The supervisor methods that back the facet's alarm API. */
+interface AlarmBridge {
+  __claydoSetAlarm(kind: string, time: number): Promise<void>;
+  __claydoGetAlarm(
+    kind: string,
+    options?: DurableObjectGetAlarmOptions,
+  ): Promise<number | null>;
+  __claydoDeleteAlarm(kind: string): Promise<void>;
+}
+
 /** The facet role of a starting instance, when it has one. */
 export interface FacetRole {
   identity: FacetIdentity;
+  /** The kind's own props: the startup props minus claydo's field. */
+  kindProps: Record<string, unknown> | undefined;
   /** True when the identity came from storage rather than props. */
   persisted: boolean;
 }
@@ -22,23 +47,24 @@ export interface FacetRole {
  * Interprets a starting instance's props. Returns the facet role, or
  * `undefined` for the supervisor role.
  *
- * The runtime gives unconfigured instances an empty props object, so
- * absent, null, and empty props normally mean supervisor. Empty props on
- * an instance whose storage holds a persisted facet identity mean the
+ * Claydo's identity travels under the one reserved props field
+ * (`__claydo`); all other props belong to the application and pass
+ * through. Props without the reserved field mean supervisor — unless the
+ * instance's storage holds a persisted facet identity, which means the
  * runtime started an existing facet without replaying its startup props
- * (for example on a hibernation wake); the identity restores the facet
- * role. Props that claydo did not write are a configuration error, never
- * a silent role guess.
+ * (for example on a hibernation wake). A malformed reserved field is a
+ * configuration error, never a silent role guess.
  */
 export function readFacetIdentity(
   ctx: DurableObjectState,
 ): FacetRole | undefined {
   const props = (ctx as { props?: unknown }).props;
-  const empty =
-    props === undefined ||
-    props === null ||
-    (typeof props === "object" && Object.keys(props).length === 0);
-  if (empty) {
+  const record =
+    typeof props === "object" && props !== null
+      ? (props as Record<string, unknown>)
+      : undefined;
+  const branded = record?.[FACET_IDENTITY_KEY];
+  if (branded === undefined) {
     const kv = (ctx.storage as { kv?: DurableObjectStorage["kv"] } | undefined)
       ?.kv;
     if (kv === undefined || typeof kv.get !== "function") {
@@ -50,33 +76,33 @@ export function readFacetIdentity(
       );
     }
     const identity = kv.get<unknown>(FACET_IDENTITY_KEY);
-    return isFacetIdentity(identity)
-      ? { identity, persisted: true }
-      : undefined;
+    if (!isFacetIdentity(identity)) return undefined;
+    const storedProps = (identity as { props?: unknown }).props;
+    return {
+      identity,
+      kindProps:
+        typeof storedProps === "object" && storedProps !== null
+          ? (storedProps as Record<string, unknown>)
+          : undefined,
+      persisted: true,
+    };
   }
-  if (isFacetIdentity(props)) return { identity: props, persisted: false };
-  throw claydoError(
-    "CLAYDO_CONFIG",
-    "the union class reserves ctx.props to select between its supervisor " +
-      "and facet roles. Do not configure props on this class.",
-  );
-}
-
-/** Methods that `call()` refuses to dispatch. */
-const RESERVED_METHODS = new Set<string>([
-  ...RESERVED_LIFECYCLE_METHODS,
-  ...RESERVED_STUB_KEYS,
-  "constructor",
-]);
-
-/** The supervisor methods that back the facet's alarm API. */
-interface AlarmBridge {
-  __claydoSetAlarm(kind: string, time: number): Promise<void>;
-  __claydoGetAlarm(
-    kind: string,
-    options?: DurableObjectGetAlarmOptions,
-  ): Promise<number | null>;
-  __claydoDeleteAlarm(kind: string): Promise<void>;
+  if (!isFacetIdentity(branded)) {
+    throw claydoError(
+      "CLAYDO_CONFIG",
+      `the union class reserves the '${FACET_IDENTITY_KEY}' props field ` +
+        `for its role selection. Do not configure that field.`,
+    );
+  }
+  const kindProps: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(record!)) {
+    if (key !== FACET_IDENTITY_KEY) kindProps[key] = value;
+  }
+  return {
+    identity: branded,
+    kindProps: Object.keys(kindProps).length > 0 ? kindProps : undefined,
+    persisted: false,
+  };
 }
 
 /** Quotes an SQLite identifier. */
@@ -151,12 +177,12 @@ function deleteAllFacetStorage(
  * fields (and `cause`) all clone pass through unchanged; anything else is
  * rebuilt with its name, message, stack, and every cloneable field, so
  * the caller always receives the real error instead of an opaque
- * serialization failure. Non-Error throwables that cannot clone become
- * plain Errors carrying their string form.
+ * serialization failure. Non-Error throwables become plain Errors
+ * carrying their string form: Workers RPC tunnels Errors specially, and
+ * raw values have no defined delivery.
  */
 function wireSafeError(error: unknown, depth = 0): unknown {
   if (!(error instanceof Error)) {
-    if (isCloneable(error)) return error;
     return new Error(String(error));
   }
   const fields = new Map<string, unknown>();
@@ -195,15 +221,6 @@ function wireSafeError(error: unknown, depth = 0): unknown {
   return safe;
 }
 
-function isCloneable(value: unknown): boolean {
-  try {
-    structuredClone(value);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 /**
  * Rewires the facet's own storage object so the kind gets the normal
  * Durable Object storage API:
@@ -216,8 +233,10 @@ function isCloneable(value: unknown): boolean {
  * - `deleteAll()` clears the kind's tables and key-value data explicitly.
  * - Writes to the reserved identity key are rejected.
  *
- * The methods are replaced in place on the real storage object, so
- * references captured in a kind constructor behave the same as `this.ctx`.
+ * The same interception sets drive the storage object and the transaction
+ * proxy, so the two surfaces cannot diverge. The methods are replaced in
+ * place on the real storage object, so references captured in a kind
+ * constructor behave the same as `this.ctx`.
  */
 function adaptFacetStorage(
   ctx: DurableObjectState,
@@ -245,6 +264,12 @@ function adaptFacetStorage(
   const assertOutsideTransaction = (): void => {
     if (transactionDepth > 0) rejectAlarmInTransaction();
   };
+  const guardedWrite =
+    (write: (...args: unknown[]) => unknown) =>
+    (key: unknown, ...rest: unknown[]): unknown => {
+      assertWritableKeys(key);
+      return write(key, ...rest);
+    };
 
   const replacements: Record<string, unknown> = {
     setAlarm: (scheduledTime: number | Date): Promise<void> => {
@@ -265,14 +290,8 @@ function adaptFacetStorage(
       assertOutsideTransaction();
       return bridge().__claydoDeleteAlarm(kind);
     },
-    put: (key: unknown, ...rest: unknown[]): unknown => {
-      assertWritableKeys(key);
-      return (nativePut as (...args: unknown[]) => unknown)(key, ...rest);
-    },
-    delete: (key: unknown, ...rest: unknown[]): unknown => {
-      assertWritableKeys(key);
-      return (nativeDelete as (...args: unknown[]) => unknown)(key, ...rest);
-    },
+    put: guardedWrite(nativePut as (...args: unknown[]) => unknown),
+    delete: guardedWrite(nativeDelete as (...args: unknown[]) => unknown),
     transaction: <T>(
       closure: (txn: DurableObjectTransaction) => Promise<T>,
     ): Promise<T> =>
@@ -282,26 +301,21 @@ function adaptFacetStorage(
           return await closure(
             new Proxy(txn, {
               get(target, property) {
-                if (
-                  property === "setAlarm" ||
-                  property === "getAlarm" ||
-                  property === "deleteAlarm"
-                ) {
-                  return rejectAlarmInTransaction;
+                if (typeof property === "string") {
+                  if (ALARM_METHODS.has(property)) {
+                    return rejectAlarmInTransaction;
+                  }
+                  if (KEYED_WRITE_METHODS.has(property)) {
+                    const value = Reflect.get(target, property, target) as (
+                      ...args: unknown[]
+                    ) => unknown;
+                    return guardedWrite(value.bind(target));
+                  }
                 }
                 const value = Reflect.get(target, property, target);
-                if (typeof value !== "function") return value;
-                if (property === "put" || property === "delete") {
-                  return (key: unknown, ...rest: unknown[]): unknown => {
-                    assertWritableKeys(key);
-                    return (value as (...args: unknown[]) => unknown).call(
-                      target,
-                      key,
-                      ...rest,
-                    );
-                  };
-                }
-                return value.bind(target);
+                return typeof value === "function"
+                  ? value.bind(target)
+                  : value;
               },
             }),
           );
@@ -326,14 +340,8 @@ function adaptFacetStorage(
     Object.defineProperty(storage, name, { value, configurable: true });
   }
   const kvReplacements: Record<string, unknown> = {
-    put: (key: unknown, ...rest: unknown[]): unknown => {
-      assertWritableKeys(key);
-      return (nativeKvPut as (...args: unknown[]) => unknown)(key, ...rest);
-    },
-    delete: (key: unknown): unknown => {
-      assertWritableKeys(key);
-      return nativeKvDelete(key as string);
-    },
+    put: guardedWrite(nativeKvPut as (...args: unknown[]) => unknown),
+    delete: guardedWrite(nativeKvDelete as (...args: unknown[]) => unknown),
   };
   for (const [name, value] of Object.entries(kvReplacements)) {
     Object.defineProperty(storage.kv, name, { value, configurable: true });
@@ -396,43 +404,66 @@ export class FacetCore {
   readonly #env: unknown;
   readonly #identity: FacetIdentity;
   readonly #kinds: KindRegistry;
-  readonly #onStart: (instance: object) => void | Promise<void>;
+  readonly #options: UnionOptions;
+  readonly #className: () => string;
+  readonly #kindProps: Record<string, unknown> | undefined;
+  readonly #rawKvPut: (key: string, value: unknown) => void;
   #implLoading?: Promise<object & KindHandlers>;
 
   constructor(
     ctx: DurableObjectState,
     env: unknown,
-    identity: FacetIdentity,
-    persisted: boolean,
+    role: FacetRole,
     kinds: KindRegistry,
     options: UnionOptions,
+    className: () => string,
   ) {
     this.#ctx = ctx;
     this.#env = env;
-    this.#identity = identity;
+    this.#identity = role.identity;
     this.#kinds = kinds;
-    this.#onStart = options.onStart ?? defaultOnStart;
-    // Persist the facet's identity under the one reserved key in the
-    // kind's key-value store, so the facet can select its role even when
-    // the runtime starts it without props.
-    if (!persisted) {
-      ctx.storage.kv.put(FACET_IDENTITY_KEY, identity);
+    this.#options = options;
+    this.#className = className;
+    this.#kindProps = role.kindProps;
+    this.#rawKvPut = ctx.storage.kv.put.bind(ctx.storage.kv);
+    // Persist the facet's identity (and the kind's own props, so a
+    // propless wake restores them too) under the one reserved key.
+    if (!role.persisted) {
+      this.#rawKvPut(FACET_IDENTITY_KEY, this.#identityRecord());
     }
-    adaptFacetStorage(ctx, identity.kind, () => this.#hostBridge());
-    // The kind implementation gets a clean context: the props are a claydo
-    // detail, not part of the kind's contract.
+    adaptFacetStorage(ctx, role.identity.kind, () => this.#hostBridge());
+    // The kind sees its own props: the startup props minus claydo's
+    // reserved field.
     try {
       Object.defineProperty(ctx, "props", {
-        value: undefined,
+        value: role.kindProps,
         configurable: true,
       });
     } catch {
-      // A frozen context still works; the kind just sees the props.
+      // A frozen context still works; the kind just sees the raw props.
     }
   }
 
   #instanceIdentity(): string {
     return this.#ctx.id.name ?? this.#ctx.id.toString();
+  }
+
+  #identityRecord(host = this.#identity.host): FacetIdentity {
+    return {
+      ...this.#identity,
+      host,
+      ...(this.#kindProps !== undefined ? { props: this.#kindProps } : {}),
+    } as FacetIdentity;
+  }
+
+  /**
+   * The current export name of the union class. The current code (the
+   * `name` option or the exported class's own name) wins over the
+   * persisted identity, so an export rename does not strand facets woken
+   * from storage with the old name.
+   */
+  #hostExport(): string {
+    return this.#options.name ?? this.#className();
   }
 
   /**
@@ -441,20 +472,31 @@ export class FacetCore {
    * supervisor object resets while this facet stays live.
    */
   #hostBridge(): AlarmBridge {
-    const exported = (
-      this.#ctx.exports as unknown as Record<string, unknown>
-    )[this.#identity.host] as
-      | { get?: (id: DurableObjectId) => AlarmBridge }
-      | undefined;
-    if (typeof exported?.get !== "function") {
-      throw claydoError(
-        "CLAYDO_CONFIG",
-        `cannot find the union export '${this.#identity.host}' from ` +
-          `inside a kind facet. Keep the class returned by union() ` +
-          `exported under that name.`,
-      );
+    const exports = this.#ctx.exports as unknown as Record<string, unknown>;
+    const current = this.#hostExport();
+    const candidates =
+      current === this.#identity.host
+        ? [current]
+        : [current, this.#identity.host];
+    for (const host of candidates) {
+      const exported = exports[host] as
+        | { get?: (id: DurableObjectId) => AlarmBridge }
+        | undefined;
+      if (typeof exported?.get === "function") {
+        if (host !== this.#identity.host) {
+          // The export was renamed; refresh the persisted identity so
+          // later propless wakes resolve directly.
+          this.#rawKvPut(FACET_IDENTITY_KEY, this.#identityRecord(host));
+        }
+        return exported.get(this.#ctx.id);
+      }
     }
-    return exported.get(this.#ctx.id);
+    throw claydoError(
+      "CLAYDO_CONFIG",
+      `cannot find the union export '${current}' from inside a kind ` +
+        `facet. Keep the class returned by union() exported under that ` +
+        `name, or pass its export name to union() as { name: "..." }.`,
+    );
   }
 
   #load(): Promise<object & KindHandlers> {
@@ -475,7 +517,7 @@ export class FacetCore {
       );
     }
     const impl = new Kind(this.#ctx, this.#env) as object & KindHandlers;
-    await this.#onStart(impl);
+    await (this.#options.onStart ?? defaultOnStart)(impl);
     return impl;
   }
 

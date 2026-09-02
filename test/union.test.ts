@@ -218,10 +218,17 @@ describe("error fidelity across the stub", () => {
     expect(error.message).toBe("db down");
   });
 
+  it("normalizes non-Error throwables into Errors", async () => {
+    const error = await caught(app.vault.get("errors").openNonError());
+    expect(error).toBeInstanceOf(Error);
+    expect(error.message).toContain("not an Error instance");
+  });
+
   it("delivers non-Error throwables that cannot serialize", async () => {
     const error = await caught(
       app.vault.get("errors").openWithHostilePlainThrow(),
     );
+    expect(error).toBeInstanceOf(Error);
     expect(error.message).toBeDefined();
   });
 
@@ -251,6 +258,31 @@ describe("error fidelity across the stub", () => {
 describe("kinds without a DurableObject base", () => {
   it("runs plain (ctx, env) classes", async () => {
     expect(await app.plain.get("plain-1").touch()).toBe("plain");
+  });
+});
+
+describe("framework kinds", () => {
+  it("hosts a PartyServer Server as a kind", async () => {
+    expect(await app.party.get("lobby").hello()).toBe("party:lobby");
+  });
+
+  it("initializes framework kinds on RPC-first access", async () => {
+    // The deferred PartyServer setup runs through the onStart hook, so
+    // the name is available without a warm-up fetch.
+    const name = await app.party.get("init-first").storedName();
+    expect(typeof name).toBe("string");
+    expect(name.length).toBeGreaterThan(0);
+  });
+
+  it("rejects getServerByName-style access with guidance", async () => {
+    const { getServerByName } = await import("partyserver");
+    const error = await caught(
+      getServerByName(
+        env.APP_DO as unknown as Parameters<typeof getServerByName>[0],
+        "lobby",
+      ) as unknown as Promise<unknown>,
+    );
+    expect(error.message).toContain("kind(ns, '<kind>').get(name)");
   });
 });
 
@@ -325,9 +357,8 @@ describe("union configuration errors", () => {
 describe("role selection", () => {
   const Union = union({ counter: Counter });
 
-  it("rejects construction with props that claydo did not write", () => {
-    for (const props of [
-      { anything: true },
+  it("rejects construction when the reserved props field is malformed", () => {
+    for (const branded of [
       { v: 1 },
       { v: 1, kind: "counter" },
       { v: 2, kind: "counter", host: "AppDO" },
@@ -335,9 +366,33 @@ describe("role selection", () => {
       42,
     ]) {
       expect(
-        () => new Union({ props } as unknown as DurableObjectState, {}),
-      ).toThrowError(/reserves ctx\.props/);
+        () =>
+          new Union(
+            { props: { __claydo: branded } } as unknown as DurableObjectState,
+            {},
+          ),
+      ).toThrowError(/reserves the '__claydo' props field/);
     }
+  });
+
+  it("passes user props through and keeps the supervisor role without the brand", () => {
+    const fakeCtx = {
+      props: { tenant: "acme" },
+      storage: { kv: { get: () => undefined } },
+    } as unknown as DurableObjectState;
+    expect(readFacetIdentity(fakeCtx)).toBeUndefined();
+  });
+
+  it("separates the kind's props from claydo's identity field", () => {
+    const identity = { v: 1, kind: "counter", host: "AppDO" };
+    const fakeCtx = {
+      props: { __claydo: identity, tenant: "acme" },
+    } as unknown as DurableObjectState;
+    expect(readFacetIdentity(fakeCtx)).toEqual({
+      identity,
+      kindProps: { tenant: "acme" },
+      persisted: false,
+    });
   });
 
   it("restores the facet role from the persisted identity on a propless start", () => {
@@ -353,6 +408,7 @@ describe("role selection", () => {
     } as unknown as DurableObjectState;
     expect(readFacetIdentity(fakeCtx)).toEqual({
       identity,
+      kindProps: undefined,
       persisted: true,
     });
   });
