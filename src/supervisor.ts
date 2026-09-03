@@ -210,10 +210,23 @@ export class SupervisorCore {
       }
       const identity: FacetIdentity = { v: 1, kind, host };
       const ownProps = (this.#ctx as { props?: unknown }).props;
-      const props = {
-        ...(typeof ownProps === "object" && ownProps !== null
+      const passthrough =
+        typeof ownProps === "object" && ownProps !== null
           ? (ownProps as Record<string, unknown>)
-          : {}),
+          : {};
+      // A binding-configured reserved field would be silently overwritten
+      // here (and a valid-shaped one would already have selected the
+      // facet role at construction), so any own reserved key on the
+      // binding props fails loudly instead.
+      if (Object.hasOwn(passthrough, FACET_IDENTITY_KEY)) {
+        this.#config(
+          `the binding props of this union class define the reserved ` +
+            `'${FACET_IDENTITY_KEY}' field. Claydo owns that field; ` +
+            `remove it from the binding configuration.`,
+        );
+      }
+      const props = {
+        ...passthrough,
         [FACET_IDENTITY_KEY]: identity,
       };
       configured = entry({ props });

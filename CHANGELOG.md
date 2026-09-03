@@ -21,7 +21,7 @@ A ground-up rebuild on [Durable Object facets](https://developers.cloudflare.com
 
 - Claydo's own errors carry a stable `code` (`ClaydoErrorCode`); messages are not a contract. On the fetch path, claydo errors become structured responses with an `x-claydo-code` header.
 - The reserved-name set for kind methods grew: `ctx`, `env`, and `then` join `id`, `name`, `kind`, and `stub`. `union()` rejects kinds that define these as prototype methods, at module evaluation.
-- Alarms are supervisor-multiplexed with documented at-least-once delivery: entries are consumed only after the handler returns, failures retry (native retry first, a paced supervisor re-fire after), `getAlarm()` inside the handler reads `null`, and a schedule set during a failed delivery's retry window is preserved alongside the retry.
+- Alarms are supervisor-multiplexed with documented at-least-once delivery: entries are consumed only after the handler returns, failures retry (native retry first, a paced supervisor re-fire after), `getAlarm()` inside the handler reads `null`, and a schedule set during a failed delivery's retry window is preserved alongside the retry. An explicit `deleteAlarm()` cancels everything, including a pending retry of a failed delivery.
 - `fromId()` never initializes an instance and fails with `CLAYDO_UNINITIALIZED` on untouched IDs.
 - `union()` reserves the `__claydo` field of `ctx.props`; all other configured props pass through to the kind.
 
