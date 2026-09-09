@@ -6,14 +6,14 @@
   "durable_objects": {
     "bindings": [
       { "name": "APP_DO", "class_name": "AppDO" },
-      { "name": "LEGACY", "class_name": "LegacyTally" },
-      { "name": "LEGACY_FW", "class_name": "LegacyFramework" }
+      { "name": "RENAMED", "class_name": "RenamedDO" },
+      { "name": "MISNAMED", "class_name": "Misnamed" }
     ]
   },
   "migrations": [
     {
       "tag": "v1",
-      "new_sqlite_classes": ["AppDO", "LegacyTally", "LegacyFramework"]
+      "new_sqlite_classes": ["AppDO", "RenamedDO", "Misnamed"]
     }
   ]
 }

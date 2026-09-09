@@ -6,5 +6,7 @@
   "durable_objects": {
     "bindings": [{ "name": "APP_DO", "class_name": "ShopDO" }]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ShopDO"] }]
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["ShopDO"] }
+  ]
 }

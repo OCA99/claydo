@@ -4,10 +4,10 @@ import {
   waitOnExecutionContext,
 } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { kind } from "../../../src/index";
+import { isClaydoError, kinds } from "../../../src/index";
 import worker, { type TakeResult } from "../worker";
 
-const buckets = () => kind(env.APP_DO, "bucket");
+const buckets = () => kinds(env.APP_DO).bucket;
 
 describe("token bucket: exhaustion", () => {
   it("allows until the bucket is empty, then denies with retryAfterMs", async () => {
@@ -78,6 +78,8 @@ describe("token bucket: instance independence", () => {
     const a = buckets().get("key-a");
     const b = buckets().get("key-b");
     expect(a.id.toString()).not.toBe(b.id.toString());
+    expect(a.kind).toBe("bucket");
+    expect(a.name).toBe("key-a");
     await a.configure(1, 1);
     await b.configure(1, 1);
     await a.take();
@@ -96,12 +98,12 @@ describe("token bucket: instance independence", () => {
 describe("token bucket: config persistence", () => {
   it("persists config in SQLite and reads it back through a fresh stub", async () => {
     await buckets().get("key-persist").configure(42, 7);
-    // A brand-new accessor and stub for the same logical key.
-    const again = kind(env.APP_DO, "bucket").get("key-persist");
+    // A brand-new stub for the same logical key.
+    const again = buckets().get("key-persist");
     expect(await again.config()).toEqual({ capacity: 42, refillPerSec: 7 });
-    // The kind pin also persisted: raw access resolves it from storage.
-    const raw = env.APP_DO.get(buckets().idFromName("key-persist"));
-    expect(await raw.__claydoKind()).toBe("bucket");
+    // The same instance is also reachable by its Durable Object ID.
+    const byId = buckets().fromId(buckets().idFromName("key-persist"));
+    expect(await byId.config()).toEqual({ capacity: 42, refillPerSec: 7 });
   });
 
   it("reconfigure refills to the new capacity", async () => {
@@ -127,7 +129,7 @@ describe("token bucket: concurrency", () => {
 });
 
 describe("error propagation through the stub", () => {
-  it("keeps name, message, custom fields AND the remote stack (new); instanceof still lost by design", async () => {
+  it("keeps name, message, custom fields, and the remote stack; instanceof does not survive", async () => {
     const bucket = buckets().get("key-bad-config");
     let thrown: unknown;
     try {
@@ -140,20 +142,34 @@ describe("error propagation through the stub", () => {
     expect(err.message).toBe(
       "configure(capacity, refillPerSec) requires positive numbers, got (-1, 0)",
     );
-    // NEW: own enumerable fields survive the RPC hop.
+    // Own enumerable fields survive the RPC hop.
     expect(err.code).toBe("ERR_BAD_BUCKET_CONFIG");
-    // NEW: the remote stack survives, followed by a marker line, then local frames.
-    expect(err.stack).toContain("Bucket.configure");
-    expect(err.stack).toContain(
-      "at [remote call bucket.configure() via claydo]",
-    );
-    // Unchanged (documented as by-design): the class does not survive.
-    expect(err).not.toBeInstanceOf(RangeError);
+    // The stack is the real stack from inside the kind.
+    expect(err.stack).toContain("configure");
+    // Built-in error classes are reconstructed across RPC. Custom error
+    // classes are not; match those on error.name or error.code.
+    expect(err).toBeInstanceOf(RangeError);
   });
 });
 
-describe("resetStorage keeps the kind pinned", () => {
-  it("reset() wipes state but the instance stays kind 'bucket'", async () => {
+describe("addressing rules", () => {
+  it("fromId() never initializes: an untouched id fails with CLAYDO_UNINITIALIZED", async () => {
+    const untouched = env.APP_DO.newUniqueId();
+    let thrown: unknown;
+    try {
+      await buckets().fromId(untouched.toString()).config();
+    } catch (error) {
+      thrown = error;
+    }
+    expect(isClaydoError(thrown)).toBe(true);
+    if (isClaydoError(thrown)) {
+      expect(thrown.code).toBe("CLAYDO_UNINITIALIZED");
+    }
+  });
+});
+
+describe("deleteAll resets a bucket", () => {
+  it("reset() wipes state back to defaults and the bucket keeps working", async () => {
     const bucket = buckets().get("key-reset");
     await bucket.configure(42, 7);
     expect(await bucket.config()).toEqual({ capacity: 42, refillPerSec: 7 });
@@ -162,9 +178,6 @@ describe("resetStorage keeps the kind pinned", () => {
     // Config is gone, back to defaults; the bucket still works.
     expect(await bucket.config()).toEqual({ capacity: 10, refillPerSec: 1 });
     expect((await bucket.take()).allowed).toBe(true);
-    // The kind pin survived the deleteAll (this is what resetStorage adds).
-    const raw = env.APP_DO.get(buckets().idFromName("key-reset"));
-    expect(await raw.__claydoKind()).toBe("bucket");
   });
 });
 
@@ -187,7 +200,9 @@ describe("worker routes end to end", () => {
     });
     expect(put.status).toBe(200);
 
-    expect((await call("/limits/e2e-key/take", { method: "POST" })).status).toBe(200);
+    expect(
+      (await call("/limits/e2e-key/take", { method: "POST" })).status,
+    ).toBe(200);
     const second = await call("/limits/e2e-key/take?n=1", { method: "POST" });
     expect(second.status).toBe(200);
     expect(((await second.json()) as TakeResult).remaining).toBe(0);

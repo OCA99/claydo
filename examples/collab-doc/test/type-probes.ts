@@ -1,30 +1,36 @@
 /**
- * Compile-time DX probes. Each `@ts-expect-error` documents a diagnostic
- * that TypeScript produces for a misuse; the verbatim messages are quoted
- * in ../DX-REPORT.md. This file is typechecked but never executed.
+ * Compile-time checks of the typed stub. Each `@ts-expect-error` marks a
+ * misuse that TypeScript must reject. This file is typechecked but never
+ * executed.
  */
 import { env } from "cloudflare:test";
-import { kind } from "../../../src/index";
+import { kinds } from "../../../src/index";
+import type { KindNameOf, KindStub } from "../../../src/index";
+import type { Doc } from "../worker";
 
-const doc = kind(env.APP_DO, "doc").get("ts-probe");
+// The accessor returns a typed stub for the kind's instance type.
+const doc: KindStub<Doc> = kinds(env.APP_DO).doc.get("type-checks");
 
-// Typo'd method (TS2551):
-//   Property 'getTxt' does not exist on type 'KindStub<Doc>'.
-//   Did you mean 'getText'?
-// @ts-expect-error
+// Method names are checked against the kind class.
+// @ts-expect-error 'getTxt' does not exist on the stub.
 void doc.getTxt();
 
-// Malformed op payload is caught with a regular structural error (TS2322):
-//   Type 'string' is not assignable to type 'number'.
-// @ts-expect-error
+// Argument types are checked structurally.
+// @ts-expect-error 'pos' must be a number.
 void doc.applyOp({ type: "insert", pos: "zero", text: "x" });
 
-// Return types are awaited and exact: getText() yields Promise<string>.
+// Return types are exact and always promise-wrapped.
 const text: Promise<string> = doc.getText();
 
-// The stub deliberately does not expose lifecycle handlers:
-//   Property 'webSocketMessage' does not exist on type 'KindStub<Doc>'. (TS2339)
-// @ts-expect-error
+// Lifecycle handlers are not RPC methods, so the stub does not expose them.
+// @ts-expect-error 'webSocketMessage' does not exist on the stub.
 void doc.webSocketMessage;
 
+// KindNameOf extracts the kind names registered on the namespace.
+const kindName: KindNameOf<typeof env.APP_DO> = "doc";
+// @ts-expect-error 'chat' is not a registered kind.
+const wrongKind: KindNameOf<typeof env.APP_DO> = "chat";
+
 void text;
+void kindName;
+void wrongKind;

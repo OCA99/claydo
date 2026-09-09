@@ -1,22 +1,22 @@
 /**
  * game-lobby example for claydo.
  *
- * Two kinds share one host DO class:
- *  - `lobby`: a singleton (`get("main")`) that creates matches and lists them.
+ * Two kinds share one Durable Object class:
+ *  - `lobby`: a singleton (`get("main")`) that creates matches and tracks
+ *    them in its own SQLite database.
  *  - `game`: one instance per match (created with `unique()`), running a
  *    turn-based tic-tac-toe game with a turn-timeout alarm and WebSocket
  *    spectators.
  */
 import { DurableObject } from "cloudflare:workers";
-import { kind, union } from "../../src/index";
+import { isClaydoError, kind, kinds, union } from "../../src/index";
 
 export interface Env {
   APP_DO: DurableObjectNamespace<AppDO>;
-  METRICS_DO: DurableObjectNamespace<MetricsDO>;
 }
 
 /** How long the current player has to move before the alarm forfeits them. */
-export const TURN_TIMEOUT_MS = 30_000;
+export const DEFAULT_TURN_TIMEOUT_MS = 30_000;
 
 export interface GameState {
   players: [string, string];
@@ -24,10 +24,12 @@ export interface GameState {
   board: (string | null)[];
   /** Whose turn it is. Meaningless once status is "finished". */
   turn: string;
-  status: "unstarted" | "active" | "finished";
+  status: "active" | "finished";
   winner: string | null;
   /** Why the game finished: "win", "draw" or "timeout". */
   endReason: string | null;
+  /** Per-match move clock, in milliseconds. */
+  turnTimeoutMs: number;
 }
 
 const WIN_LINES = [
@@ -43,7 +45,10 @@ const WIN_LINES = [
 
 /** Turn-based tic-tac-toe with a turn-timeout alarm and spectator sockets. */
 export class Game extends DurableObject<Env> {
-  async setup(players: string[]): Promise<GameState> {
+  async setup(
+    players: string[],
+    turnTimeoutMs = DEFAULT_TURN_TIMEOUT_MS,
+  ): Promise<GameState> {
     if (players.length !== 2) {
       throw new Error(`a game needs exactly 2 players, got ${players.length}`);
     }
@@ -58,9 +63,10 @@ export class Game extends DurableObject<Env> {
       status: "active",
       winner: null,
       endReason: null,
+      turnTimeoutMs,
     };
     await this.ctx.storage.put("state", state);
-    await this.ctx.storage.setAlarm(Date.now() + TURN_TIMEOUT_MS);
+    await this.ctx.storage.setAlarm(Date.now() + turnTimeoutMs);
     return state;
   }
 
@@ -99,7 +105,7 @@ export class Game extends DurableObject<Env> {
 
     await this.ctx.storage.put("state", state);
     if (state.status === "active") {
-      await this.ctx.storage.setAlarm(Date.now() + TURN_TIMEOUT_MS);
+      await this.ctx.storage.setAlarm(Date.now() + state.turnTimeoutMs);
     } else {
       await this.ctx.storage.deleteAlarm();
     }
@@ -109,6 +115,11 @@ export class Game extends DurableObject<Env> {
 
   async state(): Promise<GameState> {
     return this.#state();
+  }
+
+  /** When the current turn times out, or `null` when no clock is running. */
+  async deadline(): Promise<number | null> {
+    return this.ctx.storage.getAlarm();
   }
 
   /** Turn timeout: the player who failed to move forfeits. */
@@ -160,10 +171,13 @@ export class Lobby extends DurableObject<Env> {
     );
   }
 
-  /** Creates a new game instance (cross-kind, from inside this DO). */
-  async createMatch(players: string[]): Promise<string> {
+  /** Creates a new game instance (a cross-kind call, from inside this kind). */
+  async createMatch(
+    players: string[],
+    turnTimeoutMs?: number,
+  ): Promise<string> {
     const game = kind(this.env.APP_DO, "game").unique();
-    await game.setup(players);
+    await game.setup(players, turnTimeoutMs);
     const id = game.id.toString();
     this.ctx.storage.sql.exec(
       `INSERT INTO matches (id, players, created_at) VALUES (?, ?, ?)`,
@@ -189,59 +203,47 @@ export class AppDO extends union({
   game: Game,
 }) {}
 
-/**
- * DX probe: a SECOND union host class in the same Worker, with its own
- * binding, to check that two namespaces coexist without type confusion.
- */
-export class Metrics extends DurableObject<Env> {
-  /** Plain property, used by a DX probe: stubs proxy methods only. */
-  version = 2;
-
-  async bump(counter: string): Promise<number> {
-    const next = ((await this.ctx.storage.get<number>(counter)) ?? 0) + 1;
-    await this.ctx.storage.put(counter, next);
-    return next;
-  }
-}
-
-export class MetricsDO extends union({
-  metrics: Metrics,
-}) {}
-
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
-    const lobby = kind(env.APP_DO, "lobby").get("main");
+    const app = kinds(env.APP_DO);
+    const lobby = app.lobby.get("main");
 
     if (request.method === "POST" && url.pathname === "/matches") {
-      const { players } = (await request.json()) as { players: string[] };
-      const id = await lobby.createMatch(players);
+      const { players, turnTimeoutMs } = (await request.json()) as {
+        players: string[];
+        turnTimeoutMs?: number;
+      };
+      const id = await lobby.createMatch(players, turnTimeoutMs);
       return Response.json({ id }, { status: 201 });
     }
     if (request.method === "GET" && url.pathname === "/matches") {
       return Response.json(await lobby.listMatches());
     }
 
-    const match = url.pathname.match(/^\/matches\/([0-9a-f]+)(\/.*)?$/);
+    const match = url.pathname.match(/^\/matches\/([0-9a-f]{64})(\/.*)?$/);
     if (match !== null) {
-      const game = kind(env.APP_DO, "game").fromId(match[1]!);
+      const game = app.game.fromId(match[1]!);
       if (match[2] === "/ws") {
         return game.fetch(request);
       }
-      if (request.method === "POST" && match[2] === "/move") {
-        const { player, cell } = (await request.json()) as {
-          player: string;
-          cell: number;
-        };
-        try {
+      try {
+        if (request.method === "POST" && match[2] === "/move") {
+          const { player, cell } = (await request.json()) as {
+            player: string;
+            cell: number;
+          };
           return Response.json(await game.move(player, cell));
-        } catch (error) {
-          const message = error instanceof Error ? error.message : `${error}`;
-          return Response.json({ error: message }, { status: 409 });
         }
-      }
-      if (request.method === "GET" && match[2] === undefined) {
-        return Response.json(await game.state());
+        if (request.method === "GET" && match[2] === undefined) {
+          return Response.json(await game.state());
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : `${error}`;
+        // A claydo error here means the id does not name a live game:
+        // fromId() never initializes an instance.
+        const status = isClaydoError(error) ? 404 : 409;
+        return Response.json({ error: message }, { status });
       }
     }
 

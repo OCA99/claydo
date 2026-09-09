@@ -4,12 +4,9 @@
   "main": "./worker.ts",
   "compatibility_date": "2026-08-01",
   "durable_objects": {
-    "bindings": [
-      { "name": "APP_DO", "class_name": "AppDO" },
-      { "name": "METRICS_DO", "class_name": "MetricsDO" }
-    ]
+    "bindings": [{ "name": "APP_DO", "class_name": "AppDO" }]
   },
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["AppDO", "MetricsDO"] }
+    { "tag": "v1", "new_sqlite_classes": ["AppDO"] }
   ]
 }

@@ -6,6 +6,16 @@ import worker, { OutOfStockError } from "../worker";
 const carts = () => kind(env.APP_DO, "cart");
 const inventories = () => kind(env.APP_DO, "inventory");
 
+/** Awaits a promise that must reject, and returns the rejection. */
+async function caught(promise: Promise<unknown>): Promise<Error> {
+  const error = await promise.then(
+    () => undefined,
+    (thrown: unknown) => thrown,
+  );
+  expect(error).toBeInstanceOf(Error);
+  return error as Error;
+}
+
 /**
  * Storage persists across tests in this file, so every test gets its own
  * product/user namespace via a unique prefix.
@@ -34,7 +44,8 @@ describe("inventory", () => {
     const { widget } = ids();
     const inv = inventories().get(widget);
     await inv.restock(2);
-    await expect(inv.reserve(5)).rejects.toThrow(
+    const error = await caught(inv.reserve(5));
+    expect(error.message).toBe(
       `out of stock: product '${widget}' has 2 left, cannot reserve 5`,
     );
     expect(await inv.stock()).toBe(2);
@@ -73,7 +84,8 @@ describe("cart checkout", () => {
     await cart.addItem(gadget, 2);
     await cart.addItem(widget, 3); // only 1 in stock
 
-    await expect(cart.checkout()).rejects.toThrow(
+    const error = await caught(cart.checkout());
+    expect(error.message).toBe(
       `out of stock: product '${widget}' has 1 left, cannot reserve 3`,
     );
 
@@ -86,14 +98,50 @@ describe("cart checkout", () => {
 
   it("rejects checkout of an empty cart", async () => {
     const { user } = ids();
-    await expect(carts().get(user).checkout()).rejects.toThrow(
-      "cart is empty",
+    const error = await caught(carts().get(user).checkout());
+    expect(error.message).toBe("cart is empty");
+  });
+});
+
+describe("error propagation across kinds", () => {
+  it("keeps name, message, and custom fields over one hop", async () => {
+    const { widget } = ids();
+    const inv = inventories().get(widget);
+    await inv.restock(1);
+    const error = await caught(inv.reserve(3));
+    const e = error as OutOfStockError;
+    expect(e.name).toBe("OutOfStockError");
+    expect(e.message).toBe(
+      `out of stock: product '${widget}' has 1 left, cannot reserve 3`,
     );
+    // Own enumerable fields survive the RPC hop.
+    expect(e.productId).toBe(widget);
+    expect(e.requested).toBe(3);
+    expect(e.available).toBe(1);
+    // Class identity does not survive RPC: match on `error.name`.
+    expect(error instanceof OutOfStockError).toBe(false);
+  });
+
+  it("keeps the fields over two hops (test -> cart -> inventory)", async () => {
+    const { user, widget } = ids();
+    await inventories().get(widget).restock(1);
+    const cart = carts().get(user);
+    await cart.addItem(widget, 4);
+
+    const error = await caught(cart.checkout());
+    const e = error as OutOfStockError;
+    expect(e.name).toBe("OutOfStockError");
+    expect(e.message).toBe(
+      `out of stock: product '${widget}' has 1 left, cannot reserve 4`,
+    );
+    expect(e.productId).toBe(widget);
+    expect(e.requested).toBe(4);
+    expect(e.available).toBe(1);
   });
 });
 
 describe("worker end to end", () => {
-  it("surfaces the nested failure as a 409 with the error name", async () => {
+  it("surfaces the nested failure as a 409 with structured fields", async () => {
     const { user, widget } = ids();
     await worker.fetch(
       new Request(`https://x/cart/${user}/items`, {
@@ -107,144 +155,11 @@ describe("worker end to end", () => {
       env,
     );
     expect(response.status).toBe(409);
-    // Post-fix: the typed fields survive DO -> DO -> worker, so the HTTP
-    // response can carry structured data instead of parsing the message.
     expect(await response.json()).toEqual({
       error: "OutOfStockError",
       message: `out of stock: product '${widget}' has 0 left, cannot reserve 2`,
       productId: widget,
       available: 0,
     });
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Adversarial DX probes: what does a custom error class look like after one
-// and after two RPC hops? Post-fix, the envelope carries the original stack
-// and own enumerable serializable fields; `instanceof` still does not
-// survive (by design — match on `error.name`). Verbatim findings are quoted
-// in DX-REPORT.md.
-// ---------------------------------------------------------------------------
-
-describe("dx probes: cross-kind error propagation", () => {
-  it("PROBE one hop (test -> inventory): name, message, FIELDS and remote stack survive", async () => {
-    const { widget } = ids();
-    const inv = inventories().get(widget);
-    await inv.restock(1);
-    let caught: unknown;
-    try {
-      await inv.reserve(3);
-    } catch (error) {
-      caught = error;
-    }
-    const e = caught as OutOfStockError;
-    expect(e.name).toBe("OutOfStockError");
-    expect(e.message).toBe(
-      `out of stock: product '${widget}' has 1 left, cannot reserve 3`,
-    );
-    expect(caught instanceof Error).toBe(true);
-    // Post-fix: the typed fields survive the hop (own enumerable props).
-    expect(e.productId).toBe(widget);
-    expect(e.requested).toBe(3);
-    expect(e.available).toBe(1);
-    // Class identity still does not survive, by design.
-    expect(caught instanceof OutOfStockError).toBe(false);
-    // Post-fix stack: the remote throw site leads, then the hop marker,
-    // then the local frames.
-    const stack = e.stack ?? "";
-    const throwSite = stack.indexOf("at Inventory.reserve");
-    const marker = stack.indexOf(
-      "at [remote call inventory.reserve() via claydo]",
-    );
-    const local = stack.indexOf("shop.test.ts");
-    expect(throwSite).toBeGreaterThan(-1);
-    expect(stack).toContain("examples/shop/worker.ts");
-    expect(marker).toBeGreaterThan(throwSite);
-    expect(local).toBeGreaterThan(marker);
-  });
-
-  it("PROBE inside the cart DO: the catch site now sees fields and the remote stack", async () => {
-    const { user, widget } = ids();
-    await inventories().get(widget).restock(1);
-    const report = await carts().get(user).probeReserveFailure(widget, 5);
-    expect(report).toMatchObject({
-      instanceofOutOfStock: false, // still by design
-      instanceofError: true,
-      constructorName: "Error",
-      name: "OutOfStockError",
-      message: `out of stock: product '${widget}' has 1 left, cannot reserve 5`,
-      // Post-fix: fields arrive inside the catching DO.
-      productIdField: widget,
-      availableField: 1,
-    });
-    // The first stack frame at the catch site is the real throw site.
-    expect(report.stackHead).toContain("OutOfStockError: out of stock");
-    expect(report.stackHead).toContain("at Inventory.reserve");
-  });
-
-  it("PROBE two hops (test -> cart -> inventory): full causal chain preserved", async () => {
-    const { user, widget } = ids();
-    await inventories().get(widget).restock(1);
-    const cart = carts().get(user);
-    await cart.addItem(widget, 4);
-
-    let caught: unknown;
-    try {
-      await cart.checkout();
-    } catch (error) {
-      caught = error;
-    }
-    const e = caught as OutOfStockError;
-    expect(e.name).toBe("OutOfStockError");
-    expect(e.message).toBe(
-      `out of stock: product '${widget}' has 1 left, cannot reserve 4`,
-    );
-    expect(caught instanceof OutOfStockError).toBe(false); // still by design
-    // Post-fix: fields survive BOTH hops (re-wrapped at each hop).
-    expect(e.productId).toBe(widget);
-    expect(e.requested).toBe(4);
-    expect(e.available).toBe(1);
-    // Post-fix stack is a causal chain, innermost first:
-    //   Inventory.reserve (worker.ts)
-    //   ... at [remote call inventory.reserve() via claydo]
-    //   Cart.checkout (worker.ts)
-    //   ... at [remote call cart.checkout() via claydo]
-    //   <test frames>
-    const stack = e.stack ?? "";
-    const throwSite = stack.indexOf("at Inventory.reserve");
-    const innerMarker = stack.indexOf(
-      "at [remote call inventory.reserve() via claydo]",
-    );
-    const rethrowSite = stack.indexOf("at Cart.checkout");
-    const outerMarker = stack.indexOf(
-      "at [remote call cart.checkout() via claydo]",
-    );
-    const local = stack.indexOf("shop.test.ts");
-    expect(throwSite).toBeGreaterThan(-1);
-    expect(innerMarker).toBeGreaterThan(throwSite);
-    expect(rethrowSite).toBeGreaterThan(innerMarker);
-    expect(outerMarker).toBeGreaterThan(rethrowSite);
-    expect(local).toBeGreaterThan(outerMarker);
-  });
-
-  it("PROBE transport failure: non-serializable return values are wrapped with call context", async () => {
-    const { widget } = ids();
-    const inv = inventories().get(widget);
-    await inv.restock(1);
-    let caught: unknown;
-    try {
-      // snapshot() returns a custom class instance, which Workers RPC
-      // cannot serialize.
-      await inv.snapshot();
-    } catch (error) {
-      caught = error;
-    }
-    const e = caught as Error & { cause?: Error };
-    expect(e.message).toBe(
-      'claydo: call to inventory.snapshot() failed: ' +
-        'Could not serialize object of type "StockSnapshot". ' +
-        'This type does not support serialization.',
-    );
-    expect(e.cause?.name).toBe("DataCloneError");
   });
 });

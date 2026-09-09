@@ -1,11 +1,12 @@
 /**
  * shop example for claydo.
  *
- * Two kinds share one host DO class:
- *  - `inventory`: one instance per product (`get(productId)`), stock in SQLite.
+ * Two kinds share one Durable Object class:
+ *  - `inventory`: one instance per product (`get(productId)`), stock in the
+ *    instance's own SQLite database.
  *  - `cart`: one instance per user. `checkout()` reserves stock on every
- *    product's inventory instance (cross-kind RPC from inside the DO) and
- *    compensates (releases) already-reserved stock when any product is short.
+ *    product's inventory instance (cross-kind calls from inside a kind) and
+ *    releases already-reserved stock when any product is short.
  */
 import { DurableObject } from "cloudflare:workers";
 import { instanceName, kind, kinds, union } from "../../src/index";
@@ -14,7 +15,7 @@ export interface Env {
   APP_DO: DurableObjectNamespace<ShopDO>;
 }
 
-/** Typed error thrown by `Inventory.reserve()` when stock is insufficient. */
+/** Thrown by `Inventory.reserve()` when stock is insufficient. */
 export class OutOfStockError extends Error {
   readonly productId: string;
   readonly requested: number;
@@ -30,11 +31,6 @@ export class OutOfStockError extends Error {
     this.requested = requested;
     this.available = available;
   }
-}
-
-/** A custom class used by a DX probe: not structured-cloneable over RPC. */
-export class StockSnapshot {
-  constructor(readonly qty: number) {}
 }
 
 /** Per-product stock, held in the instance's SQLite database. */
@@ -74,14 +70,6 @@ export class Inventory extends DurableObject<Env> {
 
   release(qty: number): number {
     return this.#adjust(qty);
-  }
-
-  /**
-   * DX probe instrument: returns a custom class instance, which Workers RPC
-   * cannot serialize, to exercise the transport-failure wrapping.
-   */
-  snapshot(): StockSnapshot {
-    return new StockSnapshot(this.stock());
   }
 
   #adjust(delta: number): number {
@@ -133,12 +121,9 @@ export class Cart extends DurableObject<Env> {
   }
 
   /**
-   * Reserves stock for every line. When any reservation fails, releases the
-   * reservations made so far (compensation) and rethrows the failure.
-   *
-   * The compensation deliberately catches every error, so it needs no error
-   * class or name matching at all — the revived error's typed fields
-   * (post-fix) only matter to callers that want to *report* the failure.
+   * Reserves stock for every line. When any reservation fails, releases
+   * the reservations made so far (compensation) and rethrows the failure.
+   * The cart keeps its items on failure, so a retry is possible.
    */
   async checkout(): Promise<{ lines: OrderLine[] }> {
     const lines = this.items();
@@ -160,38 +145,6 @@ export class Cart extends DurableObject<Env> {
 
     this.ctx.storage.sql.exec(`DELETE FROM items`);
     return { lines };
-  }
-
-  /**
-   * DX probe instrument: catches the error from a failing cross-kind
-   * `reserve()` INSIDE the cart DO and reports what actually arrived.
-   */
-  async probeReserveFailure(productId: string, qty: number): Promise<{
-    instanceofOutOfStock: boolean;
-    instanceofError: boolean;
-    constructorName: string;
-    name: string;
-    message: string;
-    productIdField: unknown;
-    availableField: unknown;
-    stackHead: string;
-  }> {
-    try {
-      await kind(this.env.APP_DO, "inventory").get(productId).reserve(qty);
-      throw new Error("expected reserve() to fail");
-    } catch (error) {
-      const e = error as OutOfStockError;
-      return {
-        instanceofOutOfStock: error instanceof OutOfStockError,
-        instanceofError: error instanceof Error,
-        constructorName: (error as object).constructor.name,
-        name: e.name,
-        message: e.message,
-        productIdField: e.productId,
-        availableField: e.available,
-        stackHead: (e.stack ?? "").split("\n").slice(0, 2).join("\n"),
-      };
-    }
   }
 }
 
@@ -225,10 +178,9 @@ export default {
         try {
           return Response.json(await cart.checkout());
         } catch (error) {
-          // `instanceof OutOfStockError` does not survive RPC (by design);
-          // the blessed pattern is matching on `error.name`. Post-fix, the
-          // typed fields DO survive, so the response can carry them —
-          // though they arrive untyped and need the cast below.
+          // Class identity does not survive RPC, so match on `error.name`.
+          // The error's own fields do survive, so the response can carry
+          // structured data instead of parsing the message.
           const e = error as Error & Partial<OutOfStockError>;
           if (e.name === "OutOfStockError") {
             return Response.json(

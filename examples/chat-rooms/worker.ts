@@ -1,18 +1,17 @@
 import { DurableObject } from "cloudflare:workers";
-import {
-  Server,
-  type Connection,
-  type WSMessage,
-} from "partyserver";
-import { kind, union } from "../../src/index";
+import { Server, type Connection, type WSMessage } from "partyserver";
+import { instanceName, kinds, union } from "../../src/index";
 
 export interface Env {
   APP_DO: DurableObjectNamespace<AppDO>;
 }
 
-/** Messages allowed per user per window. Small so tests can hit the limit. */
+/** Messages allowed per user per window. Small so tests can reach the limit. */
 export const LIMIT = 5;
 export const WINDOW_MS = 60_000;
+
+/** Recent messages replayed to each client on connect. */
+export const HISTORY_LIMIT = 20;
 
 export interface LimitResult {
   allowed: boolean;
@@ -20,14 +19,17 @@ export interface LimitResult {
   resetAt: number;
 }
 
+export interface ChatMessage {
+  user: string;
+  text: string;
+}
+
 /**
  * Fixed-window per-user rate limiter. One instance per user id, addressed
- * as `kind(env.APP_DO, "limiter").get(userId)`.
+ * as `kinds(env.APP_DO).limiter.get(userId)`. The window state lives in
+ * this kind's own SQLite database.
  */
 export class Limiter extends DurableObject<Env> {
-  /** DX audit probe: a plain (non-method) public property. */
-  windowMs = WINDOW_MS;
-
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     ctx.storage.sql.exec(
@@ -83,13 +85,25 @@ export class Limiter extends DurableObject<Env> {
 }
 
 /**
- * A PartyServer `Server` registered as a kind. Clients connect over
- * WebSocket; the connection id (PartyServer `_pk` query param) doubles as
- * the user id. Every message consults the per-user `limiter` kind — a
- * cross-kind call made from inside the Durable Object.
+ * A chat room: a PartyServer `Server` registered as a kind. Clients connect
+ * over WebSocket, and the connection id (PartyServer's `_pk` query
+ * parameter) doubles as the user id. Messages persist in the room's own
+ * SQLite database and are replayed to new connections. Every message
+ * consults the per-user `limiter` kind — a cross-kind call made from
+ * inside the Durable Object.
  */
 export class Chat extends Server<Env> {
   static options = { hibernate: true };
+
+  onStart(): void {
+    this.ctx.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user TEXT NOT NULL,
+        text TEXT NOT NULL
+      )`,
+    );
+  }
 
   onConnect(connection: Connection): void {
     connection.send(
@@ -97,6 +111,7 @@ export class Chat extends Server<Env> {
         type: "welcome",
         room: this.name,
         users: [...this.getConnections()].map((c) => c.id),
+        history: this.history(),
       }),
     );
     this.broadcast(
@@ -107,14 +122,8 @@ export class Chat extends Server<Env> {
 
   async onMessage(connection: Connection, message: WSMessage): Promise<void> {
     if (typeof message !== "string") return;
-    // DX audit probe: what does a throw inside a WebSocket handler look like
-    // to the client and the test runner?
-    if (message === "/throw") {
-      throw new Error("chat kind: deliberate failure inside onMessage");
-    }
-    // Cross-kind call from inside the DO: consult the per-user limiter.
-    const result = await kind(this.env.APP_DO, "limiter")
-      .get(connection.id)
+    const result = await kinds(this.env.APP_DO)
+      .limiter.get(connection.id)
       .consume();
     if (!result.allowed) {
       connection.send(
@@ -122,6 +131,11 @@ export class Chat extends Server<Env> {
       );
       return;
     }
+    this.ctx.storage.sql.exec(
+      `INSERT INTO messages (user, text) VALUES (?, ?)`,
+      connection.id,
+      message,
+    );
     this.broadcast(
       JSON.stringify({
         type: "chat",
@@ -139,10 +153,27 @@ export class Chat extends Server<Env> {
     );
   }
 
-  /** RPC alongside WebSockets: reports the room as seen from inside. */
-  roomInfo(): { name: string; connections: number } {
+  /** The most recent messages, oldest first. */
+  history(): ChatMessage[] {
+    return this.ctx.storage.sql
+      .exec<{ user: string; text: string }>(
+        `SELECT user, text FROM (
+           SELECT id, user, text FROM messages ORDER BY id DESC LIMIT ?
+         ) ORDER BY id`,
+        HISTORY_LIMIT,
+      )
+      .toArray();
+  }
+
+  /**
+   * RPC alongside WebSockets. PartyServer reads `ctx.id.name`, which
+   * includes the kind prefix, so `this.name` is `chat:<room>`; the
+   * `instanceName()` helper strips the prefix.
+   */
+  roomInfo(): { name: string; room: string | undefined; connections: number } {
     return {
       name: this.name,
+      room: instanceName(this.ctx),
       connections: [...this.getConnections()].length,
     };
   }
@@ -160,15 +191,14 @@ export default {
     _ctx: ExecutionContext,
   ): Promise<Response> {
     const url = new URL(request.url);
+    const app = kinds(env.APP_DO);
     const chatMatch = /^\/chat\/([^/]+)$/.exec(url.pathname);
     if (chatMatch !== null && chatMatch[1] !== undefined) {
-      return kind(env.APP_DO, "chat").get(chatMatch[1]).fetch(request);
+      return app.chat.get(chatMatch[1]).fetch(request);
     }
     const limitMatch = /^\/limit\/([^/]+)$/.exec(url.pathname);
     if (limitMatch !== null && limitMatch[1] !== undefined) {
-      const result = await kind(env.APP_DO, "limiter")
-        .get(limitMatch[1])
-        .consume();
+      const result = await app.limiter.get(limitMatch[1]).consume();
       return Response.json(result);
     }
     return new Response("not found", { status: 404 });
