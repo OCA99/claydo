@@ -125,6 +125,20 @@ interface OwnExportEntry {
   get?(id: DurableObjectId): unknown;
 }
 
+/** Releases a per-call facet stub handle once its call settled. */
+function disposeStub(stub: unknown): void {
+  const disposeSymbol = (Symbol as { dispose?: symbol }).dispose;
+  if (disposeSymbol === undefined) return;
+  const dispose = (stub as Record<symbol, unknown>)[disposeSymbol];
+  if (typeof dispose === "function") {
+    try {
+      (dispose as (this: unknown) => void).call(stub);
+    } catch {
+      // Never let handle cleanup mask the call's own outcome.
+    }
+  }
+}
+
 /**
  * The supervisor role of a union instance. It owns the instance's identity,
  * routes every interaction to the kind's facet, and multiplexes the
@@ -136,7 +150,6 @@ export class SupervisorCore {
   readonly #options: UnionOptions;
   readonly #className: () => string;
   #kindLoading?: Promise<string>;
-  readonly #facetClasses = new Map<string, unknown>();
   /** Kinds whose alarm handler is running right now, in this isolate. */
   readonly #firing = new Set<string>();
 
@@ -194,57 +207,53 @@ export class SupervisorCore {
    * props (if any) pass through to the kind.
    */
   #facetClass(kind: string): unknown {
-    let configured = this.#facetClasses.get(kind);
-    if (configured === undefined) {
-      const host = this.#hostExport();
-      const entry = (
-        this.#ctx.exports as unknown as Record<string, unknown>
-      )[host] as OwnExportEntry | undefined;
-      if (typeof entry !== "function" || typeof entry.get !== "function") {
-        this.#config(
-          `cannot find the union export '${host}' in the worker's ` +
-            `top-level exports. Export the class returned by union() ` +
-            `under that name, or pass its export name to union() as ` +
-            `{ name: "..." }.`,
-        );
-      }
-      const identity: FacetIdentity = { v: 1, kind, host };
-      const ownProps = (this.#ctx as { props?: unknown }).props;
-      const passthrough =
-        typeof ownProps === "object" && ownProps !== null
-          ? (ownProps as Record<string, unknown>)
-          : {};
-      // A binding-configured reserved field would be silently overwritten
-      // here (and a valid-shaped one would already have selected the
-      // facet role at construction), so any own reserved key on the
-      // binding props fails loudly instead.
-      if (Object.hasOwn(passthrough, FACET_IDENTITY_KEY)) {
-        this.#config(
-          `the binding props of this union class define the reserved ` +
-            `'${FACET_IDENTITY_KEY}' field. Claydo owns that field; ` +
-            `remove it from the binding configuration.`,
-        );
-      }
-      const props = {
-        ...passthrough,
-        [FACET_IDENTITY_KEY]: identity,
-      };
-      configured = entry({ props });
-      this.#facetClasses.set(kind, configured);
+    const host = this.#hostExport();
+    const entry = (this.#ctx.exports as unknown as Record<string, unknown>)[
+      host
+    ] as OwnExportEntry | undefined;
+    if (typeof entry !== "function" || typeof entry.get !== "function") {
+      this.#config(
+        `cannot find the union export '${host}' in the worker's ` +
+          `top-level exports. Export the class returned by union() ` +
+          `under that name, or pass its export name to union() as ` +
+          `{ name: "..." }.`,
+      );
     }
-    return configured;
+    const identity: FacetIdentity = { v: 1, kind, host };
+    const ownProps = (this.#ctx as { props?: unknown }).props;
+    const passthrough =
+      typeof ownProps === "object" && ownProps !== null
+        ? (ownProps as Record<string, unknown>)
+        : {};
+    // A binding-configured reserved field would be silently overwritten
+    // here (and a valid-shaped one would already have selected the
+    // facet role at construction), so any own reserved key on the
+    // binding props fails loudly instead.
+    if (Object.hasOwn(passthrough, FACET_IDENTITY_KEY)) {
+      this.#config(
+        `the binding props of this union class define the reserved ` +
+          `'${FACET_IDENTITY_KEY}' field. Claydo owns that field; ` +
+          `remove it from the binding configuration.`,
+      );
+    }
+    return entry({ props: { ...passthrough, [FACET_IDENTITY_KEY]: identity } });
   }
 
   /**
-   * Returns the facet that owns this instance's kind data. `facets.get()`
-   * runs on every call: it resumes or restarts the facet transparently,
-   * so a stale stub is never held across a facet restart.
+   * Returns the facet that owns this instance's kind data. The class
+   * handle and the stub are created per call and the handle is released
+   * as soon as `facets.get()` has consumed it: `facets.get()` resumes or
+   * restarts the facet transparently, so a stale stub is never held
+   * across a facet restart, and no capability handle outlives its use
+   * (an undisposed handle draws runtime warnings when collected).
    */
   #facet(kind: string): FacetStub {
     const configured = this.#facetClass(kind);
-    return this.#facets().get(kind, () => ({
+    const stub = this.#facets().get(kind, () => ({
       class: configured as never,
     })) as unknown as FacetStub;
+    disposeStub(configured);
+    return stub;
   }
 
   #kindFromName(): string | undefined {
@@ -378,7 +387,12 @@ export class SupervisorCore {
     init: boolean,
   ): Promise<unknown> {
     const resolved = await this.#resolveKind(kind, init);
-    return this.#facet(resolved).__claydoCall(resolved, method, args, init);
+    const facet = this.#facet(resolved);
+    try {
+      return await facet.__claydoCall(resolved, method, args, init);
+    } finally {
+      disposeStub(facet);
+    }
   }
 
   async #assertKind(kind: string): Promise<void> {
@@ -523,7 +537,12 @@ export class SupervisorCore {
         };
         this.#firing.add(kind);
         try {
-          await this.#facet(kind).__claydoAlarm(info);
+          const facet = this.#facet(kind);
+          try {
+            await facet.__claydoAlarm(info);
+          } finally {
+            disposeStub(facet);
+          }
           // Consume with a compare-and-set: promote a schedule the
           // handler (or a concurrent caller) set while the delivery ran,
           // otherwise delete. The in-flight flag clears only after the
@@ -587,6 +606,10 @@ export class SupervisorCore {
       }
       throw error;
     }
-    return facet.fetch(forwarded);
+    try {
+      return await facet.fetch(forwarded);
+    } finally {
+      disposeStub(facet);
+    }
   }
 }

@@ -217,26 +217,30 @@ function makeStub<T>(
       if (LOCAL_UNDEFINED_KEYS.has(prop) || prop.startsWith("__")) {
         return undefined;
       }
-      return (...args: unknown[]) =>
-        (
-          stub.__claydoCall(
+      // Await the RPC promise directly instead of chaining on it: a
+      // .then/.catch chain wraps the RPC result in a native promise and
+      // can leave the underlying result undisposed.
+      return async (...args: unknown[]) => {
+        try {
+          return await (stub.__claydoCall(
             kindName,
             prop,
             args,
             mode !== "fromId",
-          ) as Promise<unknown>
-        ).catch((error: unknown) => {
-            // Serialization failures originate at this call site, not in
-            // the kind, so add the call context the raw error lacks.
-            if (error instanceof Error && error.name === "DataCloneError") {
-              throw new Error(
-                `claydo: call to ${kindName}.${prop}() failed to ` +
-                  `serialize: ${error.message}`,
-                { cause: error },
-              );
-            }
-            throw error;
-          });
+          ) as Promise<unknown>);
+        } catch (error) {
+          // Serialization failures originate at this call site, not in
+          // the kind, so add the call context the raw error lacks.
+          if (error instanceof Error && error.name === "DataCloneError") {
+            throw new Error(
+              `claydo: call to ${kindName}.${prop}() failed to ` +
+                `serialize: ${error.message}`,
+              { cause: error },
+            );
+          }
+          throw error;
+        }
+      };
     },
   }) as KindStub<T>;
 }

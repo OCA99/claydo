@@ -110,6 +110,20 @@ function quoteIdent(name: string): string {
   return `"${name.replaceAll('"', '""')}"`;
 }
 
+/** Releases a per-call loopback stub handle once its call settled. */
+function disposeStub(stub: unknown): void {
+  const disposeSymbol = (Symbol as { dispose?: symbol }).dispose;
+  if (disposeSymbol === undefined) return;
+  const dispose = (stub as Record<symbol, unknown>)[disposeSymbol];
+  if (typeof dispose === "function") {
+    try {
+      (dispose as (this: unknown) => void).call(stub);
+    } catch {
+      // Never let handle cleanup mask the call's own outcome.
+    }
+  }
+}
+
 function rejectReservedKey(): never {
   throw claydoError(
     "CLAYDO_CONFIG",
@@ -271,6 +285,16 @@ function adaptFacetStorage(
       return write(key, ...rest);
     };
 
+  const withBridge = async <T>(
+    run: (host: AlarmBridge) => Promise<T>,
+  ): Promise<T> => {
+    const host = bridge();
+    try {
+      return await run(host);
+    } finally {
+      disposeStub(host);
+    }
+  };
   const replacements: Record<string, unknown> = {
     setAlarm: (scheduledTime: number | Date): Promise<void> => {
       assertOutsideTransaction();
@@ -278,17 +302,17 @@ function adaptFacetStorage(
         scheduledTime instanceof Date
           ? scheduledTime.getTime()
           : scheduledTime;
-      return bridge().__claydoSetAlarm(kind, time);
+      return withBridge((host) => host.__claydoSetAlarm(kind, time));
     },
     getAlarm: (
       options?: DurableObjectGetAlarmOptions,
     ): Promise<number | null> => {
       assertOutsideTransaction();
-      return bridge().__claydoGetAlarm(kind, options);
+      return withBridge((host) => host.__claydoGetAlarm(kind, options));
     },
     deleteAlarm: (): Promise<void> => {
       assertOutsideTransaction();
-      return bridge().__claydoDeleteAlarm(kind);
+      return withBridge((host) => host.__claydoDeleteAlarm(kind));
     },
     put: guardedWrite(nativePut as (...args: unknown[]) => unknown),
     delete: guardedWrite(nativeDelete as (...args: unknown[]) => unknown),
