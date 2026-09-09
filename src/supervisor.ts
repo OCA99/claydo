@@ -1,4 +1,5 @@
 import { claydoError, claydoErrorStatus, isClaydoError } from "./errors";
+import { reviveThrown, type FacetCallResult } from "./facet";
 import {
   FACET_IDENTITY_KEY,
   INIT_HEADER,
@@ -114,7 +115,7 @@ interface FacetStub {
     method: string,
     args: unknown[],
     init: boolean,
-  ): Promise<unknown>;
+  ): Promise<FacetCallResult>;
   __claydoAlarm(info: AlarmInfo): Promise<void>;
   fetch(request: Request): Promise<Response>;
 }
@@ -388,11 +389,17 @@ export class SupervisorCore {
   ): Promise<unknown> {
     const resolved = await this.#resolveKind(kind, init);
     const facet = this.#facet(resolved);
+    let result: FacetCallResult;
     try {
-      return await facet.__claydoCall(resolved, method, args, init);
+      result = await facet.__claydoCall(resolved, method, args, init);
     } finally {
       disposeStub(facet);
     }
+    // A thrown kind error crossed the internal hop as a value; rethrow it
+    // exactly once, so the caller gets a native error and the runtime
+    // logs a single event instead of one per hop.
+    if (!result.ok) throw reviveThrown(result.error);
+    return result.value;
   }
 
   async #assertKind(kind: string): Promise<void> {

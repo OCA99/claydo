@@ -187,6 +187,81 @@ function deleteAllFacetStorage(
 }
 
 /**
+ * The internal result envelope of a kind RPC dispatch.
+ *
+ * A thrown kind error crosses claydo's facet-to-supervisor hop as a
+ * value, not a rejection: the supervisor unwraps it and rethrows exactly
+ * once, so the caller still gets a native error while the runtime logs
+ * one uncaught-exception event instead of one per hop. The envelope
+ * never leaves the library.
+ */
+export type FacetCallResult =
+  | { ok: true; value: unknown }
+  | { ok: false; error: ThrownWire };
+
+/** The serializable snapshot of a thrown kind error. */
+export interface ThrownWire {
+  name: string;
+  message: string;
+  stack?: string;
+  fields: [string, unknown][];
+  cause?: ThrownWire;
+}
+
+/** Captures a thrown value as a wire snapshot, keeping cloneable fields. */
+export function serializeThrown(error: unknown, depth = 0): ThrownWire {
+  if (!(error instanceof Error)) {
+    return { name: "Error", message: String(error), fields: [] };
+  }
+  const wire: ThrownWire = {
+    name: error.name,
+    message: error.message,
+    stack: error.stack,
+    fields: [],
+  };
+  for (const key of Object.keys(error)) {
+    try {
+      const value = (error as unknown as Record<string, unknown>)[key];
+      structuredClone(value);
+      wire.fields.push([key, value]);
+    } catch {
+      // A throwing getter or a non-cloneable value: drop the field.
+    }
+  }
+  if ("cause" in error && error.cause !== undefined && depth < 3) {
+    wire.cause = serializeThrown(error.cause, depth + 1);
+  }
+  return wire;
+}
+
+/**
+ * Rebuilds a thrown kind error from its wire snapshot. Built-in error
+ * classes are reconstructed by name so `instanceof` holds for them;
+ * custom classes arrive as plain Errors carrying the original name.
+ */
+export function reviveThrown(wire: ThrownWire): Error {
+  const ctor = (globalThis as Record<string, unknown>)[wire.name];
+  const error =
+    typeof ctor === "function" &&
+    ctor !== Error &&
+    (ctor as { prototype?: unknown }).prototype instanceof Error
+      ? new (ctor as new (message: string) => Error)(wire.message)
+      : new Error(wire.message);
+  error.name = wire.name;
+  if (wire.stack !== undefined) error.stack = wire.stack;
+  for (const [key, value] of wire.fields) {
+    (error as unknown as Record<string, unknown>)[key] = value;
+  }
+  if (wire.cause !== undefined) {
+    Object.defineProperty(error, "cause", {
+      value: reviveThrown(wire.cause),
+      configurable: true,
+    });
+  }
+  return error;
+}
+
+/**
  * Returns an error that survives RPC serialization. Errors whose own
  * fields (and `cause`) all clone pass through unchanged; anything else is
  * rebuilt with its name, message, stack, and every cloneable field, so
@@ -550,18 +625,18 @@ export class FacetCore {
     method: string,
     args: unknown[],
     _init: boolean,
-  ): Promise<unknown> {
-    if (kind !== this.#identity.kind) {
-      throw claydoError(
-        "CLAYDO_KIND_MISMATCH",
-        `this facet is kind '${this.#identity.kind}', not '${kind}'.`,
-        { actualKind: this.#identity.kind, expectedKind: kind },
-      );
-    }
+  ): Promise<FacetCallResult> {
     try {
-      return await this.#dispatch(kind, method, args);
+      if (kind !== this.#identity.kind) {
+        throw claydoError(
+          "CLAYDO_KIND_MISMATCH",
+          `this facet is kind '${this.#identity.kind}', not '${kind}'.`,
+          { actualKind: this.#identity.kind, expectedKind: kind },
+        );
+      }
+      return { ok: true, value: await this.#dispatch(kind, method, args) };
     } catch (error) {
-      throw wireSafeError(error);
+      return { ok: false, error: serializeThrown(error) };
     }
   }
 
