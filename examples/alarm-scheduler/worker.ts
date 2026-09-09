@@ -189,7 +189,11 @@ export class AppDO extends union({
 }) {}
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(
+    request: Request,
+    env: Env,
+    _ctx?: ExecutionContext,
+  ): Promise<Response> {
     // Tiny HTTP facade: POST /schedule/:instance/:job?delayMs=1000
     const url = new URL(request.url);
     const [, action, instance, job] = url.pathname.split("/");

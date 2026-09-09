@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.3.0
+
+Driven by a twelve-application developer-experience study: twelve agents at
+varied capability levels built real applications against 0.2.0 with no
+guidance, and their full session traces were analyzed for friction.
+
+### Fixed
+
+- A kind error delivered to a caller no longer prints per-hop
+  `uncaught exception` log events: thrown kind errors cross claydo's
+  internal facet-to-supervisor hop as values and are rethrown exactly
+  once, with the original stack, name, fields, `cause`, and built-in
+  class reconstruction preserved. Error-path tests now log at most one
+  runtime event per delivered error — the same as a native Durable
+  Object.
+- The intermittent `An RPC result was not disposed properly` runtime
+  warning under bulk calls is gone: every internal capability handle
+  (facet stubs, alarm-bridge loopback stubs, configured class handles)
+  is released deterministically after use, and the internal error
+  envelope removed the rejected-RPC-promise path that leaked under load.
+
+### Added
+
+- `kind(...).has(name)` — pure existence read: true when the named
+  instance was created, without initializing anything.
+- `kind(...).getExisting(name)` — a stub that never initializes:
+  calls on uncreated names fail with `CLAYDO_UNINITIALIZED`, and
+  `fetch()` answers 404. Serves caller-supplied lookups without
+  materializing storage. Requests without claydo headers (third-party
+  routers such as `routePartykitRequest`) keep creating on first
+  contact.
+- `claydo/test` with `fireScheduledAlarm(stub)`: fires a pending kind
+  alarm immediately inside a `@cloudflare/vitest-pool-workers` suite,
+  replacing hand-written test-only trigger methods on production kinds.
+- Documentation from the study: existence semantics, a worked custom
+  error class, the sync-method/async-stub gotcha, cross-kind call
+  atomicity and topology guidance, alarm-test margins, the `sql.exec`
+  type-alias requirement, reserved-name scope, and expected error-path
+  log lines. Example conventions unified (one vitest config style, one
+  worker handler signature).
+
 ## 0.2.0
 
 A ground-up rebuild on [Durable Object facets](https://developers.cloudflare.com/dynamic-workers/usage/durable-object-facets/). Each kind now runs in its own facet with an isolated SQLite database, and every library invariant lives inside one Durable Object. The `union()` API and the typed `kind()`/`kinds()` client keep their shape; most of the surrounding machinery changed.

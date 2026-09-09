@@ -17,6 +17,14 @@ isolated storage, how `unique()` ids are persisted and resolved with
 - `broken` — a kind whose constructor throws, showing how constructor
   failures surface to callers.
 
+## A note on the registry shape
+
+The registry is a coordinator for lifecycle operations (create, list,
+delete), not a router: high-volume operations like `increment` should go
+from the Worker straight to the counter instance (`fromId()`), not through
+the registry. Routing every request through one singleton instance
+serializes the whole fleet on it.
+
 ## Running the tests
 
 From the repository root:
