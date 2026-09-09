@@ -83,6 +83,10 @@ export function union<R extends KindRegistry>(
       return this.#core.call(kind, method, args, init);
     }
 
+    async __claydoHas(): Promise<boolean> {
+      return this.#supervisor().has();
+    }
+
     async __claydoSetAlarm(kind: string, time: number): Promise<void> {
       return this.#supervisor().setKindAlarm(kind, time);
     }

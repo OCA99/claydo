@@ -91,6 +91,7 @@ export interface SupervisorInstance<R extends KindRegistry>
     args: unknown[],
     init: boolean,
   ): Promise<unknown>;
+  __claydoHas(): Promise<boolean>;
   __claydoSetAlarm(kind: string, time: number): Promise<void>;
   __claydoGetAlarm(
     kind: string,
@@ -310,9 +311,17 @@ export class SupervisorCore {
     const pinned = persisted.get(KIND_KEY) as string | undefined;
     const derived = this.#kindFromName();
     if (derived !== undefined) {
-      // The name stays authoritative; the pin is a write-once cache that
-      // lets fromId() resolve this instance after a nameless cold start.
+      // The name stays authoritative; the pin marks the instance as
+      // created and lets fromId() resolve it after a nameless cold start.
       if (pinned === undefined) {
+        if (!init) {
+          throw claydoError(
+            "CLAYDO_UNINITIALIZED",
+            `instance '${this.#identity()}' was never created. ` +
+              `getExisting() and fromId() never initialize an instance; ` +
+              `create it first with kind(ns, '${derived}').get(name).`,
+          );
+        }
         await this.#ctx.storage.put(KIND_KEY, derived);
       }
       return derived;
@@ -379,6 +388,23 @@ export class SupervisorCore {
       `${base} Unique-ID instances initialize on their first call ` +
         `through kind(ns, '<kind>').unique().`,
     );
+  }
+
+  /**
+   * True when this instance was already initialized (its kind pin exists).
+   * A pure read: it never pins, never starts the facet, and never runs
+   * the kind's constructor. "Initialized" means the instance had a first
+   * contact through `get()` or `unique()`, not that it holds data.
+   */
+  async has(): Promise<boolean> {
+    const persisted = await this.#ctx.storage.get<unknown>([
+      KIND_KEY,
+      LEGACY_KIND_KEY,
+    ]);
+    if (persisted.get(LEGACY_KIND_KEY) !== undefined) {
+      this.#legacyLayoutError();
+    }
+    return persisted.get(KIND_KEY) !== undefined;
   }
 
   async call(
@@ -585,11 +611,15 @@ export class SupervisorCore {
     let forwarded: Request;
     try {
       // The typed stub asserts its expected kind in a header, so a
-      // wrong-kind fetch fails exactly like a wrong-kind RPC call. The
-      // init marker allows first-contact pinning in the same round trip.
+      // wrong-kind fetch fails exactly like a wrong-kind RPC call, and
+      // its init marker allows first-contact pinning in the same round
+      // trip (getExisting() and fromId() stubs omit it). A request
+      // without claydo headers is third-party routing (for example
+      // routePartykitRequest); for those, a kind-prefixed name is
+      // self-describing and first contact creates the instance.
       const hint = request.headers.get(KIND_HEADER) ?? undefined;
       const init =
-        hint !== undefined && request.headers.get(INIT_HEADER) !== null;
+        hint === undefined || request.headers.get(INIT_HEADER) !== null;
       const kind = await this.#resolveKind(hint, init);
       // The headers are claydo transport, not part of the kind's request,
       // and `cf` does not survive Request cloning on its own.
