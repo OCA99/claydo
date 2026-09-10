@@ -110,6 +110,20 @@ function quoteIdent(name: string): string {
   return `"${name.replaceAll('"', '""')}"`;
 }
 
+/** Releases a per-call loopback stub handle once its call settled. */
+function disposeStub(stub: unknown): void {
+  const disposeSymbol = (Symbol as { dispose?: symbol }).dispose;
+  if (disposeSymbol === undefined) return;
+  const dispose = (stub as Record<symbol, unknown>)[disposeSymbol];
+  if (typeof dispose === "function") {
+    try {
+      (dispose as (this: unknown) => void).call(stub);
+    } catch {
+      // Never let handle cleanup mask the call's own outcome.
+    }
+  }
+}
+
 function rejectReservedKey(): never {
   throw claydoError(
     "CLAYDO_CONFIG",
@@ -170,6 +184,81 @@ function deleteAllFacetStorage(
       kvDelete(key);
     }
   });
+}
+
+/**
+ * The internal result envelope of a kind RPC dispatch.
+ *
+ * A thrown kind error crosses claydo's facet-to-supervisor hop as a
+ * value, not a rejection: the supervisor unwraps it and rethrows exactly
+ * once, so the caller still gets a native error while the runtime logs
+ * one uncaught-exception event instead of one per hop. The envelope
+ * never leaves the library.
+ */
+export type FacetCallResult =
+  | { ok: true; value: unknown }
+  | { ok: false; error: ThrownWire };
+
+/** The serializable snapshot of a thrown kind error. */
+export interface ThrownWire {
+  name: string;
+  message: string;
+  stack?: string;
+  fields: [string, unknown][];
+  cause?: ThrownWire;
+}
+
+/** Captures a thrown value as a wire snapshot, keeping cloneable fields. */
+export function serializeThrown(error: unknown, depth = 0): ThrownWire {
+  if (!(error instanceof Error)) {
+    return { name: "Error", message: String(error), fields: [] };
+  }
+  const wire: ThrownWire = {
+    name: error.name,
+    message: error.message,
+    stack: error.stack,
+    fields: [],
+  };
+  for (const key of Object.keys(error)) {
+    try {
+      const value = (error as unknown as Record<string, unknown>)[key];
+      structuredClone(value);
+      wire.fields.push([key, value]);
+    } catch {
+      // A throwing getter or a non-cloneable value: drop the field.
+    }
+  }
+  if ("cause" in error && error.cause !== undefined && depth < 3) {
+    wire.cause = serializeThrown(error.cause, depth + 1);
+  }
+  return wire;
+}
+
+/**
+ * Rebuilds a thrown kind error from its wire snapshot. Built-in error
+ * classes are reconstructed by name so `instanceof` holds for them;
+ * custom classes arrive as plain Errors carrying the original name.
+ */
+export function reviveThrown(wire: ThrownWire): Error {
+  const ctor = (globalThis as Record<string, unknown>)[wire.name];
+  const error =
+    typeof ctor === "function" &&
+    ctor !== Error &&
+    (ctor as { prototype?: unknown }).prototype instanceof Error
+      ? new (ctor as new (message: string) => Error)(wire.message)
+      : new Error(wire.message);
+  error.name = wire.name;
+  if (wire.stack !== undefined) error.stack = wire.stack;
+  for (const [key, value] of wire.fields) {
+    (error as unknown as Record<string, unknown>)[key] = value;
+  }
+  if (wire.cause !== undefined) {
+    Object.defineProperty(error, "cause", {
+      value: reviveThrown(wire.cause),
+      configurable: true,
+    });
+  }
+  return error;
 }
 
 /**
@@ -271,6 +360,16 @@ function adaptFacetStorage(
       return write(key, ...rest);
     };
 
+  const withBridge = async <T>(
+    run: (host: AlarmBridge) => Promise<T>,
+  ): Promise<T> => {
+    const host = bridge();
+    try {
+      return await run(host);
+    } finally {
+      disposeStub(host);
+    }
+  };
   const replacements: Record<string, unknown> = {
     setAlarm: (scheduledTime: number | Date): Promise<void> => {
       assertOutsideTransaction();
@@ -278,17 +377,17 @@ function adaptFacetStorage(
         scheduledTime instanceof Date
           ? scheduledTime.getTime()
           : scheduledTime;
-      return bridge().__claydoSetAlarm(kind, time);
+      return withBridge((host) => host.__claydoSetAlarm(kind, time));
     },
     getAlarm: (
       options?: DurableObjectGetAlarmOptions,
     ): Promise<number | null> => {
       assertOutsideTransaction();
-      return bridge().__claydoGetAlarm(kind, options);
+      return withBridge((host) => host.__claydoGetAlarm(kind, options));
     },
     deleteAlarm: (): Promise<void> => {
       assertOutsideTransaction();
-      return bridge().__claydoDeleteAlarm(kind);
+      return withBridge((host) => host.__claydoDeleteAlarm(kind));
     },
     put: guardedWrite(nativePut as (...args: unknown[]) => unknown),
     delete: guardedWrite(nativeDelete as (...args: unknown[]) => unknown),
@@ -526,18 +625,18 @@ export class FacetCore {
     method: string,
     args: unknown[],
     _init: boolean,
-  ): Promise<unknown> {
-    if (kind !== this.#identity.kind) {
-      throw claydoError(
-        "CLAYDO_KIND_MISMATCH",
-        `this facet is kind '${this.#identity.kind}', not '${kind}'.`,
-        { actualKind: this.#identity.kind, expectedKind: kind },
-      );
-    }
+  ): Promise<FacetCallResult> {
     try {
-      return await this.#dispatch(kind, method, args);
+      if (kind !== this.#identity.kind) {
+        throw claydoError(
+          "CLAYDO_KIND_MISMATCH",
+          `this facet is kind '${this.#identity.kind}', not '${kind}'.`,
+          { actualKind: this.#identity.kind, expectedKind: kind },
+        );
+      }
+      return { ok: true, value: await this.#dispatch(kind, method, args) };
     } catch (error) {
-      throw wireSafeError(error);
+      return { ok: false, error: serializeThrown(error) };
     }
   }
 

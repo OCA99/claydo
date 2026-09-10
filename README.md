@@ -112,7 +112,7 @@ await app.counter.fromId(id).increment();
 const response = await app.chat.get("lobby").fetch(request);
 ```
 
-Every accessor is fully typed from the registry: `app.counter.get(...)` returns a stub whose methods mirror `Counter`'s public prototype methods, with return values wrapped in promises.
+Every accessor is fully typed from the registry: `app.counter.get(...)` returns a stub whose methods mirror `Counter`'s public prototype methods, with return values wrapped in promises. Note the duality: a method that is synchronous in the class is asynchronous on the stub — always `await` stub calls, and run `tsc` before your tests to catch a missing `await` statically.
 
 ### Calling kinds from inside a kind
 
@@ -129,13 +129,19 @@ export class Checkout extends DurableObject<Env> {
 }
 ```
 
+Cross-kind calls are not atomic with your own writes: each instance is its own consistency domain, and a call to another kind can fail after your local write committed. Decide what happens when the other side is down — compensate (undo your write), tolerate the divergence, or make the remote effect idempotent and retry. The `shop` example shows manual compensation. Also mind the topology: routing every request through one singleton kind serializes your whole app on one instance; call the target kind directly from the Worker when no coordination is needed.
+
 ## Identity
 
 | Access | Instance | Kind resolution |
 | --- | --- | --- |
 | `app.counter.get("a")` | named `counter:a` | derived from the name, every request; pinned once as a cache for ID access |
+| `app.counter.getExisting("a")` | named, already created | like `get()`, but never initializes: uncreated names fail with `CLAYDO_UNINITIALIZED` |
+| `app.counter.has("a")` | — | pure existence read; never initializes, never runs the kind's constructor |
 | `app.counter.unique()` | unique ID | pinned in storage at first contact, immutable |
 | `app.counter.fromId(id)` | existing instance | must already have a kind; never initializes |
+
+`get()` creates on first contact, which is right for "the counter for user 42" but wrong for serving caller-supplied lookups: an unknown name would materialize an empty instance. Serve lookups with `getExisting()` (calls fail with `CLAYDO_UNINITIALIZED`, `fetch()` answers 404) or pre-check with `has()`. Existence means "was created", not "holds data" — `deleteAll()` does not reset it. For dynamically created entities with no natural name, prefer `unique()` and store `stub.id.toString()`; it needs no name-collision handling and `fromId()` gives the same never-initializes semantics on the read side.
 
 - Equal names under different kinds are different instances: `counter:a` and `chat:a` share nothing.
 - `instanceName(ctx)` inside a kind returns the logical name without the kind prefix (`"a"`, not `"counter:a"`), or `undefined` for unique-ID instances.
@@ -145,6 +151,8 @@ export class Checkout extends DurableObject<Env> {
 ## Storage
 
 Each kind instance owns a private SQLite database and key-value store, isolated by the facet. No other kind can reach it, and `claydo` keeps exactly one reserved key in it: the key-value key `__claydo` holds the facet's identity, so the runtime can restart the facet in the right role even without its startup props. `deleteAll()` preserves it; treat the `__claydo` key name as reserved.
+
+Plain storage transactions (`transaction()`, `transactionSync()`) work inside kinds without restriction; only alarm calls inside them are rejected. When typing `sql.exec<T>()` rows, declare `T` as a `type` alias, not an `interface` — the Workers types require an implicit index signature that only type aliases get.
 
 `ctx.storage.deleteAll()` inside a kind clears the kind's tables, views, and key-value data in one synchronous transaction. As with native Durable Objects, it does not delete a pending alarm, and it does not re-run your constructor: if the instance keeps serving, re-create your schema after the call.
 
@@ -196,7 +204,19 @@ async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) { /* ... */
 
 ## Errors
 
-Kind errors propagate natively. A custom error's `name`, `message`, `stack`, and own enumerable fields survive the stub. Built-in error classes such as `TypeError` and `RangeError` are reconstructed, so `instanceof` holds for them; custom classes are not, so match those on `error.name` or `error.code`.
+Kind errors propagate natively. A custom error's `name`, `message`, `stack`, and own enumerable fields survive the stub. Built-in error classes such as `TypeError` and `RangeError` are reconstructed, so `instanceof` holds for them; custom classes are not, so match those on `error.name` or `error.code`. Plain class fields qualify as own enumerable fields — this pattern crosses the hop as-is:
+
+```ts
+class OutOfStockError extends Error {
+  readonly code = "OUT_OF_STOCK";
+  constructor(readonly sku: string, readonly available: number) {
+    super(`out of stock: ${sku}`);
+    this.name = "OutOfStockError";
+  }
+}
+
+// Caller side: error.name, error.code, error.sku, error.available all arrive.
+```
 
 `claydo`'s own errors have `name: "ClaydoError"` and a stable `code`. Match on the code — messages can change in any release.
 
@@ -242,7 +262,11 @@ Creates the union class from a registry of kind names to classes. Kind names mus
 
 ### `kinds(namespace)` / `kind(namespace, kindName)`
 
-Typed accessors over the union's binding. Each accessor has `get(name)`, `unique()`, `fromId(id)`, and `idFromName(name)`. Stubs expose the kind's prototype methods plus the metadata fields `id`, `name`, `kind`, `stub` (the raw Durable Object stub), and `fetch()`.
+Typed accessors over the union's binding. Each accessor has `get(name)`, `getExisting(name)`, `has(name)`, `unique()`, `fromId(id)`, and `idFromName(name)`. Stubs expose the kind's prototype methods plus the metadata fields `id`, `name`, `kind`, `stub` (the raw Durable Object stub), and `fetch()`.
+
+### `claydo/test`
+
+`fireScheduledAlarm(stub)` fires an instance's pending kind alarm immediately inside a `@cloudflare/vitest-pool-workers` suite. Test-only.
 
 ### `instanceName(ctx)`
 
@@ -259,7 +283,7 @@ Type guard for claydo errors, and the constructor claydo uses internally (export
 ## Rules and limits
 
 - **Prototype methods only.** The stub proxies public prototype methods. Plain properties, accessor properties, and function-valued instance fields are not callable; all fail with `CLAYDO_NO_METHOD` and an explanation. Note that arrow-function fields (`increment = async () => {...}`) type-check as stub methods — TypeScript cannot distinguish them from prototype methods — but fail at the first call. Declare methods as regular class methods.
-- **Reserved names.** `ctx`, `env`, `id`, `name`, `kind`, `stub`, and `then` are stub metadata; `union()` rejects kinds that define them as methods. `fetch`, `alarm`, and the `webSocket*` handlers are lifecycle methods, invoked by the platform rather than the stub. Names starting with `__` are internal.
+- **Reserved names.** `ctx`, `env`, `id`, `name`, `kind`, `stub`, and `then` are stub metadata; `union()` rejects kinds that define them as methods. `fetch`, `alarm`, and the `webSocket*` handlers are lifecycle methods, invoked by the platform rather than the stub. Names starting with `__` are internal. All reservations apply to kind method names only — never to your SQL tables, columns, or key-value keys (except the single `__claydo` key).
 - **Arguments and return values** must serialize under Workers RPC rules (structured clone plus RPC extensions).
 - **One kind per instance.** An instance's kind is fixed by its name or its first contact and never changes.
 - **One storage layout per major version.** An instance holding data written by the claydo 0.1.x layout fails with `CLAYDO_CONFIG` instead of serving an empty instance.
@@ -279,7 +303,14 @@ export default defineConfig({
 });
 ```
 
-Alarms fire naturally in the pool: schedule a near-future alarm and poll for its effect. `runInDurableObject()` on a raw stub opens the supervisor, not the kind's facet; read kind data through kind methods.
+Alarms fire naturally in the pool. Two ways to test them:
+
+- Schedule a near-future alarm and poll for its effect. Leave a margin: an alarm scheduled 40ms out can fire while your test is still seeding data, so keep setup work outside the alarm window (or schedule 250ms+ out). For fixed product timescales (a 30-second auction window), make the duration an injectable parameter of the kind rather than waiting in tests — the pool has no time control.
+- Force a scheduled alarm with the test helper: `import { fireScheduledAlarm } from "claydo/test"` and `await fireScheduledAlarm(stubOrKindStub)` fires the pending kind alarm immediately (returns `false` when nothing is scheduled). Do not add test-only trigger methods to production kinds, and do not call `__claydo*` internals.
+
+`runInDurableObject()` on a raw stub opens the supervisor, not the kind's facet; read kind data through kind methods.
+
+Expected log lines on error-path tests: a kind error that a test intentionally triggers can appear once in stderr as an `uncaught exception` event — that is the runtime logging the rejected RPC promise, not a test failure, and the error is delivered to the caller regardless.
 
 ## Examples
 

@@ -5,7 +5,7 @@ export default defineConfig({
   plugins: [
     cloudflareTest({
       wrangler: {
-        configPath: new URL("./wrangler.jsonc", import.meta.url).pathname,
+        configPath: "./examples/rate-limiter/wrangler.jsonc",
       },
     }),
   ],

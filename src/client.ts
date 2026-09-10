@@ -92,12 +92,30 @@ export interface KindAccessor<T> {
   /**
    * Returns a stub for the named instance. The full Durable Object name is
    * `<kind>:<name>`, so equal names under different kinds map to different
-   * instances.
+   * instances. First contact through this stub initializes the instance.
    */
   get(
     name: string,
     options?: DurableObjectNamespaceGetDurableObjectOptions,
   ): KindStub<T>;
+  /**
+   * Returns a stub for the named instance that never initializes it:
+   * calls fail with `CLAYDO_UNINITIALIZED` (and `fetch()` answers 404)
+   * unless the instance already had a first contact through `get()`.
+   * Use this to serve lookups of caller-supplied names without
+   * materializing storage for names that were never created.
+   */
+  getExisting(
+    name: string,
+    options?: DurableObjectNamespaceGetDurableObjectOptions,
+  ): KindStub<T>;
+  /**
+   * True when the named instance was already initialized. A pure read: it
+   * never initializes the instance and never runs the kind's constructor.
+   * "Initialized" means a first contact happened, not that data exists —
+   * `deleteAll()` does not reset it.
+   */
+  has(name: string): Promise<boolean>;
   /** Creates a new unique instance. Store `stub.id.toString()` to find it again. */
   unique(options?: DurableObjectNamespaceNewUniqueIdOptions): KindStub<T>;
   /**
@@ -136,6 +154,16 @@ export function kind<
         kindName,
         { name, mode: "named" },
       ),
+    getExisting: (name, options) =>
+      makeStub(
+        ns.get(ns.idFromName(composeInstanceName(kindName, name)), options),
+        kindName,
+        { name, mode: "existing" },
+      ),
+    has: (name) =>
+      ns
+        .get(ns.idFromName(composeInstanceName(kindName, name)))
+        .__claydoHas() as Promise<boolean>,
     unique: (options) =>
       makeStub(ns.get(ns.newUniqueId(options)), kindName, {
         mode: "unique",
@@ -171,7 +199,7 @@ export function kinds<NS extends DurableObjectNamespace<any>>(
 
 interface StubOptions {
   name?: string;
-  mode: "named" | "unique" | "fromId";
+  mode: "named" | "unique" | "fromId" | "existing";
 }
 
 function makeStub<T>(
@@ -179,6 +207,8 @@ function makeStub<T>(
   kindName: string,
   { name, mode }: StubOptions,
 ): KindStub<T> {
+  // getExisting() and fromId() stubs never initialize an instance.
+  const initializes = mode === "named" || mode === "unique";
   const meta: Record<string, unknown> = {
     id: stub.id,
     name,
@@ -195,13 +225,12 @@ function makeStub<T>(
       // Forwarded requests can carry claydo headers from an untrusted
       // client; the stub owns both, so it always overwrites them.
       request.headers.set(KIND_HEADER, kindName);
-      if (mode === "fromId") {
-        // fromId() never initializes.
-        request.headers.delete(INIT_HEADER);
-      } else {
+      if (initializes) {
         // First contact through get() or unique() may pin the kind; the
         // supervisor does it in the same round trip.
         request.headers.set(INIT_HEADER, "1");
+      } else {
+        request.headers.delete(INIT_HEADER);
       }
       return stub.fetch(request);
     },
@@ -217,26 +246,30 @@ function makeStub<T>(
       if (LOCAL_UNDEFINED_KEYS.has(prop) || prop.startsWith("__")) {
         return undefined;
       }
-      return (...args: unknown[]) =>
-        (
-          stub.__claydoCall(
+      // Await the RPC promise directly instead of chaining on it: a
+      // .then/.catch chain wraps the RPC result in a native promise and
+      // can leave the underlying result undisposed.
+      return async (...args: unknown[]) => {
+        try {
+          return await (stub.__claydoCall(
             kindName,
             prop,
             args,
-            mode !== "fromId",
-          ) as Promise<unknown>
-        ).catch((error: unknown) => {
-            // Serialization failures originate at this call site, not in
-            // the kind, so add the call context the raw error lacks.
-            if (error instanceof Error && error.name === "DataCloneError") {
-              throw new Error(
-                `claydo: call to ${kindName}.${prop}() failed to ` +
-                  `serialize: ${error.message}`,
-                { cause: error },
-              );
-            }
-            throw error;
-          });
+            initializes,
+          ) as Promise<unknown>);
+        } catch (error) {
+          // Serialization failures originate at this call site, not in
+          // the kind, so add the call context the raw error lacks.
+          if (error instanceof Error && error.name === "DataCloneError") {
+            throw new Error(
+              `claydo: call to ${kindName}.${prop}() failed to ` +
+                `serialize: ${error.message}`,
+              { cause: error },
+            );
+          }
+          throw error;
+        }
+      };
     },
   }) as KindStub<T>;
 }

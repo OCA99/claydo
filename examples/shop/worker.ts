@@ -154,7 +154,11 @@ export class ShopDO extends union({
 }) {}
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(
+    request: Request,
+    env: Env,
+    _ctx?: ExecutionContext,
+  ): Promise<Response> {
     const url = new URL(request.url);
     const [, resource, id, action] = url.pathname.split("/");
 

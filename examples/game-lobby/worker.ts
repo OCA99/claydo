@@ -204,7 +204,11 @@ export class AppDO extends union({
 }) {}
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(
+    request: Request,
+    env: Env,
+    _ctx?: ExecutionContext,
+  ): Promise<Response> {
     const url = new URL(request.url);
     const app = kinds(env.APP_DO);
     const lobby = app.lobby.get("main");

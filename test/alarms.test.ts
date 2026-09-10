@@ -66,6 +66,18 @@ describe("kind alarms", () => {
     expect(await reminder.alarmTime()).toBeNull();
   });
 
+  it("fireScheduledAlarm forces a future alarm in tests", async () => {
+    const { fireScheduledAlarm } = await import("../src/test");
+    const reminder = app.reminder.get("alarm-forced");
+    await reminder.remindAt(Date.now() + 3_600_000, "forced");
+    expect(await fireScheduledAlarm(reminder)).toBe(true);
+    const fired = (await reminder.fired()) as { payload: string };
+    expect(fired.payload).toBe("forced");
+    expect(await reminder.alarmTime()).toBeNull();
+    // Nothing scheduled: reports false.
+    expect(await fireScheduledAlarm(reminder)).toBe(false);
+  });
+
   it("cancels from inside the handler without a refire", async () => {
     const reminder = app.reminder.get("alarm-cancel-inside");
     await reminder.cancelInsideHandler();

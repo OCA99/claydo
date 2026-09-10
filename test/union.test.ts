@@ -83,6 +83,48 @@ describe("identity and isolation", () => {
   });
 });
 
+describe("existence", () => {
+  it("has() reads existence without creating anything", async () => {
+    expect(await app.counter.has("exist-probe")).toBe(false);
+    // Probing did not create the instance.
+    expect(await app.counter.has("exist-probe")).toBe(false);
+    await app.counter.get("exist-probe").increment();
+    expect(await app.counter.has("exist-probe")).toBe(true);
+  });
+
+  it("has() reports created, not non-empty: deleteAll keeps it", async () => {
+    const counter = app.counter.get("exist-wipe");
+    await counter.increment();
+    await counter.wipe();
+    expect(await app.counter.has("exist-wipe")).toBe(true);
+  });
+
+  it("getExisting() refuses names that were never created", async () => {
+    const error = await caught(
+      app.counter.getExisting("exist-never").value(),
+    );
+    expect((error as ClaydoError).code).toBe("CLAYDO_UNINITIALIZED");
+    expect(error.message).toContain("never created");
+    // The refused access did not create the instance either.
+    expect(await app.counter.has("exist-never")).toBe(false);
+  });
+
+  it("getExisting() serves instances that were created", async () => {
+    await app.counter.get("exist-yes").increment(4);
+    expect(await app.counter.getExisting("exist-yes").value()).toBe(4);
+  });
+
+  it("getExisting().fetch() answers 404 for uncreated names", async () => {
+    const response = await app.counter
+      .getExisting("exist-fetch")
+      .fetch("https://do/value");
+    expect(response.status).toBe(404);
+    expect(response.headers.get("x-claydo-code")).toBe(
+      "CLAYDO_UNINITIALIZED",
+    );
+  });
+});
+
 describe("unique-ID instances", () => {
   it("initializes on first contact and stays reachable by id", async () => {
     const created = app.counter.unique();

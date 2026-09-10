@@ -1,6 +1,6 @@
 {
   "name": "claydo",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "One Durable Object class, many use cases. Each instance routes to a fixed kind, and each kind runs in its own isolated storage facet.",
   "license": "MIT",
   "repository": {
@@ -26,6 +26,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./test": {
+      "types": "./dist/test.d.ts",
+      "import": "./dist/test.js"
     }
   },
   "files": [
