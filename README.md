@@ -1,5 +1,7 @@
 # claydo
 
+⚠️ experimental, use at your own risk ⚠️
+
 One Durable Object class, many use cases.
 
 Cloudflare Workers accounts have a hard limit on Durable Object namespaces, and every new stateful use case normally costs one: a class, a binding, a migration, and a deploy. `claydo` multiplexes instead. You register each use case as a **kind** — a plain Durable Object class — and `union()` returns one class that hosts all of them. Each instance belongs to exactly one kind, and each kind implementation runs inside a [Durable Object facet](https://developers.cloudflare.com/dynamic-workers/usage/durable-object-facets/) with its own isolated SQLite database.
