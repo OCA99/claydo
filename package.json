@@ -5,11 +5,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/FermatResearch/GenericDurableObjects.git"
+    "url": "git+https://github.com/OCA99/claydo.git"
   },
-  "homepage": "https://github.com/FermatResearch/GenericDurableObjects#readme",
+  "homepage": "https://github.com/OCA99/claydo#readme",
   "bugs": {
-    "url": "https://github.com/FermatResearch/GenericDurableObjects/issues"
+    "url": "https://github.com/OCA99/claydo/issues"
   },
   "keywords": [
     "cloudflare",

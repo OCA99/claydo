@@ -13,7 +13,7 @@
 3. Set up auth for CI releases. Pick one:
    - **Trusted publishing (recommended).** On npmjs.com, open the package →
      Settings → Trusted Publisher. Select GitHub Actions, repository
-     `FermatResearch/GenericDurableObjects`, workflow `release.yml`. No
+     `OCA99/claydo`, workflow `release.yml`. No
      secrets needed; provenance attestations are automatic.
    - **Token.** Create a granular automation token on npmjs.com and save it
      as the `NPM_TOKEN` secret in the GitHub repository settings.
