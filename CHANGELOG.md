@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `kindNamespace(namespace, kindName)`: a typed namespace adapter for
+  existing consumers and SDK routing, with stateless ID handling,
+  location/routing options, jurisdiction scoping, and unique-ID support.
+  Namespace `get()` initializes on first contact; `kind().fromId()`
+  retains its never-initializes contract.
+- Runtime compatibility coverage using original PartyServer/Agents classes,
+  Sentry instrumentation, and authenticated MCP session initialization/reuse.
+
+### Changed
+
+- **Breaking:** named kind facets receive a native logical ID through
+  Cloudflare facet startup options. Their `ctx.id.name` has no kind prefix,
+  and their `ctx.id` is distinct from the external supervisor ID (`stub.id`).
+  Equal logical IDs across kinds remain isolated by parent and facet storage.
+- **Breaking:** no framework-private startup method is invoked by default.
+  SDK helpers/fetch handlers own initialization and startup props. Applications
+  can still supply an explicit union `onStart` hook for custom RPC setup.
+- Logical names persist in supervisor storage for reconstructed-ID cold starts.
+  Existing facet storage stays in place. Pre-upgrade named instances need one
+  named access to record the logical name before ID-only access can expose it.
+- Facet alarm relays use the persisted physical parent ID independently of the
+  logical facet ID, including after cold starts and `deleteAll()`.
+- No SDK-specific class adapters or production dependencies. SDK libraries
+  remain test dependencies only.
+
 ## 0.3.0
 
 Driven by a twelve-application developer-experience study: twelve agents at

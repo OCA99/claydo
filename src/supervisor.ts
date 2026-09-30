@@ -22,16 +22,18 @@ export interface UnionOptions {
    */
   name?: string;
   /**
-   * Runs once after a kind instance is constructed, before it serves. By
-   * default claydo runs the instance's `__unsafe_ensureInitialized()`
-   * hook when one exists, which covers PartyServer and the Agents SDK.
-   * Set this option to adapt other frameworks with deferred setup.
+   * Runs once after a kind instance is constructed, before it serves.
+   * No hook runs by default: kinds and frameworks own their initialization.
+   * Set this option when your application needs deferred setup before RPC.
    */
   onStart?: (instance: object) => void | Promise<void>;
 }
 
 /** The storage key that pins the kind of an instance. */
 const KIND_KEY = "kind";
+
+/** Logical name retained for ID-based, nameless supervisor wakes. */
+const NAME_KEY = "name";
 
 /** The storage key prefix of one kind's scheduled alarm. */
 const ALARM_PREFIX = "alarm:";
@@ -125,6 +127,7 @@ interface FacetStub {
 interface OwnExportEntry {
   (options: { props?: unknown }): unknown;
   get?(id: DurableObjectId): unknown;
+  idFromName(name: string): DurableObjectId;
 }
 
 /** Releases a per-call facet stub handle once its call settled. */
@@ -152,6 +155,7 @@ export class SupervisorCore {
   readonly #options: UnionOptions;
   readonly #className: () => string;
   #kindLoading?: Promise<string>;
+  #logicalName?: string;
   /** Kinds whose alarm handler is running right now, in this isolate. */
   readonly #firing = new Set<string>();
 
@@ -205,10 +209,13 @@ export class SupervisorCore {
   /**
    * Returns the union class handle, configured for `kind`. The facet runs
    * the same top-level export as the supervisor. Claydo's identity travels
-   * under the one reserved props field; the supervisor's own configured
+   * under the one reserved props field, including the physical parent ID
+   * used for alarm relays. Named facets receive a logical native ID;
+   * storage isolation is still provided by the parent and facet key.
+   * The supervisor's own configured
    * props (if any) pass through to the kind.
    */
-  #facetClass(kind: string): unknown {
+  #facetClass(kind: string): { class: unknown; id?: DurableObjectId } {
     const host = this.#hostExport();
     const entry = (this.#ctx.exports as unknown as Record<string, unknown>)[
       host
@@ -221,7 +228,13 @@ export class SupervisorCore {
           `{ name: "..." }.`,
       );
     }
-    const identity: FacetIdentity = { v: 1, kind, host };
+    const identity: FacetIdentity = {
+      v: 1,
+      kind,
+      host,
+      parent: this.#ctx.id.toString(),
+      ...(this.#logicalName !== undefined ? { name: this.#logicalName } : {}),
+    };
     const ownProps = (this.#ctx as { props?: unknown }).props;
     const passthrough =
       typeof ownProps === "object" && ownProps !== null
@@ -238,7 +251,12 @@ export class SupervisorCore {
           `remove it from the binding configuration.`,
       );
     }
-    return entry({ props: { ...passthrough, [FACET_IDENTITY_KEY]: identity } });
+    return {
+      class: entry({ props: { ...passthrough, [FACET_IDENTITY_KEY]: identity } }),
+      ...(this.#logicalName !== undefined
+        ? { id: entry.idFromName(this.#logicalName) }
+        : {}),
+    };
   }
 
   /**
@@ -252,9 +270,10 @@ export class SupervisorCore {
   #facet(kind: string): FacetStub {
     const configured = this.#facetClass(kind);
     const stub = this.#facets().get(kind, () => ({
-      class: configured as never,
+      class: configured.class as never,
+      ...(configured.id !== undefined ? { id: configured.id } : {}),
     })) as unknown as FacetStub;
-    disposeStub(configured);
+    disposeStub(configured.class);
     return stub;
   }
 
@@ -304,13 +323,17 @@ export class SupervisorCore {
     const persisted = await this.#ctx.storage.get<unknown>([
       KIND_KEY,
       LEGACY_KIND_KEY,
+      NAME_KEY,
     ]);
     if (persisted.get(LEGACY_KIND_KEY) !== undefined) {
       this.#legacyLayoutError();
     }
     const pinned = persisted.get(KIND_KEY) as string | undefined;
     const derived = this.#kindFromName();
+    const storedName = persisted.get(NAME_KEY);
+    this.#logicalName = typeof storedName === "string" ? storedName : undefined;
     if (derived !== undefined) {
+      this.#logicalName = this.#ctx.id.name!.slice(derived.length + 1);
       // The name stays authoritative; the pin marks the instance as
       // created and lets fromId() resolve it after a nameless cold start.
       if (pinned === undefined) {
@@ -322,7 +345,13 @@ export class SupervisorCore {
               `create it first with kind(ns, '${derived}').get(name).`,
           );
         }
-        await this.#ctx.storage.put(KIND_KEY, derived);
+        await this.#ctx.storage.put({
+          [KIND_KEY]: derived,
+          [NAME_KEY]: this.#logicalName,
+        });
+      } else if (storedName === undefined) {
+        // Upgrade an existing named instance without moving its facet data.
+        await this.#ctx.storage.put(NAME_KEY, this.#logicalName);
       }
       return derived;
     }

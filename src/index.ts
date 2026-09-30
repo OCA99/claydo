@@ -194,10 +194,11 @@ function validateRegistry(kinds: KindRegistry): void {
   }
 }
 
-export { kind, kinds } from "./client";
+export { kind, kinds, kindNamespace } from "./client";
 export type {
   KindAccessor,
   KindNameOf,
+  KindNamespace,
   KindStub,
   RegistryOf,
 } from "./client";

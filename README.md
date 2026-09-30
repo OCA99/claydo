@@ -88,9 +88,9 @@ The supervisor starts each kind facet from this same top-level export, which it 
 {
   "compatibility_date": "2026-08-01",
   "durable_objects": {
-    "bindings": [{ "name": "APP_DO", "class_name": "AppDO" }]
+    "bindings": [{ "name": "APP_DO", "class_name": "AppDO" }],
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AppDO"] }]
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AppDO"] }],
 }
 ```
 
@@ -135,18 +135,19 @@ Cross-kind calls are not atomic with your own writes: each instance is its own c
 
 ## Identity
 
-| Access | Instance | Kind resolution |
-| --- | --- | --- |
-| `app.counter.get("a")` | named `counter:a` | derived from the name, every request; pinned once as a cache for ID access |
+| Access                         | Instance               | Kind resolution                                                                       |
+| ------------------------------ | ---------------------- | ------------------------------------------------------------------------------------- |
+| `app.counter.get("a")`         | named `counter:a`      | derived from the name, every request; pinned once as a cache for ID access            |
 | `app.counter.getExisting("a")` | named, already created | like `get()`, but never initializes: uncreated names fail with `CLAYDO_UNINITIALIZED` |
-| `app.counter.has("a")` | — | pure existence read; never initializes, never runs the kind's constructor |
-| `app.counter.unique()` | unique ID | pinned in storage at first contact, immutable |
-| `app.counter.fromId(id)` | existing instance | must already have a kind; never initializes |
+| `app.counter.has("a")`         | —                      | pure existence read; never initializes, never runs the kind's constructor             |
+| `app.counter.unique()`         | unique ID              | pinned in storage at first contact, immutable                                         |
+| `app.counter.fromId(id)`       | existing instance      | must already have a kind; never initializes                                           |
 
 `get()` creates on first contact, which is right for "the counter for user 42" but wrong for serving caller-supplied lookups: an unknown name would materialize an empty instance. Serve lookups with `getExisting()` (calls fail with `CLAYDO_UNINITIALIZED`, `fetch()` answers 404) or pre-check with `has()`. Existence means "was created", not "holds data" — `deleteAll()` does not reset it. For dynamically created entities with no natural name, prefer `unique()` and store `stub.id.toString()`; it needs no name-collision handling and `fromId()` gives the same never-initializes semantics on the read side.
 
 - Equal names under different kinds are different instances: `counter:a` and `chat:a` share nothing.
-- `instanceName(ctx)` inside a kind returns the logical name without the kind prefix (`"a"`, not `"counter:a"`), or `undefined` for unique-ID instances.
+- Inside a named kind, native `ctx.id.name` and `instanceName(ctx)` return the logical name, including colons. Unique-ID instances have no native name.
+- `stub.id` is the external supervisor ID. A named facet's `ctx.id` represents its logical identity and can be equal across kinds; it is not an external routing address. Store the caller's `stub.id` when you need to reopen an instance.
 - Raw namespace access with an un-prefixed name (for example `env.APP_DO.getByName("a")`) reaches a different instance than `app.counter.get("a")` and fails with `CLAYDO_UNINITIALIZED` and guidance. Reach instances through `kind()`/`kinds()`.
 - Accessing an instance under the wrong kind fails with `CLAYDO_KIND_MISMATCH`; the error carries `actualKind` and `expectedKind`.
 
@@ -211,7 +212,10 @@ Kind errors propagate natively. A custom error's `name`, `message`, `stack`, and
 ```ts
 class OutOfStockError extends Error {
   readonly code = "OUT_OF_STOCK";
-  constructor(readonly sku: string, readonly available: number) {
+  constructor(
+    readonly sku: string,
+    readonly available: number,
+  ) {
     super(`out of stock: ${sku}`);
     this.name = "OutOfStockError";
   }
@@ -222,14 +226,14 @@ class OutOfStockError extends Error {
 
 `claydo`'s own errors have `name: "ClaydoError"` and a stable `code`. Match on the code — messages can change in any release.
 
-| Code | Meaning |
-| --- | --- |
-| `CLAYDO_CONFIG` | The worker exports or the wrangler configuration are incomplete. |
-| `CLAYDO_UNKNOWN_KIND` | The requested kind is not in the registry. |
-| `CLAYDO_KIND_MISMATCH` | The instance belongs to one kind; the caller expected another. |
-| `CLAYDO_UNINITIALIZED` | The instance has no kind yet, and the access cannot set one. |
-| `CLAYDO_NO_METHOD` | The called name is not a callable method on the kind. |
-| `CLAYDO_ALARM_IN_TRANSACTION` | An alarm operation ran inside a storage transaction. |
+| Code                          | Meaning                                                          |
+| ----------------------------- | ---------------------------------------------------------------- |
+| `CLAYDO_CONFIG`               | The worker exports or the wrangler configuration are incomplete. |
+| `CLAYDO_UNKNOWN_KIND`         | The requested kind is not in the registry.                       |
+| `CLAYDO_KIND_MISMATCH`        | The instance belongs to one kind; the caller expected another.   |
+| `CLAYDO_UNINITIALIZED`        | The instance has no kind yet, and the access cannot set one.     |
+| `CLAYDO_NO_METHOD`            | The called name is not a callable method on the kind.            |
+| `CLAYDO_ALARM_IN_TRANSACTION` | An alarm operation ran inside a storage transaction.             |
 
 ```ts
 import { isClaydoError } from "claydo";
@@ -249,18 +253,53 @@ Errors that carry non-cloneable own fields (an open socket, a function) still ar
 
 ## Third-party Durable Object classes
 
-Any class with a `(ctx, env)` constructor registers as a kind, including PartyServer servers and Agents SDK agents. `claydo` runs a class's `__unsafe_ensureInitialized()` hook at construction when it exists, which covers these frameworks' deferred setup.
+Any class with a `(ctx, env)` constructor registers directly as a kind, including PartyServer servers and Agents SDK agents. ClayDO gives named facets a native logical ID through Cloudflare's facet startup options, so the original class sees the correct `ctx.id.name` from its constructor onward. No SDK wrapper or name override is required.
 
-Two caveats, both from the kind-prefixed naming scheme:
+ClayDO constructs the class and calls only an explicitly supplied union `onStart` hook. Frameworks own their initialization: their namespace helpers deliver startup props through `setName()`, and their fetch handlers run their own lifecycle. For SDK routing, give the SDK a `kindNamespace()`:
 
-- `getServerByName()` / `getAgentByName()` address instances without a kind prefix, so they cannot reach a claydo instance. The supervisor answers their `setName()` call with a guiding error. Use `kind(ns, "<kind>").get(name)` instead.
-- URL-based routers such as `routePartykitRequest()` work only when the room name in the URL is the full `<kind>:<name>` instance name.
+```ts
+import { union, kindNamespace } from "claydo";
+import { getServerByName } from "partyserver";
+import { getAgentByName } from "agents";
 
+// Existing classes stay in their own modules, with no name/setName overrides.
+export class AppDO extends union({
+  room: ChatRoom,
+  agent: MyAgent,
+  mcp: MyMcpAgent,
+  counter: Counter,
+}) {}
+
+const rooms = kindNamespace(env.APP_DO, "room");
+const room = await getServerByName(rooms, "lobby", {
+  props: { uid: authenticatedUser.id },
+});
+const agent = await getAgentByName(
+  kindNamespace(env.APP_DO, "agent"),
+  "session-42",
+);
+
+// For McpAgent.serve(), supply the adapted namespace as MCP_OBJECT.
+const mcpEnv = { ...env, MCP_OBJECT: kindNamespace(env.APP_DO, "mcp") };
+```
+
+SDK `this.name` and `setName(logicalName, props)` use the logical name unchanged. Startup props remain owned by the SDK; authenticate them at your worker boundary. Sentry can instrument the original classes before they enter the registry.
+
+For custom RPC setup, provide an explicit `union(..., { onStart: instance => ... })` hook. It runs before the first call and has no access to props that an SDK will deliver in a later `setName()` call. Avoid using it to eagerly start a framework whose initialization depends on those props. ClayDO has no runtime SDK dependencies; PartyServer, Agents, MCP, AI and Sentry are development dependencies used by integration tests.
+`kindNamespace()` provides `idFromName`, `idFromString`, `newUniqueId`, `get`, `getByName`, and `jurisdiction`. It forwards routing/location options and unique-ID options to the real namespace, with no in-memory name cache. `get()` initializes on first contact, including for new unique IDs and reconstructed IDs; the kind becomes immutable once initialized. Use `kind(...).fromId()` or `getExisting()` when lookups must never create an instance. IDs must belong to the union namespace; old IDs from a separate namespace are not migrated. The adapter uses the same method/fetch proxy as `kind()`; it does not make kind properties, getters, or internal SDK methods available over RPC.
+
+`routePartykitRequest()` also accepts the adapted environment binding, with logical room names in its URLs. Passing the raw union binding to an SDK helper does not scope a kind: use `kindNamespace()` for these consumers.
+
+### Upgrading from 0.3.x
+
+This changes named facets' native `ctx.id` and removes automatic calls to `__unsafe_ensureInitialized()`. External supervisor IDs, kind pins and facet storage locations are unchanged. Update code that treats a facet's `ctx.id` as an external address, and explicitly opt into any application startup hook you need.
+
+The logical name is now persisted with the supervisor so reconstructed IDs work after restarts. Existing named instances retain their facet data and acquire the name record on their first named access. An older instance reached only by a reconstructed ID has no recoverable logical name in its stored supervisor state; access it by name once before relying on the new native naming behavior. Until then it retains the inherited identity. Unique-ID instances keep their existing identity.
 ## API
 
 ### `union(kinds, options?)`
 
-Creates the union class from a registry of kind names to classes. Kind names must be non-empty, must not contain `:`, and must not start with `__`. Options: `name` overrides the class's export name; `onStart` runs once after a kind instance is constructed (the default runs the `__unsafe_ensureInitialized()` hook that PartyServer and the Agents SDK use). The class reserves the `__claydo` field of `ctx.props` for its role selection; all other configured props pass through to the kind.
+Creates the union class from a registry of kind names to classes. Kind names must be non-empty, must not contain `:`, and must not start with `__`. Options: `name` overrides the class's export name; `onStart` runs once after a kind instance is constructed (no hook runs by default). The class reserves the `__claydo` field of `ctx.props` for its role selection; all other configured props pass through to the kind.
 
 ### `kinds(namespace)` / `kind(namespace, kindName)`
 
@@ -269,6 +308,10 @@ Typed accessors over the union's binding. Each accessor has `get(name)`, `getExi
 ### `claydo/test`
 
 `fireScheduledAlarm(stub)` fires an instance's pending kind alarm immediately inside a `@cloudflare/vitest-pool-workers` suite. Test-only.
+
+### `kindNamespace(namespace, kindName)`
+
+A typed, namespace-shaped adapter for one registered kind. Use it with existing namespace consumers, `getServerByName`, `getAgentByName`, and MCP routing. Namespace `get()` creates on first contact; ID reads through `kind().fromId()` retain their never-initializes behavior.
 
 ### `instanceName(ctx)`
 
@@ -280,7 +323,7 @@ Type guard for claydo errors, and the constructor claydo uses internally (export
 
 ### Types
 
-`KindRegistry`, `KindClass`, `KindStub<T>`, `KindAccessor<T>`, `KindNameOf<NS>`, `RegistryOf<NS>`, `SupervisorClass<R>`, `SupervisorInstance<R>`, `UnionOptions`, `ClaydoError`, `ClaydoErrorCode`, `KindHandlers`.
+`KindRegistry`, `KindClass`, `KindStub<T>`, `KindAccessor<T>`, `KindNamespace<T>`, `KindNameOf<NS>`, `RegistryOf<NS>`, `SdkKindClass`, `SupervisorClass<R>`, `SupervisorInstance<R>`, `UnionOptions`, `ClaydoError`, `ClaydoErrorCode`, `KindHandlers`.
 
 ## Rules and limits
 

@@ -7,13 +7,14 @@
     "bindings": [
       { "name": "APP_DO", "class_name": "AppDO" },
       { "name": "RENAMED", "class_name": "RenamedDO" },
+      { "name": "EXPLICIT", "class_name": "ExplicitDO" },
       { "name": "MISNAMED", "class_name": "Misnamed" }
     ]
   },
   "migrations": [
     {
       "tag": "v1",
-      "new_sqlite_classes": ["AppDO", "RenamedDO", "Misnamed"]
+      "new_sqlite_classes": ["AppDO", "RenamedDO", "Misnamed", "ExplicitDO"]
     }
   ]
 }

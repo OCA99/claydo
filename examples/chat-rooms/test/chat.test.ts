@@ -15,7 +15,7 @@ describe("chat rooms (partyserver kind)", () => {
     const alice = await connect("lobby", "alice");
     expect(await alice.next()).toMatchObject({
       type: "welcome",
-      room: "chat:lobby",
+      room: "lobby",
       users: ["alice"],
       history: [],
     });
@@ -110,14 +110,13 @@ describe("chat rooms (partyserver kind)", () => {
     second.close();
   });
 
-  it("sees the kind-prefixed name through PartyServer, the logical name through instanceName()", async () => {
+  it("sees the same logical name through PartyServer and instanceName()", async () => {
     const client = await connect("prefixed", "nina");
     await client.next(); // welcome
     const info = await app.chat.get("prefixed").roomInfo();
-    // PartyServer reads ctx.id.name, which is the full instance name
-    // "chat:prefixed"; instanceName() strips the kind prefix.
+    // The native facet identity is the logical room name.
     expect(info).toEqual({
-      name: "chat:prefixed",
+      name: "prefixed",
       room: "prefixed",
       connections: 1,
     });
@@ -127,7 +126,7 @@ describe("chat rooms (partyserver kind)", () => {
   it("answers RPC on a fresh room that never saw a connection", async () => {
     const info = await app.chat.get("cold-room").roomInfo();
     expect(info).toEqual({
-      name: "chat:cold-room",
+      name: "cold-room",
       room: "cold-room",
       connections: 0,
     });

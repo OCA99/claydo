@@ -308,12 +308,10 @@ describe("framework kinds", () => {
     expect(await app.party.get("lobby").hello()).toBe("party:lobby");
   });
 
-  it("initializes framework kinds on RPC-first access", async () => {
-    // The deferred PartyServer setup runs through the onStart hook, so
-    // the name is available without a warm-up fetch.
+  it("provides a native logical name on RPC-first access", async () => {
+    // The constructor sees the logical native ID before any SDK lifecycle runs.
     const name = await app.party.get("init-first").storedName();
-    expect(typeof name).toBe("string");
-    expect(name.length).toBeGreaterThan(0);
+    expect(name).toBe("init-first");
   });
 
   it("rejects getServerByName-style access with guidance", async () => {
