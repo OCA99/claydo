@@ -58,6 +58,10 @@
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.22.0",
     "@cloudflare/workers-types": "^5.20260819.1",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@sentry/cloudflare": "^11.1.0",
+    "agents": "^0.15.0",
+    "ai": "^6.0.297",
     "partyserver": "^0.5.10",
     "tsup": "^8.5.1",
     "typescript": "^5.9.0",

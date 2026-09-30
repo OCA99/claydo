@@ -194,13 +194,16 @@ function validateRegistry(kinds: KindRegistry): void {
   }
 }
 
-export { kind, kinds } from "./client";
+export { kind, kinds, kindNamespace } from "./client";
 export type {
   KindAccessor,
   KindNameOf,
+  KindNamespace,
   KindStub,
   RegistryOf,
 } from "./client";
+export { sdk } from "./sdk";
+export type { SdkKindClass } from "./sdk";
 export { claydoError, isClaydoError } from "./errors";
 export type { ClaydoError, ClaydoErrorCode } from "./errors";
 export type {

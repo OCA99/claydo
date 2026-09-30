@@ -24,7 +24,8 @@ export interface UnionOptions {
   /**
    * Runs once after a kind instance is constructed, before it serves. By
    * default claydo runs the instance's `__unsafe_ensureInitialized()`
-   * hook when one exists, which covers PartyServer and the Agents SDK.
+   * hook when one exists, except for sdk() kinds, whose framework owns
+   * initialization and props delivery. An explicit onStart overrides both.
    * Set this option to adapt other frameworks with deferred setup.
    */
   onStart?: (instance: object) => void | Promise<void>;

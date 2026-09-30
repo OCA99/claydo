@@ -1,4 +1,5 @@
 import { claydoError } from "./errors";
+import { isSdkKind } from "./sdk";
 import {
   FACET_IDENTITY_KEY,
   isFacetIdentity,
@@ -485,6 +486,7 @@ function findDescriptor(
 /** The default start hook: PartyServer and the Agents SDK defer their
  * setup to `__unsafe_ensureInitialized()`. */
 async function defaultOnStart(instance: object): Promise<void> {
+  if (isSdkKind(instance)) return;
   const ensure = (instance as Record<string, unknown>)[
     "__unsafe_ensureInitialized"
   ];

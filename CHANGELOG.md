@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `kindNamespace(namespace, kindName)`: a typed namespace adapter for
+  existing consumers and SDK routing, with stateless ID handling,
+  location/routing options, jurisdiction scoping, and unique-ID support.
+  Namespace `get()` initializes on first contact; `kind().fromId()`
+  retains its never-initializes contract.
+- `sdk(Class)`: opt-in PartyServer/Agents/McpAgent compatibility for
+  logical names, kind-prefixed `setName`, and SDK-owned initialization
+  with startup props. Works with instrumentation wrappers; other kinds
+  retain eager initialization and explicit `onStart` hooks take precedence.
+- Runtime compatibility coverage for SDK bootstrap, reconstructed IDs,
+  Sentry wrapping, and authenticated MCP session initialization/reuse.
+
 ## 0.3.0
 
 Driven by a twelve-application developer-experience study: twelve agents at
