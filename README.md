@@ -166,7 +166,7 @@ async reset(): Promise<void> {
 }
 ```
 
-The supervisor keeps its own bookkeeping in the instance's root storage: the kind pin of unique-ID instances and one `alarm:<kind>` entry per scheduled alarm. This layout is versioned with the package; a change to it is a semver-major release.
+The supervisor keeps its own bookkeeping in the instance's root storage: the kind pin, the logical name of named instances, and one `alarm:<kind>` entry per scheduled alarm. This layout is versioned with the package. Breaking changes use a new minor version while the package is below 1.0, and a new major version thereafter.
 
 ## Alarms
 
@@ -294,7 +294,7 @@ For custom RPC setup, provide an explicit `union(..., { onStart: instance => ...
 
 This changes named facets' native `ctx.id` and removes automatic calls to `__unsafe_ensureInitialized()`. External supervisor IDs, kind pins and facet storage locations are unchanged. Update code that treats a facet's `ctx.id` as an external address, and explicitly opt into any application startup hook you need.
 
-The logical name is now persisted with the supervisor so reconstructed IDs work after restarts. Existing named instances retain their facet data and acquire the name record on their first named access. An older instance reached only by a reconstructed ID has no recoverable logical name in its stored supervisor state; access it by name once before relying on the new native naming behavior. Until then it retains the inherited identity. Unique-ID instances keep their existing identity.
+The logical name is now persisted with the supervisor so reconstructed IDs work after restarts. Existing named instances retain their facet data and acquire the name record on their first named wake. An older instance reached only by a reconstructed ID has no recoverable logical name in its stored supervisor state; wake its supervisor by name after a restart before relying on the new native naming behavior. Until then it retains the inherited identity. Unique-ID instances keep their existing identity.
 ## API
 
 ### `union(kinds, options?)`
