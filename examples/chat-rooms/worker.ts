@@ -166,9 +166,8 @@ export class Chat extends Server<Env> {
   }
 
   /**
-   * RPC alongside WebSockets. PartyServer reads `ctx.id.name`, which
-   * includes the kind prefix, so `this.name` is `chat:<room>`; the
-   * `instanceName()` helper strips the prefix.
+   * RPC alongside WebSockets. Both PartyServer and instanceName() read
+   * the logical room name supplied natively to the facet.
    */
   roomInfo(): { name: string; room: string | undefined; connections: number } {
     return {

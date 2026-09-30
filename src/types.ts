@@ -73,6 +73,10 @@ export interface FacetIdentity {
   readonly kind: string;
   /** The top-level export name of the union class. */
   readonly host: string;
+  /** Physical supervisor ID, independent of the facet's logical ID. */
+  readonly parent?: string;
+  /** Logical name; absent for unique IDs and pre-upgrade nameless wakes. */
+  readonly name?: string;
 }
 
 /** Internal: true when `value` is a facet identity record. */
@@ -81,7 +85,9 @@ export function isFacetIdentity(value: unknown): value is FacetIdentity {
   return (
     candidate?.v === 1 &&
     typeof candidate.kind === "string" &&
-    typeof candidate.host === "string"
+    typeof candidate.host === "string" &&
+    (candidate.parent === undefined || typeof candidate.parent === "string") &&
+    (candidate.name === undefined || typeof candidate.name === "string")
   );
 }
 
@@ -126,15 +132,15 @@ export function parseKindPrefix(name: string): string | undefined {
 }
 
 /**
- * Returns the logical instance name without its `<kind>:` prefix, or
- * `undefined` for unique-ID instances. Works inside kind implementations:
- * a kind facet shares the identity of its instance.
- *
- * The first `:`-delimited prefix is stripped unconditionally — inside a
- * running kind the prefix is always the kind, because instances without a
- * registered prefix never reach kind code.
+ * Returns the logical name inside a kind, or undefined for unique IDs.
+ * Named facets receive this name natively as ctx.id.name. Older persisted
+ * facets inherited the supervisor's prefixed ID; keep reading those too.
  */
 export function instanceName(ctx: DurableObjectState): string | undefined {
+  const identity = ctx.storage.kv.get<FacetIdentity>(FACET_IDENTITY_KEY);
+  if (isFacetIdentity(identity) && identity.name !== undefined) {
+    return identity.name;
+  }
   const name = ctx.id.name;
   if (name === undefined) return undefined;
   const prefix = parseKindPrefix(name);

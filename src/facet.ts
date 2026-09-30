@@ -482,17 +482,6 @@ function findDescriptor(
   return undefined;
 }
 
-/** The default start hook: PartyServer and the Agents SDK defer their
- * setup to `__unsafe_ensureInitialized()`. */
-async function defaultOnStart(instance: object): Promise<void> {
-  const ensure = (instance as Record<string, unknown>)[
-    "__unsafe_ensureInitialized"
-  ];
-  if (typeof ensure === "function") {
-    await (ensure as (this: object) => unknown).call(instance);
-  }
-}
-
 /**
  * The facet role of a union instance. One isolated kind facet: it
  * constructs the kind implementation, forwards lifecycle events to it, and
@@ -579,7 +568,10 @@ export class FacetCore {
         : [current, this.#identity.host];
     for (const host of candidates) {
       const exported = exports[host] as
-        | { get?: (id: DurableObjectId) => AlarmBridge }
+        | {
+            get?: (id: DurableObjectId) => AlarmBridge;
+            idFromString: (id: string) => DurableObjectId;
+          }
         | undefined;
       if (typeof exported?.get === "function") {
         if (host !== this.#identity.host) {
@@ -587,7 +579,10 @@ export class FacetCore {
           // later propless wakes resolve directly.
           this.#rawKvPut(FACET_IDENTITY_KEY, this.#identityRecord(host));
         }
-        return exported.get(this.#ctx.id);
+        const parent = this.#identity.parent;
+        return exported.get(
+          parent === undefined ? this.#ctx.id : exported.idFromString(parent),
+        );
       }
     }
     throw claydoError(
@@ -616,7 +611,7 @@ export class FacetCore {
       );
     }
     const impl = new Kind(this.#ctx, this.#env) as object & KindHandlers;
-    await (this.#options.onStart ?? defaultOnStart)(impl);
+    await this.#options.onStart?.(impl);
     return impl;
   }
 

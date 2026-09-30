@@ -47,11 +47,13 @@ const LOCAL_UNDEFINED_KEYS = new Set<string>([
  * `error.code`.
  */
 export type KindStub<T> = {
-  [K in Exclude<keyof T, ReservedKey | symbol | number> as T[K] extends (
-    ...args: any[]
-  ) => any
-    ? K
-    : never]: T[K] extends (...args: infer A) => infer Ret
+  [
+    K in Exclude<keyof T, ReservedKey | symbol | number> as T[K] extends (
+      ...args: any[]
+    ) => any
+      ? K
+      : never
+  ]: T[K] extends (...args: infer A) => infer Ret
     ? (...args: A) => Promise<Awaited<Ret>>
     : never;
 } & {
@@ -129,6 +131,60 @@ export interface KindAccessor<T> {
   idFromName(name: string): DurableObjectId;
 }
 
+/** A namespace-shaped view of one kind, for existing namespace consumers. */
+export type KindNamespace<T> = T extends Rpc.DurableObjectBranded
+  ? DurableObjectNamespace<T>
+  : PlainKindNamespace<T>;
+
+interface PlainKindNamespace<T> extends DurableObjectNamespace {
+  get(
+    id: DurableObjectId,
+    options?: DurableObjectNamespaceGetDurableObjectOptions,
+  ): KindStub<T> & DurableObjectStub;
+  getByName(
+    name: string,
+    options?: DurableObjectNamespaceGetDurableObjectOptions,
+  ): KindStub<T> & DurableObjectStub;
+  jurisdiction(jurisdiction: DurableObjectJurisdiction): PlainKindNamespace<T>;
+}
+
+/**
+ * Adapts one kind to the DurableObjectNamespace surface used by SDKs and
+ * existing callers. Named IDs include the kind prefix. Unlike fromId(),
+ * namespace get() initializes on first contact, including for unique IDs.
+ * No ID-to-name cache is needed: identity lives in the Durable Object.
+ */
+export function kindNamespace<
+  NS extends DurableObjectNamespace<any>,
+  K extends KindNameOf<NS>,
+>(namespace: NS, kindName: K): KindNamespace<KindInstance<NS, K>> {
+  const ns = namespace as unknown as DurableObjectNamespace<AnySupervisor>;
+  const get = (
+    id: DurableObjectId,
+    options?: DurableObjectNamespaceGetDurableObjectOptions,
+  ) =>
+    makeStub(ns.get(id, options), kindName, {
+      name: id.name?.startsWith(`${kindName}:`)
+        ? id.name.slice(kindName.length + 1)
+        : undefined,
+      mode: "namespace",
+    });
+  return {
+    idFromName: (name: string) =>
+      ns.idFromName(composeInstanceName(kindName, name)),
+    idFromString: (id: string) => ns.idFromString(id),
+    newUniqueId: (options?: DurableObjectNamespaceNewUniqueIdOptions) =>
+      ns.newUniqueId(options),
+    get,
+    getByName: (
+      name: string,
+      options?: DurableObjectNamespaceGetDurableObjectOptions,
+    ) => get(ns.idFromName(composeInstanceName(kindName, name)), options),
+    jurisdiction: (jurisdiction: DurableObjectJurisdiction) =>
+      kindNamespace(namespace.jurisdiction(jurisdiction) as NS, kindName),
+  } as unknown as KindNamespace<KindInstance<NS, K>>;
+}
+
 type AnySupervisor = SupervisorInstance<KindRegistry>;
 
 /**
@@ -199,7 +255,7 @@ export function kinds<NS extends DurableObjectNamespace<any>>(
 
 interface StubOptions {
   name?: string;
-  mode: "named" | "unique" | "fromId" | "existing";
+  mode: "named" | "unique" | "namespace" | "fromId" | "existing";
 }
 
 function makeStub<T>(
@@ -208,7 +264,7 @@ function makeStub<T>(
   { name, mode }: StubOptions,
 ): KindStub<T> {
   // getExisting() and fromId() stubs never initialize an instance.
-  const initializes = mode === "named" || mode === "unique";
+  const initializes = mode !== "fromId" && mode !== "existing";
   const meta: Record<string, unknown> = {
     id: stub.id,
     name,

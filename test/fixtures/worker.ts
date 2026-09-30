@@ -1,10 +1,15 @@
 import { DurableObject } from "cloudflare:workers";
 import { Server } from "partyserver";
-import { instanceName, kinds, union } from "../../src/index";
+import { Agent } from "agents";
+import { McpAgent } from "agents/mcp";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import * as Sentry from "@sentry/cloudflare";
+import { instanceName, kinds, kindNamespace, union } from "../../src/index";
 
 export interface Env {
   APP_DO: DurableObjectNamespace<AppDO>;
   RENAMED: DurableObjectNamespace<InstanceType<typeof RenamedDO>>;
+  EXPLICIT: DurableObjectNamespace<ExplicitDO>;
   MISNAMED: DurableObjectNamespace<InstanceType<typeof Misnamed>>;
 }
 
@@ -47,7 +52,7 @@ export class Counter extends DurableObject<Env> {
 
   async whoAmI(): Promise<{ name: string | undefined; id: string }> {
     return {
-      name: instanceName(this.ctx),
+      name: this.ctx.id.name,
       id: this.ctx.id.toString(),
     };
   }
@@ -312,10 +317,7 @@ export class ChatRoom extends DurableObject<Env> {
       ws.close(4000, "requested");
       return;
     }
-    this.ctx.storage.sql.exec(
-      "INSERT INTO messages (body) VALUES (?)",
-      body,
-    );
+    this.ctx.storage.sql.exec("INSERT INTO messages (body) VALUES (?)", body);
     for (const socket of this.ctx.getWebSockets()) {
       socket.send(`echo:${body}`);
     }
@@ -379,6 +381,73 @@ export class PartyRoom extends Server<Env> {
   }
 }
 
+/** Startup requires the props delivered by the SDK's setName call. */
+export class PropsRoom extends Server<Env> {
+  async onStart(props?: Record<string, unknown>): Promise<void> {
+    if (props?.uid === undefined) throw new Error("missing startup owner");
+    await this.ctx.storage.put("owner", props.uid);
+    await this.ctx.storage.put("starts", (await this.starts()) + 1);
+  }
+
+  async starts(): Promise<number> {
+    return (await this.ctx.storage.get<number>("starts")) ?? 0;
+  }
+
+  async identity(): Promise<{ name: string; owner: unknown }> {
+    return { name: this.name, owner: await this.ctx.storage.get("owner") };
+  }
+}
+
+class ConstructorRoom extends PropsRoom {
+  private readonly constructedName: string;
+
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    this.constructedName = this.name;
+  }
+
+  async constructorName(): Promise<string> {
+    return this.constructedName;
+  }
+}
+
+export class PropsAgent extends Agent<Env> {
+  async onStart(props?: Record<string, unknown>): Promise<void> {
+    if (props?.uid === undefined)
+      throw new Error("missing agent startup owner");
+    await this.ctx.storage.put("owner", props.uid);
+  }
+
+  async identity(): Promise<{ name: string; owner: unknown }> {
+    return { name: this.name, owner: await this.ctx.storage.get("owner") };
+  }
+}
+
+export class ProbeMCP extends McpAgent<Env> {
+  server = new McpServer({ name: "claydo-probe", version: "1" });
+
+  async init(): Promise<void> {
+    this.server.tool("identity", async () => ({
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify({ name: this.name, props: this.props }),
+        },
+      ],
+    }));
+  }
+}
+
+// Instrumentation wraps the original SDK class without ClayDO adapters.
+const InstrumentedMCP = Sentry.instrumentDurableObjectWithSentry(
+  (_env: Env) => ({ dsn: "" }),
+  ProbeMCP,
+);
+const InstrumentedRoom = Sentry.instrumentDurableObjectWithSentry(
+  (_env: Env) => ({ dsn: "" }),
+  PropsRoom,
+);
+
 /** A kind whose constructor throws. */
 export class BrokenKind extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
@@ -389,8 +458,30 @@ export class BrokenKind extends DurableObject<Env> {
   async anything(): Promise<void> {}
 }
 
+/** A generic kind whose private-looking hook must never be called implicitly. */
+export class LifecycleKind extends DurableObject<Env> {
+  async __unsafe_ensureInitialized(): Promise<void> {
+    throw new Error("framework-private hook called");
+  }
+
+  async initialize(): Promise<void> {
+    await this.ctx.storage.put("starts", (await this.starts()) + 1);
+  }
+
+  async starts(): Promise<number> {
+    return (await this.ctx.storage.get<number>("starts")) ?? 0;
+  }
+}
+
+export class ExplicitDO extends union(
+  { lifecycle: LifecycleKind },
+  { onStart: (instance) => (instance as LifecycleKind).initialize() },
+) {}
+
 export class AppDO extends union({
   counter: Counter,
+  otherCounter: Counter,
+  lifecycle: LifecycleKind,
   vault: Vault,
   reminder: Reminder,
   captured: CapturedReminder,
@@ -398,6 +489,12 @@ export class AppDO extends union({
   plain: PlainKind,
   broken: BrokenKind,
   party: PartyRoom,
+  sdkParty: PropsRoom,
+  sdkOther: PropsRoom,
+  sdkWrapped: InstrumentedRoom,
+  sdkConstructor: ConstructorRoom,
+  agent: PropsAgent,
+  mcp: InstrumentedMCP,
 }) {}
 
 /** A union exported without a subclass: the name option carries the export name. */
@@ -407,8 +504,19 @@ export const RenamedDO = union({ counter: Counter }, { name: "RenamedDO" });
 export const Misnamed = union({ counter: Counter });
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(
+    request: Request,
+    env: Env,
+    ctx: ExecutionContext,
+  ): Promise<Response> {
     const url = new URL(request.url);
+    if (url.pathname === "/mcp") {
+      return ProbeMCP.serve("/mcp").fetch(
+        request,
+        { ...env, MCP_OBJECT: kindNamespace(env.APP_DO, "mcp") },
+        Object.assign(ctx, { props: { uid: "test-owner" } }),
+      );
+    }
     const [, kindName, name, ...rest] = url.pathname.split("/");
     if (kindName === undefined || name === undefined || name === "") {
       return new Response("usage: /<kind>/<name>/...", { status: 400 });

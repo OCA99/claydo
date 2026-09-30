@@ -100,7 +100,7 @@ describe("partyserver ecosystem integration", () => {
     ws.accept();
     expect(JSON.parse(await welcome)).toMatchObject({
       type: "welcome",
-      room: "chat:pk-room",
+      room: "pk-room",
       users: ["pk-user"],
     });
     ws.close();

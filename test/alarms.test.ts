@@ -251,8 +251,8 @@ describe("deleteAll semantics", () => {
       rawStub("reminder", "wipe-clean"),
       async (_instance, ctx) => [...(await ctx.storage.list()).keys()],
     );
-    // Supervisor storage holds only the alarm entry and the kind pin; the
+    // Supervisor storage holds only the alarm entry, kind pin and logical name; the
     // payload lives in the kind's facet.
-    expect(keys.sort()).toEqual(["alarm:reminder", "kind"]);
+    expect(keys.sort()).toEqual(["alarm:reminder", "kind", "name"]);
   });
 });
